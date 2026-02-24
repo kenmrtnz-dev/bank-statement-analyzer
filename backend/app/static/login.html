@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Login · Bank Statement Analyzer</title>
+    <link rel="stylesheet" href="/static/login.css" />
+  </head>
+  <body>
+    <main class="login-wrap">
+      <section class="login-card">
+        <h1>Sign In</h1>
+        <p>Use your evaluator or admin account.</p>
+        <form id="loginForm">
+          <label>
+            Username
+            <input id="username" name="username" type="text" required />
+          </label>
+          <label>
+            Password
+            <input id="password" name="password" type="password" required />
+          </label>
+          <button type="submit">Login</button>
+        </form>
+        <p id="loginError" class="error hidden">Invalid username or password.</p>
+      </section>
+    </main>
+    <script src="/static/login.js"></script>
+  </body>
+</html>
+

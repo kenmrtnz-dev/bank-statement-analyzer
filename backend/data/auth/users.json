@@ -1,0 +1,20 @@
+{
+  "admin": {
+    "username": "admin",
+    "role": "admin",
+    "salt": "fa47a990f4141618654a844e220e22b6",
+    "password_hash": "1dec53cccdba783ca8ba6386ef0d35642739fe8e2b75b21d3bfa113aa1076b5d"
+  },
+  "eval_check": {
+    "username": "eval_check",
+    "role": "evaluator",
+    "salt": "a7ca3efb02621b8a4d5d78a404dd9d75",
+    "password_hash": "bb097674bbedfe070683b18cc63fe475e9d629da76350f9a3efc6c176973c0b7"
+  },
+  "eval_r": {
+    "username": "eval_r",
+    "role": "evaluator",
+    "salt": "316695ee7273ee3ff9ead8debc5da2a3",
+    "password_hash": "16220e4633638861cab5dcfb22da58e7b62ecde4bdc77d2922b0f5c47c5c6d3f"
+  }
+}

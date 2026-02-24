@@ -1,0 +1,65 @@
+services:
+  api:
+    platform: linux/amd64
+    build:
+      context: ./backend
+    container_name: ocr_api
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend/app:/app/app:ro
+      - ocr_data:/data
+    depends_on:
+      - redis
+      - db
+    command: >
+      uvicorn app.main:app
+      --host 0.0.0.0
+      --port 8000
+      --proxy-headers
+
+  worker:
+    platform: linux/amd64
+    build:
+      context: ./backend
+    container_name: ocr_worker
+    env_file:
+      - .env
+    volumes:
+      - ./backend/app:/app/app:ro
+      - ocr_data:/data
+    depends_on:
+      - redis
+      - db
+    command: >
+      sh -c "celery -A app.worker.celery_app.celery worker
+      --loglevel=INFO
+      --pool=prefork
+      --queues=${CELERY_TASK_DEFAULT_QUEUE:-jobs}
+      --prefetch-multiplier=${CELERY_WORKER_PREFETCH_MULTIPLIER:-1}
+      --concurrency=${CELERY_CONCURRENCY:-4}
+      --max-tasks-per-child=${CELERY_MAX_TASKS_PER_CHILD:-25}"
+
+  redis:
+    image: redis:7-alpine
+    container_name: ocr_redis
+    ports:
+      - "6379:6379"
+
+  db:
+    image: postgres:16-alpine
+    container_name: ocr_db
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ocr}
+      POSTGRES_USER: ${POSTGRES_USER:-ocr}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ocrpass}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+volumes:
+  pg_data:
+  ocr_data:

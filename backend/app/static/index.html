@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Bank Statement Analyzer</title>
+    <link rel="stylesheet" href="/static/ui.css?v=20260223m" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="app-header">
+        <nav class="header-nav" aria-label="Primary navigation">
+          <a class="menu-item active" id="menuUploads" data-view="uploads" href="/uploads" aria-current="page">
+            <span class="menu-icon" aria-hidden="true">⬆</span>
+            <span>Uploads</span>
+            <span class="menu-badge" id="uploadsBadge">1</span>
+          </a>
+          <a class="menu-item" id="menuProcessing" data-view="processing" href="/processing">
+            <span class="menu-icon" aria-hidden="true">⋯</span>
+            <span>Processing</span>
+            <span class="menu-badge">1</span>
+          </a>
+        </nav>
+        <div class="header-right">
+          <p class="header-note">Upload first, then start parsing from file actions.</p>
+          <span id="userRoleLabel" class="role-chip">-</span>
+          <a id="adminLink" class="button-link ghost hidden" href="/admin">Admin</a>
+          <button id="logoutBtn" type="button" class="button-link ghost">Logout</button>
+        </div>
+      </header>
+
+      <section class="workspace">
+        <section id="uploadsView" class="view-pane">
+          <section class="card dropzone-card uploads-dropzone-card">
+            <form id="uploadForm" class="upload-row">
+              <div id="uploadSurface" class="upload-surface">
+                <div class="upload-center">
+                <p class="upload-main">
+                  <span class="upload-main-title">Drag & drop your PDF here</span>
+                </p>
+                <p class="upload-sub"><label for="pdfFile" class="upload-link">or click to browse</label></p>
+                <p class="upload-format">Supported Format: PDF</p>
+                <label for="pdfFile" class="browse-btn">Browse File</label>
+              </div>
+              <input id="pdfFile" name="file" type="file" accept="application/pdf" required />
+            </div>
+            <div id="uploadProgressWrap" class="upload-progress hidden" aria-live="polite">
+              <div class="upload-progress-head">
+                <span class="upload-progress-label">Upload Progress</span>
+                <span id="uploadProgressText" class="upload-progress-value">0%</span>
+              </div>
+              <div class="upload-progress-track">
+                <div id="uploadProgressBar" class="upload-progress-bar"></div>
+              </div>
+            </div>
+
+            <input id="mode" name="mode" type="hidden" value="auto" />
+            <input id="autoStart" type="checkbox" hidden />
+          </form>
+          </section>
+
+          <section class="card table-card">
+            <div class="row-between files-head">
+              <div>
+                <h2>Recent</h2>
+                <p class="muted">Select an action to begin processing.</p>
+              </div>
+              <div class="search-wrap">
+                <span class="search-inline-icon" aria-hidden="true">⌕</span>
+                <input id="uploadSearch" class="search-input" type="text" placeholder="Search files..." />
+              </div>
+            </div>
+            <div id="uploadEmptyState" class="upload-empty-state hidden">
+              <div class="upload-empty-icon" aria-hidden="true">◌</div>
+              <p>No files uploaded yet.</p>
+              <small>Upload a PDF to begin processing.</small>
+            </div>
+            <div id="uploadTableWrap" class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>File Name</th>
+                    <th>File Size</th>
+                    <th>Last Modified</th>
+                    <th>Uploaded By</th>
+                    <th>Status</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="uploadRowsBody"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section id="crmAttachmentsSection" class="card table-card hidden">
+            <div class="row-between files-head">
+              <div>
+                <h2>CRM Bank Statements</h2>
+                <p class="muted">Auto-loaded from EspoCRM Lead attachments (`cBankStatementsIds`).</p>
+              </div>
+              <div class="actions">
+                <button id="crmRefreshBtn" type="button">Refresh CRM Files</button>
+                <button id="crmLoadMoreBtn" type="button" class="ghost hidden">Load More</button>
+              </div>
+            </div>
+            <div id="crmAttachmentsEmptyState" class="upload-empty-state hidden">
+              <div class="upload-empty-icon" aria-hidden="true">◌</div>
+              <p>No CRM bank statement files found.</p>
+              <small>Use refresh to load files from the CRM server.</small>
+            </div>
+            <div id="crmAttachmentsTableWrap" class="table-wrap hidden">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Lead ID</th>
+                    <th>Account Name</th>
+                    <th>File Name</th>
+                    <th>Status</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="crmAttachmentsRowsBody"></tbody>
+              </table>
+            </div>
+          </section>
+        </section>
+
+        <section id="processingView" class="view-pane hidden">
+          <header class="topbar card">
+            <div>
+              <p class="eyebrow">Processing</p>
+              <h1>Parser Workspace</h1>
+            </div>
+            <div class="actions">
+              <a id="exportPdf" href="#" class="button-link disabled ghost" aria-disabled="true">Export PDF</a>
+              <a id="exportExcel" href="#" class="button-link disabled ghost" aria-disabled="true">Export Excel</a>
+              <button id="startBtn" type="button" disabled>Start Job</button>
+            </div>
+          </header>
+
+          <section class="card section-card metadata-card">
+            <div class="status-grid">
+              <div class="meta-item"><strong>Job ID</strong> <span id="jobId">-</span></div>
+              <div class="meta-item"><strong>Status</strong> <span id="jobStatus" class="job-status-badge status-idle">idle</span></div>
+              <div class="meta-item"><strong>Step</strong> <span id="jobStep">-</span></div>
+              <div class="meta-item">
+                <div class="row-between progress-head-row">
+                  <strong>Progress</strong>
+                  <span id="jobProgress">0%</span>
+                </div>
+                <div class="job-progress-track">
+                  <div id="jobProgressFill" class="job-progress-fill"></div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="processing-main-grid section-group">
+            <article class="card section-card">
+              <div class="row-between">
+                <h2>Preview</h2>
+                <div class="page-nav">
+                  <button id="pagePrevBtn" type="button" class="page-nav-btn" aria-label="Previous page">&lt;</button>
+                  <span id="pageIndicator" class="page-indicator">0/0</span>
+                  <button id="pageNextBtn" type="button" class="page-nav-btn" aria-label="Next page">&gt;</button>
+                  <select id="pageSelect" class="hidden"></select>
+                </div>
+              </div>
+              <div class="preview-wrap" id="previewWrap">
+                <div id="previewEmpty" class="preview-empty">Page preview will appear here.</div>
+                <img id="previewImage" alt="Page preview" />
+                <canvas id="overlay"></canvas>
+              </div>
+              <div class="hint">Click a row to show bounds on the image.</div>
+            </article>
+
+            <section class="card table-card section-card">
+              <div class="row-between">
+                <h2>Parsed Rows</h2>
+                <div class="parsed-header-controls">
+                  <button id="parsedDebugToggleBtn" type="button" class="parsed-header-action ghost">Debug JSON</button>
+                  <button id="reverseRowsBtn" type="button" class="parsed-header-action" disabled>Reverse Order</button>
+                  <span id="rowCount">0 rows</span>
+                </div>
+              </div>
+              <div id="parsedTableWrap" class="table-wrap parsed-side-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Row</th>
+                      <th>Date</th>
+                      <th>Description</th>
+                      <th>Debit</th>
+                      <th>Credit</th>
+                      <th>Balance</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody id="rowsBody"></tbody>
+                </table>
+              </div>
+              <div id="parsedJsonWrap" class="parsed-json-wrap hidden">
+                <pre id="parsedJsonBody" class="parsed-json-body"></pre>
+              </div>
+            </section>
+          </section>
+
+          <section class="card section-card summary-card">
+            <h2>Summary</h2>
+            <div id="summaryEmpty" class="panel-empty">
+              <p>No summary data available.</p>
+            </div>
+            <div id="summary" class="json-box hidden"></div>
+          </section>
+        </section>
+      </section>
+    </main>
+
+    <script src="/static/ui.js?v=20260223m"></script>
+  </body>
+</html>

@@ -1,0 +1,21 @@
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Local sample documents
+samples/
+
+# Python cache artifacts
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Frontend artifacts
+backend/frontend/node_modules/
+backend/frontend/.vite/
+
+# macOS Finder metadata
+.DS_Store
+
+.codex/

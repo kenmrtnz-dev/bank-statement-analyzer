@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Admin Console · Bank Statement Analyzer</title>
+    <link rel="stylesheet" href="/static/admin.css" />
+  </head>
+  <body>
+    <main class="admin-shell">
+      <header class="admin-topbar">
+        <div class="topbar-left">
+          <span class="topbar-badge">ADMIN</span>
+          <h1>Bank Statement Admin Console</h1>
+          <p>Manage evaluator accounts and backend storage maintenance tasks.</p>
+        </div>
+        <div class="topbar-actions">
+          <a class="ghost-link" href="/login">Login Page</a>
+          <button id="adminLogoutBtn" type="button">Logout</button>
+        </div>
+      </header>
+
+      <section class="admin-kpis">
+        <article class="kpi-card">
+          <span class="kpi-label">Role Model</span>
+          <strong class="kpi-value">Admin / Evaluator</strong>
+          <p>Simple role split with cookie session auth.</p>
+        </article>
+        <article class="kpi-card">
+          <span class="kpi-label">Evaluator Access</span>
+          <strong class="kpi-value">Analyzer Workspace</strong>
+          <p>Main app and job APIs are evaluator-only.</p>
+        </article>
+      </section>
+
+      <section class="admin-grid">
+        <article class="admin-card user-mgmt-card">
+          <div class="card-head">
+            <h2>Create Evaluator Account</h2>
+            <span class="card-tag">User Mgmt</span>
+          </div>
+          <p>Provision evaluator credentials for access to upload, parsing, and review pages.</p>
+          <form id="createEvaluatorForm" class="stack">
+            <label>
+              Username
+              <input id="evUsername" type="text" placeholder="evaluator_username" required />
+            </label>
+            <label>
+              Password
+              <input id="evPassword" type="password" minlength="6" placeholder="minimum 6 characters" required />
+            </label>
+            <button type="submit">Create Evaluator</button>
+          </form>
+          <p id="createEvaluatorFeedback" class="inline-feedback hidden"></p>
+        </article>
+      </section>
+
+      <section class="admin-maintenance">
+        <article class="admin-card">
+          <div class="card-head">
+            <h2>Storage Maintenance</h2>
+            <span class="card-tag danger-tag">High Impact</span>
+          </div>
+          <p>Permanently remove all stored jobs and generated export files from backend storage.</p>
+          <form id="clearStoreForm" class="stack">
+            <button type="submit">Clear Jobs and Files</button>
+          </form>
+        </article>
+      </section>
+
+      <p id="adminMessage" class="admin-message hidden"></p>
+    </main>
+    <div id="confirmModal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
+      <div class="modal-card">
+        <h3 id="confirmTitle">Confirm storage clear</h3>
+        <p>This will permanently delete all jobs and generated export files. This action cannot be undone.</p>
+        <div class="modal-actions">
+          <button id="confirmCancelBtn" type="button" class="modal-cancel">Cancel</button>
+          <button id="confirmClearBtn" type="button" class="modal-danger">Yes, clear storage</button>
+        </div>
+      </div>
+    </div>
+    <script src="/static/admin.js"></script>
+  </body>
+</html>

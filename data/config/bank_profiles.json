@@ -1,0 +1,226 @@
+{
+  "profiles": {
+    "GENERIC": {
+      "date_tokens": ["date", "book date", "posting date", "value date", "transaction date"],
+      "description_tokens": ["description", "details", "particulars", "narration", "remarks", "reference"],
+      "debit_tokens": ["debit", "debits", "withdrawal", "withdrawals"],
+      "credit_tokens": ["credit", "credits", "deposit", "deposits"],
+      "balance_tokens": ["balance", "ending balance", "closing balance", "end balance", "running balance"],
+      "date_order": ["mdy", "dmy", "ymd"],
+      "noise_tokens": ["balance at period", "beginning balance", "brought forward"],
+      "ocr_backends": ["paddleocr", "tesseract", "easyocr"],
+      "account_name_patterns": [
+        "^\\s*([A-Z][A-Z0-9 .,\\-'/&]{2,120}?(?:CORPORATION|CORP\\.?|INC\\.?|COMPANY|CO\\.?|LIMITED|LTD\\.?))\\b",
+        "account\\s*name\\s*[:\\-]?\\s*([A-Z0-9][A-Z0-9 .,\\-'/&]{2,90})",
+        "account\\s*holder\\s*[:\\-]?\\s*([A-Z0-9][A-Z0-9 .,\\-'/&]{2,90})",
+        "depositor\\s*name\\s*[:\\-]?\\s*([A-Z0-9][A-Z0-9 .,\\-'/&]{2,90})"
+      ],
+      "account_number_patterns": [
+        "account\\s*(?:no\\.?|number|#)\\s*[:\\-]?\\s*([0-9Xx\\-\\s]{6,40})",
+        "acct\\.?\\s*(?:no\\.?|#)\\s*[:\\-]?\\s*([0-9Xx\\-\\s]{6,40})",
+        "casa\\s*(?:no\\.?|#)\\s*[:\\-]?\\s*([0-9Xx\\-\\s]{6,40})"
+      ]
+    },
+    "AUB": {
+      "date_tokens": ["date", "book date"],
+      "description_tokens": ["description", "particulars", "details", "remarks", "reference"],
+      "debit_tokens": ["debit"],
+      "credit_tokens": ["credit"],
+      "balance_tokens": ["balance", "closing balance"],
+      "date_order": ["dmy", "mdy", "ymd"],
+      "noise_tokens": ["balance carried forward", "balance at period"],
+      "ocr_backends": ["paddleocr", "tesseract", "easyocr"],
+      "account_name_patterns": [
+        "^\\s*([A-Z][A-Z0-9 .,\\-'/&]{2,120}?(?:CORPORATION|CORP\\.?|INC\\.?|COMPANY|CO\\.?|LIMITED|LTD\\.?))\\b",
+        "account\\s*name\\s*[:\\-]?\\s*([A-Z0-9][A-Z0-9 .,\\-'/&]{2,90})",
+        "depositor\\s*name\\s*[:\\-]?\\s*([A-Z0-9][A-Z0-9 .,\\-'/&]{2,90})"
+      ],
+      "account_number_patterns": [
+        "account\\s*(?:no\\.?|number|#)\\s*[:\\-]?\\s*([0-9Xx\\-\\s]{6,40})",
+        "casa\\s*(?:no\\.?|#)\\s*[:\\-]?\\s*([0-9Xx\\-\\s]{6,40})"
+      ]
+    },
+    "EWB": {
+      "date_tokens": ["book date", "value date", "date"],
+      "description_tokens": ["description", "details", "particulars", "transaction details", "remarks"],
+      "debit_tokens": ["debit", "withdrawal"],
+      "credit_tokens": ["credit", "deposit"],
+      "balance_tokens": ["closing balance", "balance"],
+      "date_order": ["dmy", "mdy", "ymd"],
+      "noise_tokens": ["balance at period"],
+      "ocr_backends": ["paddleocr", "tesseract", "easyocr"],
+      "account_name_patterns": [
+        "account\\s*name\\s*[:\\-]?\\s*([A-Z0-9][A-Z0-9 .,\\-'/&]{2,90})",
+        "depositor\\s*name\\s*[:\\-]?\\s*([A-Z0-9][A-Z0-9 .,\\-'/&]{2,90})"
+      ],
+      "account_number_patterns": [
+        "account\\s*(?:no\\.?|number|#)\\s*[:\\-]?\\s*([0-9Xx\\-\\s]{6,40})"
+      ]
+    },
+    "MAYBANK": {
+      "date_tokens": ["posting date", "date"],
+      "description_tokens": ["description", "details", "particulars", "narration", "remarks", "ref no"],
+      "debit_tokens": ["debit", "withdrawal"],
+      "credit_tokens": ["credit", "deposit"],
+      "balance_tokens": ["end balance", "ending balance", "balance"],
+      "date_order": ["dmy", "mdy", "ymd"],
+      "noise_tokens": ["total debit", "total credit", "begin balance", "end balance"],
+      "ocr_backends": ["paddleocr", "tesseract", "easyocr"],
+      "account_name_patterns": [
+        "account\\s*name\\s*[:\\-]?\\s*([A-Z0-9][A-Z0-9 .,\\-'/&]{2,90})",
+        "account\\s*holder\\s*[:\\-]?\\s*([A-Z0-9][A-Z0-9 .,\\-'/&]{2,90})"
+      ],
+      "account_number_patterns": [
+        "account\\s*(?:no\\.?|number|#)\\s*[:\\-]?\\s*([0-9Xx\\-\\s]{6,40})",
+        "customer\\s*no\\.?\\s*[:\\-]?\\s*([0-9Xx\\-\\s]{6,40})"
+      ]
+    },
+    "UNIONBANK": {
+      "date_tokens": ["date", "value date"],
+      "description_tokens": ["description", "details", "particulars", "remarks", "reference"],
+      "debit_tokens": ["debits", "debit"],
+      "credit_tokens": ["credits", "credit"],
+      "balance_tokens": ["ending balance", "balance"],
+      "date_order": ["ymd", "mdy", "dmy"],
+      "noise_tokens": ["available balance", "current balance", "period covered"],
+      "ocr_backends": ["paddleocr", "tesseract", "easyocr"],
+      "account_name_patterns": [
+        "account\\s*name\\s*[:\\-]?\\s*([A-Z0-9][A-Z0-9 .,\\-'/&]{2,90})",
+        "depositor\\s*name\\s*[:\\-]?\\s*([A-Z0-9][A-Z0-9 .,\\-'/&]{2,90})"
+      ],
+      "account_number_patterns": [
+        "account\\s*(?:no\\.?|number|#)\\s*[:\\-]?\\s*([0-9Xx\\-\\s]{6,40})",
+        "account\\s*number\\s*[:\\-]?\\s*([0-9Xx\\-\\s]{6,40})"
+      ]
+    },
+    "BPI": {
+      "date_tokens": ["date", "transaction date", "posting date"],
+      "description_tokens": ["description", "details", "particulars", "remarks", "reference"],
+      "debit_tokens": ["debit", "debits", "withdrawal", "withdrawals"],
+      "credit_tokens": ["credit", "credits", "deposit", "deposits"],
+      "balance_tokens": ["balance", "ending balance", "running balance"],
+      "date_order": ["mdy", "dmy", "ymd"],
+      "noise_tokens": ["beginning balance", "available balance", "total"],
+      "ocr_backends": ["paddleocr", "tesseract", "easyocr"]
+    },
+    "CHINABANK": {
+      "date_tokens": ["date", "txn date", "transaction date", "value date"],
+      "description_tokens": ["description", "details", "particulars", "remarks", "reference"],
+      "debit_tokens": ["debit", "debits", "withdrawal", "withdrawals"],
+      "credit_tokens": ["credit", "credits", "deposit", "deposits"],
+      "balance_tokens": ["balance", "ending balance", "running balance", "outstanding balance"],
+      "date_order": ["mdy", "dmy", "ymd"],
+      "noise_tokens": ["total debit", "total credit", "balance forward"],
+      "ocr_backends": ["paddleocr", "tesseract", "easyocr"]
+    },
+    "RCBC": {
+      "date_tokens": ["date", "book date", "posting date", "value date", "transaction date"],
+      "description_tokens": ["description", "details", "particulars", "remarks", "reference"],
+      "debit_tokens": ["debit", "debits", "withdrawal", "withdrawals"],
+      "credit_tokens": ["credit", "credits", "deposit", "deposits"],
+      "balance_tokens": ["balance", "ending balance", "running balance", "closing balance"],
+      "date_order": ["mdy", "dmy", "ymd"],
+      "noise_tokens": ["available balance", "current balance", "balance brought forward"],
+      "ocr_backends": ["paddleocr", "tesseract", "easyocr"],
+      "account_name_patterns": [
+        "account\\s*name\\s*[:\\-]?\\s*([A-Z0-9][A-Z0-9 .,\\-'/&]{2,90})",
+        "depositor\\s*name\\s*[:\\-]?\\s*([A-Z0-9][A-Z0-9 .,\\-'/&]{2,90})"
+      ],
+      "account_number_patterns": [
+        "account\\s*(?:no\\.?|number|#)\\s*[:\\-]?\\s*([0-9Xx\\-\\s]{6,40})",
+        "account\\s*number\\s*[:\\-]?\\s*([0-9Xx\\-\\s]{6,40})"
+      ]
+    },
+    "SECURITY_BANK": {
+      "date_tokens": ["date", "book date", "transaction date", "posting date", "value date"],
+      "description_tokens": ["description", "details", "particulars", "remarks", "reference"],
+      "debit_tokens": ["debit", "debits", "withdrawal", "withdrawals"],
+      "credit_tokens": ["credit", "credits", "deposit", "deposits"],
+      "balance_tokens": ["balance", "ending balance", "closing balance", "running balance"],
+      "date_order": ["mdy", "dmy", "ymd"],
+      "noise_tokens": ["balance brought forward", "available balance", "current balance", "period covered"],
+      "ocr_backends": ["paddleocr", "tesseract", "easyocr"]
+    },
+    "STERLING": {
+      "date_tokens": ["date", "book date", "posting date", "value date"],
+      "description_tokens": ["description", "details", "particulars", "remarks", "reference"],
+      "debit_tokens": ["debit", "debits", "withdrawal", "withdrawals"],
+      "credit_tokens": ["credit", "credits", "deposit", "deposits"],
+      "balance_tokens": ["balance", "ending balance", "closing balance", "running balance"],
+      "date_order": ["mdy", "dmy", "ymd"],
+      "noise_tokens": ["balance brought forward", "period covered", "available balance"],
+      "ocr_backends": ["paddleocr", "tesseract", "easyocr"]
+    }
+  },
+  "detection_rules": [
+    {
+      "profile": "CHINABANK",
+      "contains_any": ["chinabank"],
+      "contains_all": []
+    },
+    {
+      "profile": "BPI",
+      "contains_any": ["bank of the philippine islands", " bpi statement"],
+      "contains_all": []
+    },
+    {
+      "profile": "UNIONBANK",
+      "contains_any": ["unionbank", "union bank of the philippines", "transaction id"],
+      "contains_all": []
+    },
+    {
+      "profile": "MAYBANK",
+      "contains_any": ["maybank", "malayan banking berhad"],
+      "contains_all": []
+    },
+    {
+      "profile": "RCBC",
+      "contains_any": ["rcbc", "rizal commercial banking corporation"],
+      "contains_all": []
+    },
+    {
+      "profile": "SECURITY_BANK",
+      "contains_any": ["security bank", "securitybank"],
+      "contains_all": []
+    },
+    {
+      "profile": "STERLING",
+      "contains_any": ["sterling bank of asia"],
+      "contains_all": []
+    },
+    {
+      "profile": "EWB",
+      "contains_any": ["eastwest", "ewb"],
+      "contains_all": []
+    },
+    {
+      "profile": "EWB",
+      "contains_any": [],
+      "contains_all": ["book date", "closing balance"]
+    },
+    {
+      "profile": "AUB",
+      "contains_any": [
+        "asia united bank",
+        "aub",
+        "asia united bank corporation",
+        "pesonet sending to other bank",
+        "pesonet sending service charge",
+        "instapay sending service charg",
+        "casa fund transfer credit",
+        "casa fund transfer debit"
+      ],
+      "contains_all": []
+    },
+    {
+      "profile": "AUB",
+      "contains_any": [],
+      "contains_all": ["check no.", "channel code"]
+    },
+    {
+      "profile": "AUB",
+      "contains_any": [],
+      "contains_all": ["period coverage", "check no."]
+    }
+  ]
+}
