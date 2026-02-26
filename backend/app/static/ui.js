@@ -99,7 +99,8 @@
     pageSaveTimers: {},
     pageSaveTokenByPage: {},
     parsedPanelMode: 'table',
-    currentParseMode: ''
+    currentParseMode: '',
+    reverseRowsBusy: false
   };
   const ROUTE_TO_VIEW = {
     '/uploads': 'uploads',
@@ -266,6 +267,13 @@
       maximumFractionDigits: 2
     });
     return `${n < 0 ? '-' : ''}${currency}${abs}`;
+  }
+
+  function formatCurrencyOrDash(value, currency = '₱') {
+    if (value === null || value === undefined || String(value).trim() === '') return '-';
+    const n = Number(value);
+    if (!Number.isFinite(n)) return '-';
+    return formatCurrency(n, currency);
   }
 
   function escapeHtml(value) {
@@ -668,7 +676,7 @@
     setView(view);
     if (view === 'processing' && routeJobId && routeJobId !== state.jobId) {
       setActiveJob(routeJobId, false).catch((err) => {
-        alert(`Load job failed: ${err.message}`);
+        alert(`Load job failed: ${normalizeApiErrorMessage(err?.message)}`);
       });
     }
     const targetPath = buildRoute(view, routeJobId);
@@ -770,9 +778,11 @@
       els.reverseRowsBtn.disabled = true;
       return;
     }
-    const page = String(state.currentPage || '').trim();
-    const rows = page ? state.parsedByPage[page] : null;
-    const canReverse = Array.isArray(rows) && rows.length > 1;
+    if (state.reverseRowsBusy) {
+      els.reverseRowsBtn.disabled = true;
+      return;
+    }
+    const canReverse = Object.values(state.parsedByPage).some((rows) => Array.isArray(rows) && rows.length > 1);
     els.reverseRowsBtn.disabled = !canReverse;
   }
 
@@ -1065,15 +1075,37 @@
     queuePageRowsSave(page);
   }
 
-  function reverseCurrentPageRows() {
-    const page = String(state.currentPage || '').trim();
-    if (!page) return;
-    const rows = Array.isArray(state.parsedByPage[page]) ? state.parsedByPage[page] : [];
-    if (rows.length < 2) return;
-
-    state.parsedByPage[page] = rows.slice().reverse();
-    renderRows();
-    queuePageRowsSave(page);
+  async function reverseAllPagesRows() {
+    if (state.reverseRowsBusy) return;
+    state.reverseRowsBusy = true;
+    updateReverseRowsActionState();
+    try {
+      let changed = false;
+      const pagesToProcess = Array.isArray(state.pages) && state.pages.length
+        ? state.pages.slice()
+        : Object.keys(state.parsedByPage || {});
+      for (const page of pagesToProcess) {
+        if (!Array.isArray(state.parsedByPage[page]) && state.jobId) {
+          try {
+            state.parsedByPage[page] = await api(`/jobs/${state.jobId}/parsed/${page}`);
+          } catch {
+            continue;
+          }
+        }
+        const rows = Array.isArray(state.parsedByPage[page]) ? state.parsedByPage[page] : [];
+        if (!Array.isArray(rows) || rows.length < 2) continue;
+        state.parsedByPage[page] = rows.slice().reverse();
+        queuePageRowsSave(page);
+        changed = true;
+      }
+      if (changed) {
+        renderRows();
+        await flushPendingPageSaves();
+      }
+    } finally {
+      state.reverseRowsBusy = false;
+      updateReverseRowsActionState();
+    }
   }
 
   function drawSelectedBound() {
@@ -1348,6 +1380,8 @@
     const id = String(jobId || '').trim();
     if (!id) return;
 
+    const status = await api(`/jobs/${id}`);
+
     state.jobId = id;
     if (els.jobId) els.jobId.textContent = id;
     if (els.startBtn) els.startBtn.disabled = false;
@@ -1360,7 +1394,6 @@
     renderSummary(null);
     if (switchToProcessing) syncRoute('/processing', false, id);
 
-    const status = await api(`/jobs/${id}`);
     setStatus(status);
     const terminal = new Set(['done', 'failed']);
     if (terminal.has(String(status.status || '').toLowerCase())) {
@@ -1428,7 +1461,7 @@
     try {
       await setActiveJob(value, true);
     } catch (err) {
-      alert(`Load job failed: ${err.message}`);
+      alert(`Load job failed: ${normalizeApiErrorMessage(err?.message)}`);
     }
   }
 
@@ -1436,7 +1469,7 @@
   if (els.startBtn) els.startBtn.addEventListener('click', () => startJob());
   if (els.reverseRowsBtn) {
     els.reverseRowsBtn.addEventListener('click', () => {
-      reverseCurrentPageRows();
+      reverseAllPagesRows();
     });
   }
   if (els.parsedDebugToggleBtn) {
@@ -1524,7 +1557,7 @@
       if (!jobId) return;
       if (action === 'none') return;
       if (action === 'start') startJob(jobId);
-      else setActiveJob(jobId, true).catch((err) => alert(`Load job failed: ${err.message}`));
+      else setActiveJob(jobId, true).catch((err) => alert(`Load job failed: ${normalizeApiErrorMessage(err?.message)}`));
     });
   }
 
@@ -1579,7 +1612,7 @@
       if (openBtn) {
         const openJobId = String(openBtn.getAttribute('data-open-job-id') || '').trim();
         if (!openJobId) return;
-        setActiveJob(openJobId, true).catch((err) => alert(`Load job failed: ${err.message}`));
+        setActiveJob(openJobId, true).catch((err) => alert(`Load job failed: ${normalizeApiErrorMessage(err?.message)}`));
         return;
       }
 
@@ -1750,14 +1783,18 @@
       if (!hasData) {
         els.summary.innerHTML = '';
       } else {
+        const totalCreditNumber = Number(summary.total_credit);
+        const computedTotalCreditMonthlyAverage = Number.isFinite(totalCreditNumber)
+          ? (totalCreditNumber / 6) * 0.30
+          : summary.total_credit_monthly_average;
         const metrics = [
           { label: 'Total Transactions', value: formatNumber(summary.total_transactions), negative: Number(summary.total_transactions) < 0 },
           { label: 'Debit Transactions', value: formatNumber(summary.debit_transactions), negative: Number(summary.debit_transactions) < 0 },
           { label: 'Credit Transactions', value: formatNumber(summary.credit_transactions), negative: Number(summary.credit_transactions) < 0 },
-          { label: 'Total Debit', value: formatCurrency(summary.total_debit), negative: Number(summary.total_debit) < 0 },
-          { label: 'Total Credit', value: formatCurrency(summary.total_credit), negative: Number(summary.total_credit) < 0 },
-          { label: 'Ending Balance', value: formatCurrency(summary.ending_balance), negative: Number(summary.ending_balance) < 0 },
-          { label: 'Average Daily Balance (ADB)', value: formatCurrency(summary.adb), negative: Number(summary.adb) < 0 }
+          { label: 'Total Debit', value: formatCurrencyOrDash(summary.total_debit), negative: Number(summary.total_debit) < 0 },
+          { label: 'Total Credit', value: formatCurrencyOrDash(summary.total_credit), negative: Number(summary.total_credit) < 0 },
+          { label: 'Total Credit Monthly Average', value: formatCurrencyOrDash(computedTotalCreditMonthlyAverage), negative: Number(computedTotalCreditMonthlyAverage) < 0 },
+          { label: 'Average Daily Balance (ADB)', value: formatCurrencyOrDash(summary.adb), negative: Number(summary.adb) < 0 }
         ];
         const monthlyRows = Array.isArray(summary.monthly) ? summary.monthly : [];
 
@@ -1782,6 +1819,8 @@
                     <th>Month</th>
                     <th class="num">Total Debit</th>
                     <th class="num">Total Credit</th>
+                    <th class="num">Debit Count</th>
+                    <th class="num">Credit Count</th>
                     <th class="num">Avg Debit</th>
                     <th class="num">Avg Credit</th>
                     <th class="num">ADB</th>
@@ -1793,14 +1832,16 @@
                       ? monthlyRows.map((row) => `
                           <tr>
                             <td>${escapeHtml(row.month || '-')}</td>
-                            <td class="num${Number(row.debit) < 0 ? ' is-negative' : ''}">${escapeHtml(formatCurrency(row.debit))}</td>
-                            <td class="num${Number(row.credit) < 0 ? ' is-negative' : ''}">${escapeHtml(formatCurrency(row.credit))}</td>
-                            <td class="num${Number(row.avg_debit) < 0 ? ' is-negative' : ''}">${escapeHtml(formatCurrency(row.avg_debit))}</td>
-                            <td class="num${Number(row.avg_credit) < 0 ? ' is-negative' : ''}">${escapeHtml(formatCurrency(row.avg_credit))}</td>
-                            <td class="num${Number(row.adb) < 0 ? ' is-negative' : ''}">${escapeHtml(formatCurrency(row.adb))}</td>
+                            <td class="num${Number(row.debit) < 0 ? ' is-negative' : ''}">${escapeHtml(formatCurrencyOrDash(row.debit))}</td>
+                            <td class="num${Number(row.credit) < 0 ? ' is-negative' : ''}">${escapeHtml(formatCurrencyOrDash(row.credit))}</td>
+                            <td class="num">${escapeHtml(formatNumber(row.debit_count || 0))}</td>
+                            <td class="num">${escapeHtml(formatNumber(row.credit_count || 0))}</td>
+                            <td class="num${Number(row.avg_debit) < 0 ? ' is-negative' : ''}">${escapeHtml(formatCurrencyOrDash(row.avg_debit))}</td>
+                            <td class="num${Number(row.avg_credit) < 0 ? ' is-negative' : ''}">${escapeHtml(formatCurrencyOrDash(row.avg_credit))}</td>
+                            <td class="num${Number(row.adb) < 0 ? ' is-negative' : ''}">${escapeHtml(formatCurrencyOrDash(row.adb))}</td>
                           </tr>
                         `).join('')
-                      : '<tr><td colspan="6" class="summary-table-empty">No monthly data available.</td></tr>'
+                      : '<tr><td colspan="8" class="summary-table-empty">No monthly data available.</td></tr>'
                   }
                 </tbody>
               </table>

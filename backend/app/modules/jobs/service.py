@@ -9,6 +9,7 @@ import os
 import time
 import uuid
 import zipfile
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from xml.sax.saxutils import escape as xml_escape
@@ -27,6 +28,8 @@ PREVIEW_MAX_PIXELS = int(os.getenv("PREVIEW_MAX_PIXELS", "6000000"))
 _ACTIVE_CELERY_STATES = {"PENDING", "RECEIVED", "STARTED", "RETRY"}
 _PAGE_TERMINAL_STATES = {"done", "failed"}
 _PAGE_ACTIVE_STATES = {"queued", "processing", "retrying"}
+_JOB_UPDATE_LOCKS: Dict[str, threading.Lock] = {}
+_JOB_UPDATE_LOCKS_GUARD = threading.Lock()
 
 
 def normalize_page_name(page: str) -> str:
@@ -273,14 +276,26 @@ def update_page_rows(job_id: str, page: str, rows: List[Dict]) -> Dict:
             }
         )
 
-    rows_by_page = _load_parsed_rows(repo, job_id, required=True)
-    rows_by_page[page_name] = normalized_rows
+    lock = _get_job_update_lock(job_id)
+    with lock:
+        rows_by_page = _load_parsed_rows(repo, job_id, required=True)
+        rows_by_page[page_name] = normalized_rows
 
-    repo.write_json(repo.path(job_id, "result", "parsed_rows.json"), rows_by_page)
-    summary = compute_summary(_flatten_rows(rows_by_page))
-    repo.write_json(repo.path(job_id, "result", "summary.json"), summary)
+        repo.write_json(repo.path(job_id, "result", "parsed_rows.json"), rows_by_page)
+        summary = compute_summary(_flatten_rows(rows_by_page))
+        repo.write_json(repo.path(job_id, "result", "summary.json"), summary)
 
     return {"page": page_name, "rows": normalized_rows, "summary": summary}
+
+
+def _get_job_update_lock(job_id: str) -> threading.Lock:
+    key = str(job_id or "").strip()
+    with _JOB_UPDATE_LOCKS_GUARD:
+        lock = _JOB_UPDATE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _JOB_UPDATE_LOCKS[key] = lock
+        return lock
 
 
 def get_summary(job_id: str) -> Dict:
@@ -289,7 +304,9 @@ def get_summary(job_id: str) -> Dict:
 
     summary_path = repo.path(job_id, "result", "summary.json")
     if summary_path.exists():
-        return repo.read_json(summary_path, default={})
+        cached = repo.read_json(summary_path, default={})
+        if isinstance(cached, dict) and not _summary_needs_refresh(cached):
+            return cached
 
     rows_by_page = _load_parsed_rows(repo, job_id, required=True)
     rows = _flatten_rows(rows_by_page)
@@ -1024,6 +1041,24 @@ def _flatten_rows(rows_by_page: Dict[str, List[Dict]]) -> List[Dict]:
     return merged
 
 
+def _summary_needs_refresh(summary: Dict[str, Any]) -> bool:
+    if not isinstance(summary, dict):
+        return True
+    if "total_credit_monthly_average" not in summary:
+        return True
+    monthly = summary.get("monthly")
+    if monthly is None:
+        return False
+    if not isinstance(monthly, list):
+        return True
+    for row in monthly:
+        if not isinstance(row, dict):
+            return True
+        if "debit_count" not in row or "credit_count" not in row:
+            return True
+    return False
+
+
 def _coerce_progress(value, default: int = 0) -> int:
     try:
         return max(0, min(100, int(value)))
@@ -1281,6 +1316,7 @@ def compute_summary(rows: List[Dict]) -> Dict:
     credit_count = 0
     total_debit = 0.0
     total_credit = 0.0
+    total_credit_monthly_average = 0.0
     daily_balances: Dict[dt.date, float] = {}
     monthly: Dict[str, Dict] = {}
 
@@ -1319,6 +1355,10 @@ def compute_summary(rows: List[Dict]) -> Dict:
         if total_days > 0:
             adb = weighted / total_days
 
+    # Business formula requested by users:
+    # Total Credit Monthly Average = (Total Credit / 6) * 30%
+    total_credit_monthly_average = (total_credit / 6.0) * 0.30
+
     for date, debit, credit, balance in normalized:
         if not date:
             continue
@@ -1355,6 +1395,8 @@ def compute_summary(rows: List[Dict]) -> Dict:
                 "month": key,
                 "debit": round(item["debit"], 2),
                 "credit": round(item["credit"], 2),
+                "debit_count": int(item["debit_count"]),
+                "credit_count": int(item["credit_count"]),
                 "avg_debit": round((item["debit"] / item["debit_count"]), 2) if item["debit_count"] else 0.0,
                 "avg_credit": round((item["credit"] / item["credit_count"]), 2) if item["credit_count"] else 0.0,
                 "adb": round((item["balance_weighted"] / item["days"]), 2) if item["days"] else 0.0,
@@ -1367,6 +1409,7 @@ def compute_summary(rows: List[Dict]) -> Dict:
         "credit_transactions": credit_count,
         "total_debit": round(total_debit, 2),
         "total_credit": round(total_credit, 2),
+        "total_credit_monthly_average": round(total_credit_monthly_average, 2),
         "ending_balance": round(ending_balance, 2) if ending_balance is not None else None,
         "adb": round(adb, 2) if adb is not None else None,
         "monthly": monthly_rows,
@@ -1387,7 +1430,7 @@ def _build_minimal_report_pdf(job_id: str, summary: Dict, rows: List[Dict]) -> b
         f"Credit Transactions: {summary.get('credit_transactions')}",
         f"Total Debit: {summary.get('total_debit')}",
         f"Total Credit: {summary.get('total_credit')}",
-        f"Ending Balance: {summary.get('ending_balance')}",
+        f"Total Credit Monthly Average: {summary.get('total_credit_monthly_average')}",
         f"ADB: {summary.get('adb')}",
         "",
         "Top Transactions:",

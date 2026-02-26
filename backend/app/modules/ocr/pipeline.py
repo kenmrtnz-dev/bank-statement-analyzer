@@ -120,6 +120,7 @@ def _run_text_pipeline(input_pdf: Path, ocr_dir: Path, report: ProgressReporter)
     parsed_output: Dict[str, List[Dict]] = {}
     bounds_output: Dict[str, List[Dict]] = {}
     diagnostics: Dict[str, Dict] = {"job": {"source_type": "text"}, "pages": {}}
+    header_hints_by_profile: Dict[str, Dict] = {}
 
     total = len(layout_pages)
     for idx, layout in enumerate(layout_pages, start=1):
@@ -130,8 +131,19 @@ def _run_text_pipeline(input_pdf: Path, ocr_dir: Path, report: ProgressReporter)
         text = str(layout.get("text") or "")
 
         profile = detect_bank_profile(text)
-        page_rows, page_bounds, parser_diag = parse_page_with_profile_fallback(words, page_w, page_h, profile)
+        page_rows, page_bounds, parser_diag = parse_page_with_profile_fallback(
+            words,
+            page_w,
+            page_h,
+            profile,
+            header_hint=header_hints_by_profile.get(profile.name),
+        )
         filtered_rows, filtered_bounds = _filter_rows_and_bounds(page_rows, page_bounds, profile)
+
+        selected_profile = str(parser_diag.get("profile_selected") or profile.name)
+        header_anchors = parser_diag.get("header_anchors")
+        if isinstance(header_anchors, dict) and header_anchors:
+            header_hints_by_profile[selected_profile] = dict(header_anchors)
 
         parsed_output[page_name] = filtered_rows
         bounds_output[page_name] = filtered_bounds
@@ -140,8 +152,11 @@ def _run_text_pipeline(input_pdf: Path, ocr_dir: Path, report: ProgressReporter)
             "bank_profile": profile.name,
             "rows_parsed": len(filtered_rows),
             "profile_detected": parser_diag.get("profile_detected", profile.name),
-            "profile_selected": parser_diag.get("profile_selected", profile.name),
+            "profile_selected": selected_profile,
             "fallback_applied": bool(parser_diag.get("fallback_applied", False)),
+            "header_detected": bool(parser_diag.get("header_detected", False)),
+            "header_hint_used": bool(parser_diag.get("header_hint_used", False)),
+            "fallback_mode": parser_diag.get("fallback_mode"),
         }
         _write_json_atomic(ocr_dir / f"{page_name}.json", [])
 
