@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Bank Statement Analyzer</title>
-    <link rel="stylesheet" href="/static/ui.css?v=20260223m" />
+    <link rel="stylesheet" href="/static/ui.css?v=20260226c" />
   </head>
   <body>
     <main class="app-shell">
@@ -22,7 +22,7 @@
           </a>
         </nav>
         <div class="header-right">
-          <p class="header-note">Upload first, then start parsing from file actions.</p>
+          <p class="header-note">Start parsing from file actions.</p>
           <span id="userRoleLabel" class="role-chip">-</span>
           <a id="adminLink" class="button-link ghost hidden" href="/admin">Admin</a>
           <button id="logoutBtn" type="button" class="button-link ghost">Logout</button>
@@ -31,74 +31,17 @@
 
       <section class="workspace">
         <section id="uploadsView" class="view-pane">
-          <section class="card dropzone-card uploads-dropzone-card">
-            <form id="uploadForm" class="upload-row">
-              <div id="uploadSurface" class="upload-surface">
-                <div class="upload-center">
-                <p class="upload-main">
-                  <span class="upload-main-title">Drag & drop your PDF here</span>
-                </p>
-                <p class="upload-sub"><label for="pdfFile" class="upload-link">or click to browse</label></p>
-                <p class="upload-format">Supported Format: PDF</p>
-                <label for="pdfFile" class="browse-btn">Browse File</label>
-              </div>
-              <input id="pdfFile" name="file" type="file" accept="application/pdf" required />
-            </div>
-            <div id="uploadProgressWrap" class="upload-progress hidden" aria-live="polite">
-              <div class="upload-progress-head">
-                <span class="upload-progress-label">Upload Progress</span>
-                <span id="uploadProgressText" class="upload-progress-value">0%</span>
-              </div>
-              <div class="upload-progress-track">
-                <div id="uploadProgressBar" class="upload-progress-bar"></div>
-              </div>
-            </div>
-
-            <input id="mode" name="mode" type="hidden" value="auto" />
-            <input id="autoStart" type="checkbox" hidden />
-          </form>
-          </section>
-
-          <section class="card table-card">
-            <div class="row-between files-head">
-              <div>
-                <h2>Recent</h2>
-                <p class="muted">Select an action to begin processing.</p>
-              </div>
-              <div class="search-wrap">
-                <span class="search-inline-icon" aria-hidden="true">⌕</span>
-                <input id="uploadSearch" class="search-input" type="text" placeholder="Search files..." />
-              </div>
-            </div>
-            <div id="uploadEmptyState" class="upload-empty-state hidden">
-              <div class="upload-empty-icon" aria-hidden="true">◌</div>
-              <p>No files uploaded yet.</p>
-              <small>Upload a PDF to begin processing.</small>
-            </div>
-            <div id="uploadTableWrap" class="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>File Name</th>
-                    <th>File Size</th>
-                    <th>Last Modified</th>
-                    <th>Uploaded By</th>
-                    <th>Status</th>
-                    <th>Actions</th>
-                  </tr>
-                </thead>
-                <tbody id="uploadRowsBody"></tbody>
-              </table>
-            </div>
-          </section>
-
           <section id="crmAttachmentsSection" class="card table-card hidden">
             <div class="row-between files-head">
               <div>
                 <h2>CRM Bank Statements</h2>
-                <p class="muted">Auto-loaded from EspoCRM Lead attachments (`cBankStatementsIds`).</p>
+                <p class="muted">Auto-loaded from EspoCRM Lead + Account attachments (`cBankStatementsIds`).</p>
               </div>
               <div class="actions">
+                <div class="search-wrap">
+                  <span class="search-inline-icon" aria-hidden="true">⌕</span>
+                  <input id="crmSearch" class="search-input" type="text" placeholder="Search CRM files..." />
+                </div>
                 <button id="crmRefreshBtn" type="button">Refresh CRM Files</button>
                 <button id="crmLoadMoreBtn" type="button" class="ghost hidden">Load More</button>
               </div>
@@ -112,8 +55,11 @@
               <table>
                 <thead>
                   <tr>
-                    <th>Lead ID</th>
+                    <th>ID</th>
+                    <th>Type</th>
+                    <th>Date Created</th>
                     <th>Account Name</th>
+                    <th>Assigned User</th>
                     <th>File Name</th>
                     <th>Status</th>
                     <th>Actions</th>
@@ -121,6 +67,11 @@
                 </thead>
                 <tbody id="crmAttachmentsRowsBody"></tbody>
               </table>
+            </div>
+            <div id="crmPager" class="table-pager hidden">
+              <button id="crmPrevBtn" type="button" class="ghost">Previous</button>
+              <span id="crmPageInfo" class="muted">Showing 0-0</span>
+              <button id="crmNextBtn" type="button" class="ghost">Next</button>
             </div>
           </section>
         </section>
@@ -216,6 +167,6 @@
       </section>
     </main>
 
-    <script src="/static/ui.js?v=20260223m"></script>
+    <script src="/static/ui.js?v=20260226h"></script>
   </body>
 </html>

@@ -19,6 +19,7 @@ from app.modules.jobs.service import (
     get_ocr_openai_raw_page,
     get_page_bounds,
     get_page_rows,
+    get_pages_status,
     get_preview_path,
     get_status,
     get_summary,
@@ -68,6 +69,11 @@ def start_job_endpoint(job_id: uuid.UUID, mode: str | None = Query(default=None)
 @router.get("/jobs/{job_id}")
 def get_job_status_endpoint(job_id: uuid.UUID):
     return get_status(str(job_id))
+
+
+@router.get("/jobs/{job_id}/pages/status")
+def get_job_pages_status_endpoint(job_id: uuid.UUID):
+    return get_pages_status(str(job_id))
 
 
 @router.get("/jobs/{job_id}/cleaned")

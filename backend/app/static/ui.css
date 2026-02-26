@@ -1061,6 +1061,37 @@ button:active,
   border-radius: 12px;
 }
 
+#crmAttachmentsSection {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+}
+
+#crmAttachmentsTableWrap {
+  height: clamp(360px, 62vh, 680px);
+  max-height: none;
+}
+
+#crmAttachmentsTableWrap thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: #fafbff;
+}
+
+.table-pager {
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+#crmPageInfo {
+  margin: 0;
+  min-width: 150px;
+  text-align: center;
+}
+
 .parsed-side-wrap thead th {
   position: sticky;
   top: 0;
@@ -1314,5 +1345,9 @@ tr.selected {
 
   .search-wrap {
     width: 180px;
+  }
+
+  #crmAttachmentsTableWrap {
+    height: clamp(280px, 52vh, 520px);
   }
 }

@@ -103,6 +103,10 @@ def test_job_flow_with_mocked_pipeline(client, monkeypatch):
     assert status.status_code == 200
     assert status.json().get("status") == "done"
 
+    pages_status = client.get(f"/jobs/{job_id}/pages/status")
+    assert pages_status.status_code == 200
+    assert isinstance(pages_status.json(), dict)
+
     parsed = client.get(f"/jobs/{job_id}/parsed")
     assert parsed.status_code == 200
     assert parsed.json()["page_001"][0]["description"] == "Deposit"

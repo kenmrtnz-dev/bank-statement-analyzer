@@ -3,7 +3,15 @@ from __future__ import annotations
 import os
 import random
 
-from app.modules.jobs.service import mark_job_failed, mark_job_retrying, process_job
+from app.modules.jobs.service import (
+    finalize_job_processing,
+    mark_job_failed,
+    mark_job_retrying,
+    mark_page_failed,
+    mark_page_retrying,
+    process_job,
+    process_job_page,
+)
 from app.worker.celery_app import celery
 
 _RETRYABLE_OSERROR_ERRNOS = {
@@ -107,4 +115,65 @@ def process_job_task(self, job_id: str, parse_mode: str) -> dict:
         raise
 
 
-__all__ = ["process_job_task"]
+@celery.task(
+    bind=True,
+    name="jobs.process_page",
+    queue=os.getenv("CELERY_TASK_DEFAULT_QUEUE", "jobs"),
+    acks_late=True,
+    reject_on_worker_lost=True,
+)
+def process_page_task(self, job_id: str, parse_mode: str, page_name: str, page_index: int, page_count: int) -> dict:
+    task_id = str(self.request.id or "").strip() or None
+    retries_so_far = int(self.request.retries or 0)
+    max_retries = _max_retries()
+
+    try:
+        return process_job_page(
+            job_id=job_id,
+            parse_mode=parse_mode,
+            page_name=page_name,
+            page_index=int(page_index),
+            page_count=int(page_count),
+            task_id=task_id,
+        )
+    except Exception as exc:
+        if _is_retryable_exception(exc) and retries_so_far < max_retries:
+            next_attempt = retries_so_far + 1
+            countdown = _retry_delay_seconds(next_attempt)
+            mark_page_retrying(
+                job_id=job_id,
+                parse_mode=parse_mode,
+                page_name=page_name,
+                retry_attempt=next_attempt,
+                retry_max_attempts=max_retries,
+                retry_in_seconds=countdown,
+                message=str(exc),
+                task_id=task_id,
+            )
+            raise self.retry(exc=exc, countdown=countdown, max_retries=max_retries)
+
+        mark_page_failed(
+            job_id=job_id,
+            parse_mode=parse_mode,
+            page_name=page_name,
+            message=str(exc),
+            task_id=task_id,
+            retry_attempt=retries_so_far,
+            retry_max_attempts=max_retries,
+        )
+        raise
+
+
+@celery.task(
+    bind=True,
+    name="jobs.finalize_job",
+    queue=os.getenv("CELERY_TASK_DEFAULT_QUEUE", "jobs"),
+    acks_late=True,
+    reject_on_worker_lost=True,
+)
+def finalize_job_task(self, job_id: str, parse_mode: str) -> dict:
+    task_id = str(self.request.id or "").strip() or None
+    return finalize_job_processing(job_id=job_id, parse_mode=parse_mode, task_id=task_id)
+
+
+__all__ = ["process_job_task", "process_page_task", "finalize_job_task"]

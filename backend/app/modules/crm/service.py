@@ -17,7 +17,8 @@ from fastapi.responses import Response
 from app.modules.jobs.service import create_job
 
 DEFAULT_ESPOCRM_BASE_URL = "https://staging-crm.discoverycsc.com/api/v1"
-LEAD_SELECT_FIELDS = "id,accountName,cBankStatementsIds"
+LEAD_SELECT_FIELDS = "id,accountName,cBankStatementsIds,createdAt,createdByName,assignedUserName"
+ACCOUNT_SELECT_FIELDS = "id,name,cBankStatementsIds,createdAt,createdByName,assignedUserName"
 DEFAULT_TIMEOUT = httpx.Timeout(25.0, connect=10.0)
 ATTACHMENT_FILE_ENDPOINTS = ("Attachment", "Attachments")
 DEFAULT_ATTACHMENTS_PAGE_SIZE = 25
@@ -25,6 +26,8 @@ MAX_ATTACHMENTS_PAGE_SIZE = 200
 DEFAULT_ATTACHMENT_PROBE_MODE = "lazy"
 DEFAULT_ATTACHMENT_CACHE_TTL_SECONDS = 90
 DEFAULT_ATTACHMENT_PROBE_CONCURRENCY = 12
+DEFAULT_ATTACHMENT_FILENAME_PROBE_CONCURRENCY = 6
+ATTACHMENTS_PAGE_CACHE_VERSION = 3
 
 _CACHE_LOCK = threading.Lock()
 _ATTACHMENT_PAGE_CACHE: dict[tuple[str, int, int], dict[str, Any]] = {}
@@ -45,7 +48,7 @@ def _build_headers(api_key: str) -> dict[str, str]:
     return {"x-api-key": api_key}
 
 
-def _extract_lead_records(payload: Any) -> list[dict[str, Any]]:
+def _extract_records(payload: Any) -> list[dict[str, Any]]:
     if isinstance(payload, list):
         return [item for item in payload if isinstance(item, dict)]
     if not isinstance(payload, dict):
@@ -257,31 +260,34 @@ def _load_attachment_process_index() -> dict[str, dict[str, Any]]:
     return latest_by_attachment
 
 
-def _fetch_lead_batch(
+def _fetch_entity_batch(
     client: httpx.Client,
     base_url: str,
     headers: dict[str, str],
+    *,
+    entity_name: str,
+    select_fields: str,
     offset: int,
     max_size: int,
 ) -> tuple[list[dict[str, Any]], bool]:
     try:
         response = client.get(
-            f"{base_url}/Lead",
-            params={"select": LEAD_SELECT_FIELDS, "maxSize": max_size, "offset": offset},
+            f"{base_url}/{entity_name}",
+            params={"select": select_fields, "maxSize": max_size, "offset": offset},
             headers=headers,
         )
     except httpx.RequestError as exc:
-        raise HTTPException(status_code=502, detail="espocrm_lead_request_failed") from exc
+        raise HTTPException(status_code=502, detail=f"espocrm_{entity_name.lower()}_request_failed") from exc
 
     if response.status_code >= 400:
-        _raise_remote_http_error("espocrm_lead_request", response.status_code)
+        _raise_remote_http_error(f"espocrm_{entity_name.lower()}_request", response.status_code)
 
     try:
         payload = response.json()
     except ValueError as exc:
-        raise HTTPException(status_code=502, detail="espocrm_lead_response_invalid_json") from exc
+        raise HTTPException(status_code=502, detail=f"espocrm_{entity_name.lower()}_response_invalid_json") from exc
 
-    batch = _extract_lead_records(payload)
+    batch = _extract_records(payload)
     total = payload.get("total") if isinstance(payload, dict) else None
     if isinstance(total, int):
         has_more = offset + len(batch) < total
@@ -373,67 +379,123 @@ def _collect_attachment_page(
 ) -> dict[str, Any]:
     max_size = 100
     lead_offset = 0
+    account_offset = 0
     lead_count = 0
+    account_count = 0
     attachment_seen = 0
     items: list[dict[str, Any]] = []
     has_more = False
 
-    while True:
-        batch, has_more_leads = _fetch_lead_batch(client, base_url, headers, offset=lead_offset, max_size=max_size)
-        if not batch:
-            break
-        lead_offset += len(batch)
-        lead_count += len(batch)
+    sources = [
+        {
+            "entity_name": "Lead",
+            "select_fields": LEAD_SELECT_FIELDS,
+            "label": "Lead",
+            "offset_key": "lead_offset",
+        },
+        {
+            "entity_name": "Account",
+            "select_fields": ACCOUNT_SELECT_FIELDS,
+            "label": "Business Profile",
+            "offset_key": "account_offset",
+        },
+    ]
+    source_done: set[str] = set()
+    while len(source_done) < len(sources):
+        progressed = False
+        for source in sources:
+            entity_name = str(source["entity_name"])
+            if entity_name in source_done:
+                continue
+            current_offset = lead_offset if source["offset_key"] == "lead_offset" else account_offset
+            batch, has_more_entities = _fetch_entity_batch(
+                client,
+                base_url,
+                headers,
+                entity_name=entity_name,
+                select_fields=str(source["select_fields"]),
+                offset=current_offset,
+                max_size=max_size,
+            )
+            if not batch:
+                source_done.add(entity_name)
+                continue
 
-        for lead in batch:
-            lead_id = str(lead.get("id") or "").strip()
-            account_name = str(lead.get("accountName") or "").strip()
-            attachment_ids = _normalize_attachment_ids(lead.get("cBankStatementsIds"))
-            for attachment_id in attachment_ids:
-                if attachment_seen < offset:
+            progressed = True
+            if source["offset_key"] == "lead_offset":
+                lead_offset += len(batch)
+                lead_count += len(batch)
+            else:
+                account_offset += len(batch)
+                account_count += len(batch)
+
+            for record in batch:
+                record_id = str(record.get("id") or "").strip()
+                account_name = str(record.get("accountName") or record.get("name") or "").strip()
+                assigned_user = _extract_assigned_user_name(record)
+                attachment_ids = _normalize_attachment_ids(record.get("cBankStatementsIds"))
+                for attachment_id in attachment_ids:
+                    if attachment_seen < offset:
+                        attachment_seen += 1
+                        continue
+
+                    if len(items) >= limit:
+                        has_more = True
+                        break
+
                     attachment_seen += 1
-                    continue
-
-                if len(items) >= limit:
-                    has_more = True
+                    items.append(
+                        {
+                            "id": record_id,
+                            "type": str(source["label"]),
+                            "created_at": str(record.get("createdAt") or "").strip(),
+                            "account_name": account_name,
+                            "assigned_user": assigned_user,
+                            "attachment_id": attachment_id,
+                            "filename": "",
+                            "content_type": "",
+                            "size_bytes": 0,
+                            "status": "available",
+                            "error": "",
+                            "download_url": f"/crm/attachments/{quote(attachment_id, safe='')}/file",
+                            "process_job_id": "",
+                            "process_status": "not_started",
+                            "process_step": "",
+                            "process_progress": 0,
+                        }
+                    )
+                if has_more:
                     break
-
-                attachment_seen += 1
-                items.append(
-                    {
-                        "lead_id": lead_id,
-                        "account_name": account_name,
-                        "attachment_id": attachment_id,
-                        "filename": "",
-                        "content_type": "",
-                        "size_bytes": 0,
-                        "status": "available",
-                        "error": "",
-                        "download_url": f"/crm/attachments/{quote(attachment_id, safe='')}/file",
-                        "process_job_id": "",
-                        "process_status": "not_started",
-                        "process_step": "",
-                        "process_progress": 0,
-                    }
-                )
             if has_more:
                 break
-
+            if not has_more_entities:
+                source_done.add(entity_name)
         if has_more:
             break
-        if not has_more_leads:
+        if not progressed:
             break
 
     next_offset = offset + len(items)
     return {
         "items": items,
         "lead_count": lead_count,
+        "account_count": account_count,
         "attachment_count": len(items),
         "offset": offset,
         "limit": limit,
         "next_offset": next_offset,
         "has_more": has_more,
     }
+
+
+def _extract_assigned_user_name(lead: dict[str, Any]) -> str:
+    created_by = str(lead.get("createdByName") or "").strip()
+    if created_by:
+        return created_by
+    direct = str(lead.get("assignedUserName") or "").strip()
+    if direct:
+        return direct
+    return ""
 
 
 def list_bank_statement_attachments(
@@ -448,17 +510,22 @@ def list_bank_statement_attachments(
         1,
         _env_int("CRM_ATTACHMENT_PROBE_CONCURRENCY", DEFAULT_ATTACHMENT_PROBE_CONCURRENCY),
     )
+    filename_probe_concurrency = max(
+        1,
+        _env_int("CRM_ATTACHMENT_FILENAME_PROBE_CONCURRENCY", DEFAULT_ATTACHMENT_FILENAME_PROBE_CONCURRENCY),
+    )
 
     base_url, api_key = _get_espocrm_settings()
     headers = _build_headers(api_key)
     process_index = _load_attachment_process_index()
-    page_cache_key = (base_url, offset, limit)
+    page_cache_key = (f"{base_url}|v{ATTACHMENTS_PAGE_CACHE_VERSION}", offset, limit)
 
     cached_page = _cache_get(_ATTACHMENT_PAGE_CACHE, page_cache_key)
     if isinstance(cached_page, dict):
         page_payload = {
             "items": [dict(item) for item in (cached_page.get("items") or [])],
             "lead_count": int(cached_page.get("lead_count") or 0),
+            "account_count": int(cached_page.get("account_count") or 0),
             "attachment_count": int(cached_page.get("attachment_count") or 0),
             "offset": int(cached_page.get("offset") or offset),
             "limit": int(cached_page.get("limit") or limit),
@@ -478,7 +545,7 @@ def list_bank_statement_attachments(
 
     rows: list[dict[str, Any]] = [dict(item) for item in (page_payload.get("items") or [])]
 
-    if probe_mode == "eager" and rows:
+    if rows:
         def _run_probe(target: dict[str, Any]) -> tuple[str, dict[str, Any] | None, HTTPException | None]:
             attachment_id = str(target.get("attachment_id") or "").strip()
             if not attachment_id:
@@ -495,7 +562,8 @@ def list_bank_statement_attachments(
                 return attachment_id, None, exc
 
         by_attachment: dict[str, dict[str, Any]] = {str(item.get("attachment_id") or ""): item for item in rows}
-        with ThreadPoolExecutor(max_workers=min(probe_concurrency, len(rows))) as pool:
+        max_workers = probe_concurrency if probe_mode == "eager" else filename_probe_concurrency
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(rows))) as pool:
             futures = [pool.submit(_run_probe, item) for item in rows]
             for future in as_completed(futures):
                 attachment_id, metadata, error = future.result()
@@ -505,13 +573,13 @@ def list_bank_statement_attachments(
                 if metadata is not None:
                     target.update(metadata)
                     target["status"] = "available"
-                elif error is not None:
+                elif error is not None and probe_mode == "eager":
                     target["status"] = "unavailable"
                     target["error"] = str(error.detail or "espocrm_attachment_probe_failed")
-    else:
+    if probe_mode != "eager":
         for item in rows:
             attachment_id = str(item.get("attachment_id") or "").strip()
-            item["filename"] = _sanitize_filename(None, f"{attachment_id}.pdf")
+            item["filename"] = _sanitize_filename(item.get("filename"), f"{attachment_id}.pdf")
             item["content_type"] = "application/pdf"
             item["size_bytes"] = int(item.get("size_bytes") or 0)
             item["status"] = "available"
@@ -525,6 +593,7 @@ def list_bank_statement_attachments(
     return {
         "items": rows,
         "lead_count": int(page_payload.get("lead_count") or 0),
+        "account_count": int(page_payload.get("account_count") or 0),
         "attachment_count": len(rows),
         "offset": int(page_payload.get("offset") or offset),
         "limit": int(page_payload.get("limit") or limit),
@@ -533,6 +602,7 @@ def list_bank_statement_attachments(
         "probe_mode": probe_mode,
         "cache_ttl_seconds": cache_ttl_seconds,
         "probe_concurrency": probe_concurrency if probe_mode == "eager" else 0,
+        "filename_probe_concurrency": filename_probe_concurrency if probe_mode != "eager" else 0,
     }
 
 
