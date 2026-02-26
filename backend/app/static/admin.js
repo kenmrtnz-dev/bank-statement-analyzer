@@ -4,6 +4,9 @@
   const createForm = document.getElementById('createEvaluatorForm');
   const createFeedback = document.getElementById('createEvaluatorFeedback');
   const clearForm = document.getElementById('clearStoreForm');
+  const featureToggleForm = document.getElementById('featureToggleForm');
+  const uploadTestingToggle = document.getElementById('uploadTestingToggle');
+  const featureToggleFeedback = document.getElementById('featureToggleFeedback');
   const logoutBtn = document.getElementById('adminLogoutBtn');
   const confirmModal = document.getElementById('confirmModal');
   const confirmCancelBtn = document.getElementById('confirmCancelBtn');
@@ -27,6 +30,15 @@
     createFeedback.style.borderColor = isError ? '#f5ccd8' : '#cae8d5';
   }
 
+  function showFeatureFeedback(message, isError = false) {
+    if (!featureToggleFeedback) return;
+    featureToggleFeedback.textContent = message;
+    featureToggleFeedback.classList.remove('hidden');
+    featureToggleFeedback.style.color = isError ? '#a22e45' : '#1f6d44';
+    featureToggleFeedback.style.background = isError ? '#fdeef2' : '#edf9f2';
+    featureToggleFeedback.style.borderColor = isError ? '#f5ccd8' : '#cae8d5';
+  }
+
   function openConfirmModal() {
     confirmModal?.classList.remove('hidden');
   }
@@ -46,9 +58,18 @@
       show('Admin access required.', true);
       if (createForm) createForm.style.display = 'none';
       if (clearForm) clearForm.style.display = 'none';
+      if (featureToggleForm) featureToggleForm.style.display = 'none';
       return false;
     }
     return true;
+  }
+
+  async function loadSettings() {
+    if (!uploadTestingToggle) return;
+    const res = await fetch('/admin/settings');
+    if (!res.ok) throw new Error(await res.text());
+    const payload = await res.json();
+    uploadTestingToggle.checked = Boolean(payload.upload_testing_enabled);
   }
 
   createForm?.addEventListener('submit', async (e) => {
@@ -74,6 +95,22 @@
   clearForm?.addEventListener('submit', async (e) => {
     e.preventDefault();
     openConfirmModal();
+  });
+
+  featureToggleForm?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    try {
+      const enabled = Boolean(uploadTestingToggle?.checked);
+      const res = await fetch('/admin/settings/upload-testing', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled })
+      });
+      if (!res.ok) throw new Error(await res.text());
+      showFeatureFeedback(`Upload testing section ${enabled ? 'enabled' : 'disabled'}.`);
+    } catch (err) {
+      showFeatureFeedback(`Failed to save toggle: ${err.message}`, true);
+    }
   });
 
   confirmCancelBtn?.addEventListener('click', () => closeConfirmModal());
@@ -106,5 +143,10 @@
     }
   });
 
-  requireAdmin().catch(() => show('Failed to verify admin session.', true));
+  requireAdmin()
+    .then((ok) => {
+      if (!ok) return;
+      return loadSettings();
+    })
+    .catch(() => show('Failed to verify admin session.', true));
 })();

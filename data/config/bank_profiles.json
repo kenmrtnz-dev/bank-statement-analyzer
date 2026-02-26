@@ -8,7 +8,6 @@
       "balance_tokens": ["balance", "ending balance", "closing balance", "end balance", "running balance"],
       "date_order": ["mdy", "dmy", "ymd"],
       "noise_tokens": ["balance at period", "beginning balance", "brought forward"],
-      "ocr_backends": ["paddleocr", "tesseract", "easyocr"],
       "account_name_patterns": [
         "^\\s*([A-Z][A-Z0-9 .,\\-'/&]{2,120}?(?:CORPORATION|CORP\\.?|INC\\.?|COMPANY|CO\\.?|LIMITED|LTD\\.?))\\b",
         "account\\s*name\\s*[:\\-]?\\s*([A-Z0-9][A-Z0-9 .,\\-'/&]{2,90})",
@@ -29,7 +28,6 @@
       "balance_tokens": ["balance", "closing balance"],
       "date_order": ["dmy", "mdy", "ymd"],
       "noise_tokens": ["balance carried forward", "balance at period"],
-      "ocr_backends": ["paddleocr", "tesseract", "easyocr"],
       "account_name_patterns": [
         "^\\s*([A-Z][A-Z0-9 .,\\-'/&]{2,120}?(?:CORPORATION|CORP\\.?|INC\\.?|COMPANY|CO\\.?|LIMITED|LTD\\.?))\\b",
         "account\\s*name\\s*[:\\-]?\\s*([A-Z0-9][A-Z0-9 .,\\-'/&]{2,90})",
@@ -48,7 +46,6 @@
       "balance_tokens": ["closing balance", "balance"],
       "date_order": ["dmy", "mdy", "ymd"],
       "noise_tokens": ["balance at period"],
-      "ocr_backends": ["paddleocr", "tesseract", "easyocr"],
       "account_name_patterns": [
         "account\\s*name\\s*[:\\-]?\\s*([A-Z0-9][A-Z0-9 .,\\-'/&]{2,90})",
         "depositor\\s*name\\s*[:\\-]?\\s*([A-Z0-9][A-Z0-9 .,\\-'/&]{2,90})"
@@ -65,7 +62,6 @@
       "balance_tokens": ["end balance", "ending balance", "balance"],
       "date_order": ["dmy", "mdy", "ymd"],
       "noise_tokens": ["total debit", "total credit", "begin balance", "end balance"],
-      "ocr_backends": ["paddleocr", "tesseract", "easyocr"],
       "account_name_patterns": [
         "account\\s*name\\s*[:\\-]?\\s*([A-Z0-9][A-Z0-9 .,\\-'/&]{2,90})",
         "account\\s*holder\\s*[:\\-]?\\s*([A-Z0-9][A-Z0-9 .,\\-'/&]{2,90})"
@@ -83,7 +79,6 @@
       "balance_tokens": ["ending balance", "balance"],
       "date_order": ["ymd", "mdy", "dmy"],
       "noise_tokens": ["available balance", "current balance", "period covered"],
-      "ocr_backends": ["paddleocr", "tesseract", "easyocr"],
       "account_name_patterns": [
         "account\\s*name\\s*[:\\-]?\\s*([A-Z0-9][A-Z0-9 .,\\-'/&]{2,90})",
         "depositor\\s*name\\s*[:\\-]?\\s*([A-Z0-9][A-Z0-9 .,\\-'/&]{2,90})"
@@ -100,8 +95,7 @@
       "credit_tokens": ["credit", "credits", "deposit", "deposits"],
       "balance_tokens": ["balance", "ending balance", "running balance"],
       "date_order": ["mdy", "dmy", "ymd"],
-      "noise_tokens": ["beginning balance", "available balance", "total"],
-      "ocr_backends": ["paddleocr", "tesseract", "easyocr"]
+      "noise_tokens": ["beginning balance", "available balance", "total"]
     },
     "CHINABANK": {
       "date_tokens": ["date", "txn date", "transaction date", "value date"],
@@ -110,8 +104,7 @@
       "credit_tokens": ["credit", "credits", "deposit", "deposits"],
       "balance_tokens": ["balance", "ending balance", "running balance", "outstanding balance"],
       "date_order": ["mdy", "dmy", "ymd"],
-      "noise_tokens": ["total debit", "total credit", "balance forward"],
-      "ocr_backends": ["paddleocr", "tesseract", "easyocr"]
+      "noise_tokens": ["total debit", "total credit", "balance forward"]
     },
     "RCBC": {
       "date_tokens": ["date", "book date", "posting date", "value date", "transaction date"],
@@ -121,7 +114,6 @@
       "balance_tokens": ["balance", "ending balance", "running balance", "closing balance"],
       "date_order": ["mdy", "dmy", "ymd"],
       "noise_tokens": ["available balance", "current balance", "balance brought forward"],
-      "ocr_backends": ["paddleocr", "tesseract", "easyocr"],
       "account_name_patterns": [
         "account\\s*name\\s*[:\\-]?\\s*([A-Z0-9][A-Z0-9 .,\\-'/&]{2,90})",
         "depositor\\s*name\\s*[:\\-]?\\s*([A-Z0-9][A-Z0-9 .,\\-'/&]{2,90})"
@@ -138,8 +130,7 @@
       "credit_tokens": ["credit", "credits", "deposit", "deposits"],
       "balance_tokens": ["balance", "ending balance", "closing balance", "running balance"],
       "date_order": ["mdy", "dmy", "ymd"],
-      "noise_tokens": ["balance brought forward", "available balance", "current balance", "period covered"],
-      "ocr_backends": ["paddleocr", "tesseract", "easyocr"]
+      "noise_tokens": ["balance brought forward", "available balance", "current balance", "period covered"]
     },
     "STERLING": {
       "date_tokens": ["date", "book date", "posting date", "value date"],
@@ -148,8 +139,7 @@
       "credit_tokens": ["credit", "credits", "deposit", "deposits"],
       "balance_tokens": ["balance", "ending balance", "closing balance", "running balance"],
       "date_order": ["mdy", "dmy", "ymd"],
-      "noise_tokens": ["balance brought forward", "period covered", "available balance"],
-      "ocr_backends": ["paddleocr", "tesseract", "easyocr"]
+      "noise_tokens": ["balance brought forward", "period covered", "available balance"]
     }
   },
   "detection_rules": [

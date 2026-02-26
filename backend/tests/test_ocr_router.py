@@ -42,13 +42,11 @@ def test_resolve_document_parse_mode_uses_ocr_when_text_is_low(monkeypatch, tmp_
 
 
 def test_openai_selected_even_when_page_count_exceeds_previous_limit(monkeypatch):
-    monkeypatch.setenv("ENABLE_OPENAI_OCR", "true")
-
     class _DummyOpenAIClient:
         pass
 
     monkeypatch.setattr(router.OpenAIVisionOCR, "from_env", staticmethod(lambda: _DummyOpenAIClient()))
-    selected = router.build_scanned_ocr_router(page_count=75, fallback_backend="easyocr")
+    selected = router.build_scanned_ocr_router(page_count=75)
     assert selected.engine_name == "openai_vision"
     assert selected.openai_client is not None
 

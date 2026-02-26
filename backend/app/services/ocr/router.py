@@ -7,17 +7,9 @@ from typing import Dict, List
 
 from pypdf import PdfReader
 
-from app.ocr_engine import ocr_image
 from app.services.ocr.openai_vision import OpenAIVisionOCR
 
 DEFAULT_DIGITAL_TEXT_THRESHOLD = 300
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = str(os.getenv(name, "")).strip().lower()
-    if not raw:
-        return default
-    return raw in {"1", "true", "yes", "on"}
 
 
 def _env_int(name: str, default: int) -> int:
@@ -38,15 +30,10 @@ class DocumentTextProfile:
 @dataclass
 class ScannedOCRRouter:
     engine_name: str
-    local_backend: str
-    openai_client: OpenAIVisionOCR | None = None
+    openai_client: OpenAIVisionOCR
 
     def ocr_page(self, image_path: str | Path) -> List[Dict]:
-        if self.engine_name == "openai_vision":
-            if self.openai_client is None:
-                raise RuntimeError("openai_ocr_not_initialized")
-            return self.openai_client.extract_ocr_items(image_path)
-        return ocr_image(str(image_path), backend=self.local_backend)
+        return self.openai_client.extract_ocr_items(image_path)
 
 
 def detect_document_text_profile(
@@ -98,14 +85,9 @@ def scanned_render_dpi() -> int:
     return max(150, min(200, raw))
 
 
-def build_scanned_ocr_router(page_count: int, fallback_backend: str = "easyocr") -> ScannedOCRRouter:
-    enable_openai = _env_bool("ENABLE_OPENAI_OCR", True)
-    if not enable_openai:
-        return ScannedOCRRouter(engine_name=fallback_backend, local_backend=fallback_backend)
-
+def build_scanned_ocr_router(page_count: int) -> ScannedOCRRouter:
     openai_client = OpenAIVisionOCR.from_env()
     return ScannedOCRRouter(
         engine_name="openai_vision",
-        local_backend=fallback_backend,
         openai_client=openai_client,
     )
