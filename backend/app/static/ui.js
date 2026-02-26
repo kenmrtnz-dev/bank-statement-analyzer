@@ -50,7 +50,12 @@
     uploadTableWrap: document.getElementById('uploadTableWrap'),
     crmAttachmentsSection: document.getElementById('crmAttachmentsSection'),
     crmRefreshBtn: document.getElementById('crmRefreshBtn'),
+    crmSearch: document.getElementById('crmSearch'),
     crmLoadMoreBtn: document.getElementById('crmLoadMoreBtn'),
+    crmPager: document.getElementById('crmPager'),
+    crmPrevBtn: document.getElementById('crmPrevBtn'),
+    crmNextBtn: document.getElementById('crmNextBtn'),
+    crmPageInfo: document.getElementById('crmPageInfo'),
     crmAttachmentsRowsBody: document.getElementById('crmAttachmentsRowsBody'),
     crmAttachmentsEmptyState: document.getElementById('crmAttachmentsEmptyState'),
     crmAttachmentsTableWrap: document.getElementById('crmAttachmentsTableWrap'),
@@ -83,13 +88,17 @@
     crmLoadingMore: false,
     crmLimit: 25,
     crmOffset: 0,
+    crmCurrentOffset: 0,
+    crmNextOffset: 0,
     crmHasMore: false,
     crmProbeMode: 'lazy',
     crmProcessByAttachment: {},
     crmStatusTimer: null,
+    crmSearch: '',
     pageSaveTimers: {},
     pageSaveTokenByPage: {},
-    parsedPanelMode: 'table'
+    parsedPanelMode: 'table',
+    currentParseMode: ''
   };
   const ROUTE_TO_VIEW = {
     '/uploads': 'uploads',
@@ -117,6 +126,45 @@
     } catch {
       // no-op
     }
+  }
+
+  async function reconcileStoredJobsStatuses() {
+    if (!Array.isArray(state.uploadedJobs) || state.uploadedJobs.length === 0) return;
+
+    const next = [];
+    for (const row of state.uploadedJobs.slice(0, 100)) {
+      const jobId = String(row?.jobId || '').trim();
+      if (!jobId) continue;
+
+      try {
+        const res = await fetch(`/jobs/${encodeURIComponent(jobId)}`);
+        if (res.status === 401) {
+          window.location.href = '/login';
+          return;
+        }
+        if (res.status === 404) {
+          // Remove stale local row when backend no longer has the job.
+          continue;
+        }
+        if (!res.ok) {
+          next.push(row);
+          continue;
+        }
+        const payload = await res.json();
+        next.push({
+          ...row,
+          status: payload?.status || row.status || 'queued',
+          step: payload?.step || row.step || '',
+          progress: Number(payload?.progress ?? row.progress ?? 0)
+        });
+      } catch {
+        next.push(row);
+      }
+    }
+
+    state.uploadedJobs = next;
+    saveStoredJobs();
+    renderUploadedRows();
   }
 
   async function api(url, opts) {
@@ -158,8 +206,12 @@
   }
 
   function formatDate(ts) {
-    const d = new Date(ts);
-    if (Number.isNaN(d.getTime())) return '-';
+    const raw = String(ts || '').trim();
+    if (!raw) return '-';
+    const basic = raw.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (basic) return `${basic[1]}-${basic[2]}-${basic[3]}`;
+    const d = new Date(raw.replace(' ', 'T'));
+    if (Number.isNaN(d.getTime())) return raw;
     const y = d.getFullYear();
     const m = String(d.getMonth() + 1).padStart(2, '0');
     const day = String(d.getDate()).padStart(2, '0');
@@ -265,10 +317,23 @@
 
   function setCrmLoadMoreState() {
     if (!els.crmLoadMoreBtn) return;
-    const show = Boolean(state.crmHasMore) && !state.crmLoading && !state.crmAttachmentsError;
-    els.crmLoadMoreBtn.classList.toggle('hidden', !show);
-    els.crmLoadMoreBtn.disabled = state.crmLoading || state.crmLoadingMore || !state.crmHasMore;
-    els.crmLoadMoreBtn.textContent = state.crmLoadingMore ? 'Loading…' : 'Load More';
+    // Replaced by bottom pagination controls.
+    els.crmLoadMoreBtn.classList.add('hidden');
+    els.crmLoadMoreBtn.disabled = true;
+    els.crmLoadMoreBtn.textContent = 'Load More';
+  }
+
+  function setCrmPaginationState() {
+    if (!els.crmPager) return;
+    const hasRows = Array.isArray(state.crmAttachments) && state.crmAttachments.length > 0;
+    const show = !state.crmAttachmentsError && (hasRows || state.crmCurrentOffset > 0 || state.crmHasMore || state.crmLoading);
+    els.crmPager.classList.toggle('hidden', !show);
+
+    const from = hasRows ? state.crmCurrentOffset + 1 : 0;
+    const to = hasRows ? state.crmCurrentOffset + state.crmAttachments.length : 0;
+    if (els.crmPageInfo) els.crmPageInfo.textContent = `Showing ${from}-${to}`;
+    if (els.crmPrevBtn) els.crmPrevBtn.disabled = state.crmLoading || state.crmLoadingMore || state.crmCurrentOffset <= 0;
+    if (els.crmNextBtn) els.crmNextBtn.disabled = state.crmLoading || state.crmLoadingMore || !state.crmHasMore;
   }
 
   function normalizeApiErrorMessage(rawMessage) {
@@ -391,7 +456,25 @@
   function renderCrmAttachmentRows() {
     if (!els.crmAttachmentsRowsBody) return;
 
-    const items = Array.isArray(state.crmAttachments) ? state.crmAttachments : [];
+    const search = String(state.crmSearch || '').trim().toLowerCase();
+    const sourceItems = Array.isArray(state.crmAttachments) ? state.crmAttachments : [];
+    const items = sourceItems.filter((item) => {
+      if (!search) return true;
+      return [
+        item?.id,
+        item?.type,
+        item?.created_at,
+        item?.account_name,
+        item?.assigned_user,
+        item?.attachment_id,
+        item?.filename,
+        item?.process_job_id,
+        item?.process_status,
+      ]
+        .map((v) => String(v || '').toLowerCase())
+        .join(' ')
+        .includes(search);
+    });
     const hasRows = items.length > 0;
     const hasError = Boolean(state.crmAttachmentsError);
     const showTable = state.crmLoading || hasRows || hasError;
@@ -406,22 +489,30 @@
 
     if (state.crmLoading) {
       const tr = document.createElement('tr');
-      tr.innerHTML = '<td colspan="5" class="table-empty-cell">Loading CRM files…</td>';
+      tr.innerHTML = '<td colspan="8" class="table-empty-cell">Loading CRM files…</td>';
       els.crmAttachmentsRowsBody.appendChild(tr);
       setCrmLoadMoreState();
+      setCrmPaginationState();
       return;
     }
 
     if (hasError) {
       const tr = document.createElement('tr');
-      tr.innerHTML = `<td colspan="5" class="table-empty-cell">${escapeHtml(state.crmAttachmentsError)}</td>`;
+      tr.innerHTML = `<td colspan="8" class="table-empty-cell">${escapeHtml(state.crmAttachmentsError)}</td>`;
       els.crmAttachmentsRowsBody.appendChild(tr);
       setCrmLoadMoreState();
+      setCrmPaginationState();
       return;
     }
 
     if (!hasRows) {
+      if (search && sourceItems.length > 0) {
+        const tr = document.createElement('tr');
+        tr.innerHTML = '<td colspan="8" class="table-empty-cell">No matching CRM files.</td>';
+        els.crmAttachmentsRowsBody.appendChild(tr);
+      }
       setCrmLoadMoreState();
+      setCrmPaginationState();
       return;
     }
 
@@ -429,6 +520,8 @@
       const status = String(item.status || 'unavailable').toLowerCase();
       const isAvailable = status === 'available';
       const attachmentId = String(item.attachment_id || '').trim();
+      const recordId = String(item.id || item.lead_id || '').trim();
+      const sourceType = String(item.type || 'Lead').trim();
       const process = state.crmProcessByAttachment[attachmentId] || {
         jobId: String(item.process_job_id || '').trim(),
         status: normalizeProcessStatus(item.process_status),
@@ -454,11 +547,19 @@
         ? escapeHtml(item.filename || '-')
         : `${escapeHtml(item.filename || '-')}${item.error ? `<div class="subtle-id">${escapeHtml(item.error)}</div>` : ''}`;
       const statusCell = `<span class="status-pill ${processStatusClass(processStatus)}">${escapeHtml(formatProcessStatusLabel(processStatus))}</span>${shouldShowProcessStep(processStatus, process.step) ? `<div class="subtle-id">${escapeHtml(process.step)}</div>` : ''}`;
+      const recordEntity = sourceType === 'Business Profile' ? 'Account' : 'Lead';
+      const idCell = recordId
+        ? `<a href="https://staging-crm.discoverycsc.com/#${recordEntity}/view/${encodeURIComponent(recordId)}" target="_blank" rel="noopener noreferrer">${escapeHtml(recordId)}</a>`
+        : '-';
+      const createdAtCell = escapeHtml(formatDate(item.created_at || item.createdAt || ''));
 
       const tr = document.createElement('tr');
       tr.innerHTML = `
-        <td>${escapeHtml(item.lead_id || '-')}</td>
+        <td>${idCell}</td>
+        <td>${escapeHtml(sourceType || '-')}</td>
+        <td>${createdAtCell}</td>
         <td>${escapeHtml(item.account_name || '-')}</td>
+        <td>${escapeHtml(item.assigned_user || '-')}</td>
         <td>${fileNameCell}</td>
         <td>${statusCell}</td>
         <td>${actionCell}</td>
@@ -466,6 +567,7 @@
       els.crmAttachmentsRowsBody.appendChild(tr);
     }
     setCrmLoadMoreState();
+    setCrmPaginationState();
   }
 
   async function loadCrmAttachments(reset = true) {
@@ -475,32 +577,31 @@
     if (reset) {
       state.crmLoading = true;
       state.crmAttachmentsError = '';
-      state.crmOffset = 0;
       state.crmHasMore = false;
       setCrmRefreshState();
       setCrmLoadMoreState();
+      setCrmPaginationState();
       renderCrmAttachmentRows();
     } else {
       state.crmLoadingMore = true;
       setCrmRefreshState();
       setCrmLoadMoreState();
+      setCrmPaginationState();
     }
 
     try {
+      const requestOffset = Math.max(0, Number(state.crmOffset || 0));
       const params = new URLSearchParams({
         limit: String(state.crmLimit),
-        offset: String(state.crmOffset),
+        offset: String(requestOffset),
         probe: state.crmProbeMode,
       });
       const payload = await api(`/crm/attachments?${params.toString()}`);
       const items = Array.isArray(payload?.items) ? payload.items : [];
-      if (reset) {
-        state.crmAttachments = items;
-      } else {
-        state.crmAttachments = [...state.crmAttachments, ...items];
-      }
+      state.crmAttachments = items;
       state.crmHasMore = Boolean(payload?.has_more);
-      state.crmOffset = Number(payload?.next_offset ?? (state.crmOffset + items.length)) || 0;
+      state.crmCurrentOffset = requestOffset;
+      state.crmNextOffset = Number(payload?.next_offset ?? (requestOffset + items.length)) || 0;
       syncCrmProcessMapFromItems(state.crmAttachments);
       await refreshCrmProcessStatuses();
     } catch (err) {
@@ -514,6 +615,7 @@
       state.crmLoadingMore = false;
       setCrmRefreshState();
       setCrmLoadMoreState();
+      setCrmPaginationState();
       renderCrmAttachmentRows();
     }
   }
@@ -576,6 +678,7 @@
     if (els.jobProgress) els.jobProgress.textContent = `${progress}%`;
     if (els.jobProgressFill) els.jobProgressFill.style.width = `${progress}%`;
     state.isCompleted = mapped === 'completed';
+    state.currentParseMode = String(payload.parse_mode || state.currentParseMode || '').trim().toLowerCase();
 
     if (els.startBtn) {
       const allowStart = Boolean(state.jobId) && !['processing', 'completed', 'failed'].includes(mapped);
@@ -983,6 +1086,20 @@
     ctx.strokeRect(x, y, w, h);
   }
 
+  function getRowDisplayValue(row, rowId, index) {
+    if (state.currentParseMode === 'ocr') {
+      if (row && Object.prototype.hasOwnProperty.call(row, 'rownumber')) {
+        const value = row.rownumber;
+        return value === null || value === undefined ? '' : String(value).trim();
+      }
+      if (row && Object.prototype.hasOwnProperty.call(row, 'row_number')) {
+        return String(row.row_number || '').trim();
+      }
+      return '';
+    }
+    return String(Number(index) + 1);
+  }
+
   function renderRows() {
     clearRows();
     if (!state.currentPage || !els.rowsBody) return;
@@ -1000,7 +1117,7 @@
       tr.dataset.rowId = rowId;
 
       const rowIdCell = document.createElement('td');
-      rowIdCell.textContent = rowId;
+      rowIdCell.textContent = getRowDisplayValue(row, rowId, idx);
       tr.appendChild(rowIdCell);
 
       for (const field of EDITABLE_ROW_FIELDS) {
@@ -1393,6 +1510,7 @@
 
   if (els.crmRefreshBtn) {
     els.crmRefreshBtn.addEventListener('click', () => {
+      state.crmOffset = 0;
       loadCrmAttachments(true).catch((err) => {
         state.crmAttachmentsError = `CRM load failed: ${normalizeApiErrorMessage(err?.message)}`;
         renderCrmAttachmentRows();
@@ -1403,7 +1521,30 @@
   if (els.crmLoadMoreBtn) {
     els.crmLoadMoreBtn.addEventListener('click', () => {
       if (!state.crmHasMore) return;
-      loadCrmAttachments(false).catch((err) => {
+      state.crmOffset = state.crmNextOffset;
+      loadCrmAttachments(true).catch((err) => {
+        state.crmAttachmentsError = `CRM load failed: ${normalizeApiErrorMessage(err?.message)}`;
+        renderCrmAttachmentRows();
+      });
+    });
+  }
+
+  if (els.crmPrevBtn) {
+    els.crmPrevBtn.addEventListener('click', () => {
+      if (state.crmLoading || state.crmLoadingMore || state.crmCurrentOffset <= 0) return;
+      state.crmOffset = Math.max(0, state.crmCurrentOffset - state.crmLimit);
+      loadCrmAttachments(true).catch((err) => {
+        state.crmAttachmentsError = `CRM load failed: ${normalizeApiErrorMessage(err?.message)}`;
+        renderCrmAttachmentRows();
+      });
+    });
+  }
+
+  if (els.crmNextBtn) {
+    els.crmNextBtn.addEventListener('click', () => {
+      if (state.crmLoading || state.crmLoadingMore || !state.crmHasMore) return;
+      state.crmOffset = state.crmNextOffset;
+      loadCrmAttachments(true).catch((err) => {
         state.crmAttachmentsError = `CRM load failed: ${normalizeApiErrorMessage(err?.message)}`;
         renderCrmAttachmentRows();
       });
@@ -1453,6 +1594,13 @@
     });
   }
 
+  if (els.crmSearch) {
+    els.crmSearch.addEventListener('input', () => {
+      state.crmSearch = String(els.crmSearch.value || '').trim();
+      renderCrmAttachmentRows();
+    });
+  }
+
   if (els.menuUploads) {
     els.menuUploads.addEventListener('click', (e) => {
       e.preventDefault();
@@ -1487,6 +1635,7 @@
   renderUploadedRows();
   setCrmRefreshState();
   setCrmLoadMoreState();
+  setCrmPaginationState();
   renderCrmAttachmentRows();
   setParsedPanelMode('table');
   syncRoute(`${window.location.pathname}${window.location.search}` || '/uploads', true);
@@ -1495,9 +1644,15 @@
   updatePreviewEmptyState();
   updatePageNav();
   syncParsedSectionHeightToPreview();
-  initAuth().catch(() => {
-    window.location.href = '/login';
-  });
+  initAuth()
+    .then(() => {
+      reconcileStoredJobsStatuses().catch(() => {
+        // best-effort sync only
+      });
+    })
+    .catch(() => {
+      window.location.href = '/login';
+    });
 
   function setUploadProgress(percent, visible) {
     const safe = Math.max(0, Math.min(100, Math.round(Number(percent) || 0)));
@@ -1553,6 +1708,7 @@
       els.crmAttachmentsSection.classList.toggle('hidden', !canAccessCrmAttachments);
     }
     if (canAccessCrmAttachments) {
+      state.crmOffset = 0;
       await loadCrmAttachments();
       if (state.view === 'uploads') startCrmStatusPolling();
     } else {

@@ -6,12 +6,15 @@ import io
 import json
 import os
 import re
+import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 
 import httpx
 from PIL import Image
+from redis import Redis
 
 SYSTEM_PROMPT = (
     "You are a high-accuracy OCR engine. Extract text exactly as written. "
@@ -24,9 +27,16 @@ STRUCTURED_OCR_SYSTEM_PROMPT = (
 )
 STRUCTURED_ROWS_SYSTEM_PROMPT = (
     "You are a bank statement extraction engine. Return structured bank statement rows with tight bounds. "
-    "Include transactions and balance lines, but exclude table headers and page furniture."
+    "Include transactions and balance lines, but exclude table headers and page furniture. "
+    "Return rows in this schema: rownumber, date, description, debit, credit, balance, bounds. "
+    "rownumber is the serial number in the first/leftmost column before the date (e.g., 3, 4, 5). "
+    "Do NOT use check/reference/document numbers from description as rownumber. "
+    "rownumber must be integer when visible, otherwise null. "
+    "date must be MM/DD/YYYY when recognizable, otherwise empty string. "
+    "debit/credit/balance must be number or null."
 )
 MAX_IMAGE_BYTES = 2 * 1024 * 1024
+STRUCTURED_ROWS_CACHE_VERSION = "v2"
 
 
 class TruncatedOCRResponse(RuntimeError):
@@ -121,6 +131,12 @@ class OpenAIVisionOCR:
         self.base_url = base_url.rstrip("/")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._last_openai_response: Dict[str, Any] | None = None
+        self._rate_redis: Redis | None = None
+        self._rate_redis_init_failed = False
+        self._rate_limit_per_window = max(1, _env_int("OPENAI_OCR_RPM_LIMIT", 60))
+        self._rate_window_seconds = max(1, _env_int("OPENAI_OCR_RATE_WINDOW_SECONDS", 60))
+        self._rate_wait_timeout_seconds = max(1, _env_int("OPENAI_OCR_RATE_WAIT_TIMEOUT_SECONDS", 120))
+        self._rate_key = str(os.getenv("OPENAI_OCR_RATE_KEY", "openai:ocr:rpm")).strip() or "openai:ocr:rpm"
 
     @classmethod
     def from_env(cls) -> "OpenAIVisionOCR":
@@ -161,7 +177,12 @@ class OpenAIVisionOCR:
         self._last_openai_response = None
         return payload
 
-    def extract_structured_rows(self, image_path: str | Path) -> Dict[str, Any]:
+    def extract_structured_rows(
+        self,
+        image_path: str | Path,
+        *,
+        rate_limit_heartbeat: Callable[[float], None] | None = None,
+    ) -> Dict[str, Any]:
         path = Path(image_path)
         with Image.open(path) as img:
             page_w, page_h = img.size
@@ -181,6 +202,7 @@ class OpenAIVisionOCR:
                     page_height=page_h,
                     config=config,
                     allow_retry=allow_retry,
+                    rate_limit_heartbeat=rate_limit_heartbeat,
                 )
                 return {"rows": rows, "page_width": page_w, "page_height": page_h}
             except TruncatedOCRResponse as exc:
@@ -368,11 +390,12 @@ class OpenAIVisionOCR:
         config: OCRImageConfig,
         *,
         allow_retry: bool = True,
+        rate_limit_heartbeat: Callable[[float], None] | None = None,
     ) -> List[Dict]:
         encoded = self._encode_image(image, config)
         cache_hash = hashlib.sha256(encoded).hexdigest()
-        rows_cache_key = f"{cache_hash}.rows"
-        raw_cache_key = f"{cache_hash}.rows.raw"
+        rows_cache_key = f"{cache_hash}.rows.{STRUCTURED_ROWS_CACHE_VERSION}"
+        raw_cache_key = f"{cache_hash}.rows.raw.{STRUCTURED_ROWS_CACHE_VERSION}"
 
         cached_rows = self._cache_get_json(rows_cache_key)
         if isinstance(cached_rows, list) and cached_rows:
@@ -382,7 +405,12 @@ class OpenAIVisionOCR:
             return cached_rows
 
         try:
-            rows = self._call_openai_structured_rows(encoded, page_width=page_width, page_height=page_height)
+            rows = self._call_openai_structured_rows(
+                encoded,
+                page_width=page_width,
+                page_height=page_height,
+                rate_limit_heartbeat=rate_limit_heartbeat,
+            )
         except TruncatedOCRResponse:
             if allow_retry:
                 raise
@@ -415,6 +443,7 @@ class OpenAIVisionOCR:
             "Content-Type": "application/json",
         }
 
+        self._wait_for_rate_limit()
         with httpx.Client(timeout=self.timeout_seconds) as client:
             response = client.post(f"{self.base_url}/chat/completions", headers=headers, json=payload)
 
@@ -502,6 +531,7 @@ class OpenAIVisionOCR:
             "Content-Type": "application/json",
         }
 
+        self._wait_for_rate_limit()
         with httpx.Client(timeout=self.timeout_seconds) as client:
             response = client.post(f"{self.base_url}/chat/completions", headers=headers, json=payload)
 
@@ -541,14 +571,23 @@ class OpenAIVisionOCR:
             raise RuntimeError("openai_ocr_invalid_tokens")
         return self._normalize_structured_tokens(raw_tokens, page_width=page_width, page_height=page_height)
 
-    def _call_openai_structured_rows(self, image_bytes: bytes, page_width: int, page_height: int) -> List[Dict]:
+    def _call_openai_structured_rows(
+        self,
+        image_bytes: bytes,
+        page_width: int,
+        page_height: int,
+        rate_limit_heartbeat: Callable[[float], None] | None = None,
+    ) -> List[Dict]:
         data_url = "data:image/jpeg;base64," + base64.b64encode(image_bytes).decode("ascii")
         user_prompt = (
             "Extract bank statement rows. Return JSON only. "
-            "Each row must contain date, description, debit, credit, balance, row_type, and tight bounding box. "
-            "row_type must be one of: transaction, opening_balance, closing_balance, balance_only, other. "
+            "Each row must contain rownumber, date, description, debit, credit, balance, and tight bounding box. "
             f"Coordinates are absolute pixels for image width={int(page_width)}, height={int(page_height)}. "
-            "When debit or credit is absent, return empty string for that field."
+            "rownumber is the serial number in the first column before date; "
+            "do not use check/document/reference numbers from description. "
+            "date must be MM/DD/YYYY when recognized, otherwise empty string. "
+            "rownumber is the transaction/passbook number as integer, otherwise null. "
+            "debit/credit/balance must be number or null."
         )
         payload = {
             "model": self.model,
@@ -576,21 +615,12 @@ class OpenAIVisionOCR:
                                 "items": {
                                     "type": "object",
                                     "properties": {
+                                        "rownumber": {"type": ["integer", "null"]},
                                         "date": {"type": "string"},
                                         "description": {"type": "string"},
-                                        "debit": {"type": "string"},
-                                        "credit": {"type": "string"},
-                                        "balance": {"type": "string"},
-                                        "row_type": {
-                                            "type": "string",
-                                            "enum": [
-                                                "transaction",
-                                                "opening_balance",
-                                                "closing_balance",
-                                                "balance_only",
-                                                "other",
-                                            ],
-                                        },
+                                        "debit": {"type": ["number", "null"]},
+                                        "credit": {"type": ["number", "null"]},
+                                        "balance": {"type": ["number", "null"]},
                                         "bounds": {
                                             "type": "object",
                                             "properties": {
@@ -603,7 +633,7 @@ class OpenAIVisionOCR:
                                             "additionalProperties": False,
                                         },
                                     },
-                                    "required": ["date", "description", "debit", "credit", "balance", "row_type", "bounds"],
+                                    "required": ["rownumber", "date", "description", "debit", "credit", "balance", "bounds"],
                                     "additionalProperties": False,
                                 },
                             }
@@ -620,6 +650,7 @@ class OpenAIVisionOCR:
             "Content-Type": "application/json",
         }
 
+        self._wait_for_rate_limit(on_wait=rate_limit_heartbeat)
         with httpx.Client(timeout=self.timeout_seconds) as client:
             response = client.post(f"{self.base_url}/chat/completions", headers=headers, json=payload)
 
@@ -739,16 +770,18 @@ class OpenAIVisionOCR:
                 continue
 
             date = str(item.get("date") or "").strip()
+            rownumber = self._coerce_row_number(item.get("rownumber"), fallback=item.get("row_number"))
             description = str(item.get("description") or "").strip()
-            debit = str(item.get("debit") or "").strip()
-            credit = str(item.get("credit") or "").strip()
-            balance = str(item.get("balance") or "").strip()
+            debit = self._coerce_nullable_amount(item.get("debit"))
+            credit = self._coerce_nullable_amount(item.get("credit"))
+            balance = self._coerce_nullable_amount(item.get("balance"))
             row_type = str(item.get("row_type") or "transaction").strip().lower() or "transaction"
-            if not date and not description and not balance:
+            if not date and not description and balance is None:
                 continue
 
             out.append(
                 {
+                    "rownumber": rownumber,
                     "date": date,
                     "description": description,
                     "debit": debit,
@@ -761,6 +794,41 @@ class OpenAIVisionOCR:
         if not out:
             raise RuntimeError("openai_ocr_no_valid_rows")
         return out
+
+    @staticmethod
+    def _coerce_row_number(value: Any, fallback: Any = None) -> int | None:
+        candidate = value if value is not None else fallback
+        if candidate is None:
+            return None
+        text = str(candidate).strip()
+        if not text:
+            return None
+        if any(ch.isalpha() for ch in text):
+            return None
+        digits = "".join(ch for ch in text if ch.isdigit())
+        if not digits:
+            return None
+        try:
+            return int(digits)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _coerce_nullable_amount(value: Any) -> float | None:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value).strip()
+        if not text:
+            return None
+        cleaned = "".join(ch for ch in text if ch.isdigit() or ch in ".-")
+        if cleaned in {"", "-", ".", "-."}:
+            return None
+        try:
+            return float(cleaned)
+        except Exception:
+            return None
 
     def _encode_image(self, image: Image.Image, config: OCRImageConfig) -> bytes:
         prepared = image.convert("L")
@@ -868,3 +936,72 @@ class OpenAIVisionOCR:
             if parts:
                 return " | ".join(parts)
         return json.dumps(payload, ensure_ascii=True)
+
+    def _rate_redis_client(self) -> Redis | None:
+        if self._rate_redis is not None:
+            return self._rate_redis
+        if self._rate_redis_init_failed:
+            return None
+        try:
+            redis_url = str(os.getenv("REDIS_URL", os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0"))).strip()
+            if not redis_url:
+                redis_url = "redis://redis:6379/0"
+            self._rate_redis = Redis.from_url(redis_url, decode_responses=True, socket_timeout=5, socket_connect_timeout=5)
+            self._rate_redis.ping()
+            return self._rate_redis
+        except Exception:
+            self._rate_redis_init_failed = True
+            return None
+
+    def _wait_for_rate_limit(self, on_wait: Callable[[float], None] | None = None):
+        client = self._rate_redis_client()
+        if client is None:
+            return
+        limit = max(1, int(self._rate_limit_per_window))
+        window_ms = max(1000, int(self._rate_window_seconds * 1000))
+        timeout_s = max(1.0, float(self._rate_wait_timeout_seconds))
+        deadline = time.monotonic() + timeout_s
+        script = """
+local key = KEYS[1]
+local now_ms = tonumber(ARGV[1])
+local window_ms = tonumber(ARGV[2])
+local limit = tonumber(ARGV[3])
+local member = ARGV[4]
+redis.call('ZREMRANGEBYSCORE', key, 0, now_ms - window_ms)
+local count = redis.call('ZCARD', key)
+if count < limit then
+  redis.call('ZADD', key, now_ms, member)
+  redis.call('EXPIRE', key, math.floor(window_ms / 1000) + 5)
+  return {1, 0}
+end
+local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
+if oldest[2] == nil then
+  return {0, 50}
+end
+local wait_ms = window_ms - (now_ms - tonumber(oldest[2]))
+if wait_ms < 0 then wait_ms = 0 end
+return {0, wait_ms}
+"""
+        while True:
+            now_ms = int(time.time() * 1000)
+            member = f"{now_ms}-{uuid.uuid4().hex}"
+            ok = False
+            wait_ms = 0
+            try:
+                result = client.eval(script, 1, self._rate_key, now_ms, window_ms, limit, member)
+                ok = bool(result and int(result[0]) == 1)
+                if not ok:
+                    wait_ms = int(result[1] or 0)
+            except Exception:
+                return
+            if ok:
+                return
+            wait_s = max(0.05, min(1.0, wait_ms / 1000.0 if wait_ms > 0 else 0.2))
+            if on_wait is not None:
+                try:
+                    on_wait(wait_s)
+                except Exception:
+                    pass
+            if time.monotonic() + wait_s > deadline:
+                raise RuntimeError("openai_rate_limit_wait_timeout")
+            time.sleep(wait_s)

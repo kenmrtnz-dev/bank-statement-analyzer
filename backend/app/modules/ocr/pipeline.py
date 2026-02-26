@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import datetime as dt
 from pathlib import Path
 from typing import Callable, Dict, List
 
@@ -18,7 +19,7 @@ from app.services.ocr.router import (
     resolve_document_parse_mode,
     scanned_render_dpi,
 )
-from app.statement_parser import is_transaction_row, parse_page_with_profile_fallback
+from app.statement_parser import is_transaction_row, normalize_date, parse_page_with_profile_fallback
 
 OCR_BACKEND = "easyocr"
 PREVIEW_MAX_PIXELS = int(os.getenv("PREVIEW_MAX_PIXELS", "6000000"))
@@ -157,20 +158,13 @@ def _run_ocr_pipeline(
     ocr_dir: Path,
     report: ProgressReporter,
 ) -> tuple[Dict, Dict, Dict]:
-    report("processing", "pdf_to_images", 5)
-    page_files = _render_pdf_pages(input_pdf=input_pdf, pages_dir=pages_dir, dpi=scanned_render_dpi())
-    if not page_files:
-        raise RuntimeError("no_pages_rendered")
+    page_files = prepare_ocr_pages(
+        input_pdf=input_pdf,
+        pages_dir=pages_dir,
+        cleaned_dir=cleaned_dir,
+        report=report,
+    )
     ocr_router = build_scanned_ocr_router(page_count=len(page_files), fallback_backend=OCR_BACKEND)
-
-    report("processing", "image_cleaning", 20)
-    for idx, page_file in enumerate(page_files, start=1):
-        src = pages_dir / page_file
-        dst = cleaned_dir / page_file
-        cleaned = clean_page(str(src))
-        cv2.imwrite(str(dst), cleaned)
-        progress = 20 + int((idx / max(len(page_files), 1)) * 20)
-        report("processing", "image_cleaning", progress)
 
     parsed_output: Dict[str, List[Dict]] = {}
     bounds_output: Dict[str, List[Dict]] = {}
@@ -180,74 +174,115 @@ def _run_ocr_pipeline(
         batch = page_files[batch_start:batch_start + OPENAI_OCR_PAGE_BATCH_SIZE]
         for inner_idx, page_file in enumerate(batch, start=1):
             idx = batch_start + inner_idx
-            page_name = page_file.replace(".png", "")
-            page_path = cleaned_dir / page_file
-            page_h, page_w = _image_size(page_path)
-
-            if OPENAI_OCR_USE_STRUCTURED_ROWS and ocr_router.engine_name == "openai_vision" and ocr_router.openai_client is not None:
-                try:
-                    structured = ocr_router.openai_client.extract_structured_rows(page_path)
-                    raw_openai = ocr_router.openai_client.consume_last_openai_response()
-                    if raw_openai is not None:
-                        _write_json_atomic(ocr_dir / f"{page_name}.openai_raw.json", raw_openai)
-                    ai_rows, ai_bounds = _normalize_structured_ai_rows(
-                        structured_rows=structured.get("rows") or [],
-                        page_width=page_w,
-                        page_height=page_h,
-                    )
-                    if ai_rows:
-                        parsed_output[page_name] = ai_rows
-                        bounds_output[page_name] = ai_bounds
-                        diagnostics["pages"][page_name] = {
-                            "source_type": "ocr",
-                            "ocr_backend": ocr_router.engine_name,
-                            "row_extraction": "openai_structured_rows",
-                            "rows_parsed": len(ai_rows),
-                            "batch_size": OPENAI_OCR_PAGE_BATCH_SIZE,
-                        }
-                        _write_json_atomic(ocr_dir / f"{page_name}.json", [])
-                        progress = 45 + int((idx / max(len(page_files), 1)) * 45)
-                        report("processing", "ocr_parsing", progress)
-                        continue
-                except Exception:
-                    # Fall back to token OCR + local parser path.
-                    pass
-
-            ocr_items = ocr_router.ocr_page(page_path)
-            _write_json_atomic(ocr_dir / f"{page_name}.json", ocr_items)
-            if ocr_router.engine_name == "openai_vision" and ocr_router.openai_client is not None:
-                raw_openai = ocr_router.openai_client.consume_last_openai_response()
-                if raw_openai is not None:
-                    _write_json_atomic(ocr_dir / f"{page_name}.openai_raw.json", raw_openai)
-
-            ocr_words = _ocr_items_to_words(ocr_items)
-            text = " ".join((item.get("text") or "") for item in ocr_items)
-            profile = detect_bank_profile(text)
-
-            page_rows, page_bounds, parser_diag = parse_page_with_profile_fallback(
-                ocr_words,
-                page_w,
-                page_h,
-                profile,
+            page_name, page_rows, page_bounds, page_diag = process_ocr_page(
+                page_file=page_file,
+                cleaned_dir=cleaned_dir,
+                ocr_dir=ocr_dir,
+                ocr_router=ocr_router,
             )
-            filtered_rows, filtered_bounds = _filter_rows_and_bounds(page_rows, page_bounds, profile)
-
-            parsed_output[page_name] = filtered_rows
-            bounds_output[page_name] = filtered_bounds
-            diagnostics["pages"][page_name] = {
-                "source_type": "ocr",
-                "ocr_backend": ocr_router.engine_name,
-                "bank_profile": profile.name,
-                "rows_parsed": len(filtered_rows),
-                "profile_detected": parser_diag.get("profile_detected", profile.name),
-                "profile_selected": parser_diag.get("profile_selected", profile.name),
-                "fallback_applied": bool(parser_diag.get("fallback_applied", False)),
-            }
+            parsed_output[page_name] = page_rows
+            bounds_output[page_name] = page_bounds
+            diagnostics["pages"][page_name] = page_diag
 
             progress = 45 + int((idx / max(len(page_files), 1)) * 45)
             report("processing", "ocr_parsing", progress)
 
     return parsed_output, bounds_output, diagnostics
+
+
+def prepare_ocr_pages(
+    input_pdf: Path,
+    pages_dir: Path,
+    cleaned_dir: Path,
+    report: ProgressReporter | None = None,
+) -> List[str]:
+    if report is not None:
+        report("processing", "pdf_to_images", 5)
+    page_files = _render_pdf_pages(input_pdf=input_pdf, pages_dir=pages_dir, dpi=scanned_render_dpi())
+    if not page_files:
+        raise RuntimeError("no_pages_rendered")
+
+    if report is not None:
+        report("processing", "image_cleaning", 20)
+    for idx, page_file in enumerate(page_files, start=1):
+        src = pages_dir / page_file
+        dst = cleaned_dir / page_file
+        cleaned = clean_page(str(src))
+        cv2.imwrite(str(dst), cleaned)
+        if report is not None:
+            progress = 20 + int((idx / max(len(page_files), 1)) * 20)
+            report("processing", "image_cleaning", progress)
+    return page_files
+
+
+def process_ocr_page(
+    page_file: str,
+    cleaned_dir: Path,
+    ocr_dir: Path,
+    *,
+    ocr_router=None,
+    rate_limit_heartbeat=None,
+) -> tuple[str, List[Dict], List[Dict], Dict]:
+    page_name = page_file.replace(".png", "")
+    page_path = cleaned_dir / page_file
+    page_h, page_w = _image_size(page_path)
+
+    if ocr_router is None:
+        ocr_router = build_scanned_ocr_router(page_count=1, fallback_backend=OCR_BACKEND)
+
+    if OPENAI_OCR_USE_STRUCTURED_ROWS and ocr_router.engine_name == "openai_vision" and ocr_router.openai_client is not None:
+        try:
+            structured = ocr_router.openai_client.extract_structured_rows(page_path, rate_limit_heartbeat=rate_limit_heartbeat)
+            raw_openai = ocr_router.openai_client.consume_last_openai_response()
+            if raw_openai is not None:
+                _write_json_atomic(ocr_dir / f"{page_name}.openai_raw.json", raw_openai)
+            ai_rows, ai_bounds = _normalize_structured_ai_rows(
+                structured_rows=structured.get("rows") or [],
+                page_width=page_w,
+                page_height=page_h,
+            )
+            if ai_rows:
+                _write_json_atomic(ocr_dir / f"{page_name}.json", [])
+                diag = {
+                    "source_type": "ocr",
+                    "ocr_backend": ocr_router.engine_name,
+                    "row_extraction": "openai_structured_rows",
+                    "rows_parsed": len(ai_rows),
+                    "batch_size": OPENAI_OCR_PAGE_BATCH_SIZE,
+                }
+                return page_name, ai_rows, ai_bounds, diag
+        except Exception:
+            # Fall back to token OCR + local parser path.
+            pass
+
+    ocr_items = ocr_router.ocr_page(page_path)
+    _write_json_atomic(ocr_dir / f"{page_name}.json", ocr_items)
+    if ocr_router.engine_name == "openai_vision" and ocr_router.openai_client is not None:
+        raw_openai = ocr_router.openai_client.consume_last_openai_response()
+        if raw_openai is not None:
+            _write_json_atomic(ocr_dir / f"{page_name}.openai_raw.json", raw_openai)
+
+    ocr_words = _ocr_items_to_words(ocr_items)
+    text = " ".join((item.get("text") or "") for item in ocr_items)
+    profile = detect_bank_profile(text)
+
+    page_rows, page_bounds, parser_diag = parse_page_with_profile_fallback(
+        ocr_words,
+        page_w,
+        page_h,
+        profile,
+    )
+    filtered_rows, filtered_bounds = _filter_rows_and_bounds(page_rows, page_bounds, profile)
+    diag = {
+        "source_type": "ocr",
+        "ocr_backend": ocr_router.engine_name,
+        "bank_profile": profile.name,
+        "rows_parsed": len(filtered_rows),
+        "profile_detected": parser_diag.get("profile_detected", profile.name),
+        "profile_selected": parser_diag.get("profile_selected", profile.name),
+        "fallback_applied": bool(parser_diag.get("fallback_applied", False)),
+    }
+    return page_name, filtered_rows, filtered_bounds, diag
 
 
 def _filter_rows_and_bounds(page_rows: List[Dict], page_bounds: List[Dict], profile) -> tuple[List[Dict], List[Dict]]:
@@ -325,14 +360,18 @@ def _normalize_structured_ai_rows(structured_rows: List[Dict], page_width: int, 
             y1, y2 = y2, y1
 
         row_id = f"{len(rows) + 1:03}"
+        normalized_date = _normalize_structured_row_date(str(row.get("date") or "").strip())
+        rownumber_value = _infer_row_number_from_row(row)
         rows.append(
             {
                 "row_id": row_id,
-                "date": str(row.get("date") or "").strip(),
+                "rownumber": _normalize_row_number_value(rownumber_value),
+                "row_number": str(_normalize_row_number_value(rownumber_value) or ""),
+                "date": normalized_date,
                 "description": str(row.get("description") or "").strip(),
-                "debit": str(row.get("debit") or "").strip(),
-                "credit": str(row.get("credit") or "").strip(),
-                "balance": str(row.get("balance") or "").strip(),
+                "debit": _normalize_amount_value(row.get("debit")),
+                "credit": _normalize_amount_value(row.get("credit")),
+                "balance": _normalize_amount_value(row.get("balance")),
                 "row_type": str(row.get("row_type") or "transaction").strip().lower() or "transaction",
             }
         )
@@ -346,6 +385,72 @@ def _normalize_structured_ai_rows(structured_rows: List[Dict], page_width: int, 
             }
         )
     return rows, bounds
+
+
+def _normalize_row_number_value(value) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if not digits:
+        return None
+    try:
+        return int(digits)
+    except Exception:
+        return None
+
+
+def _infer_row_number_from_row(row: Dict) -> int | None:
+    direct = _normalize_row_number_value(row.get("rownumber"))
+    if direct is not None:
+        return direct
+    direct = _normalize_row_number_value(row.get("row_number"))
+    if direct is not None:
+        return direct
+    return None
+
+
+def _normalize_amount_value(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    cleaned = "".join(ch for ch in text if ch.isdigit() or ch in ".-")
+    if cleaned in {"", "-", ".", "-."}:
+        return None
+    try:
+        return float(cleaned)
+    except Exception:
+        return None
+
+
+def _normalize_structured_row_date(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+
+    iso_value = normalize_date(raw, ["mdy", "dmy", "ymd"])
+    if iso_value:
+        try:
+            parsed = dt.datetime.strptime(iso_value, "%Y-%m-%d").date()
+            return parsed.strftime("%m/%d/%Y")
+        except Exception:
+            pass
+
+    for fmt in ("%m/%d/%Y", "%d/%m/%Y", "%m-%d-%Y", "%d-%m-%Y", "%Y-%m-%d"):
+        try:
+            parsed = dt.datetime.strptime(raw, fmt).date()
+            return parsed.strftime("%m/%d/%Y")
+        except Exception:
+            continue
+    return raw
 
 
 def _classify_row_type(row: Dict, profile) -> str | None:
