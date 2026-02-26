@@ -8,7 +8,6 @@
     form: document.getElementById('uploadForm'),
     file: document.getElementById('pdfFile'),
     mode: document.getElementById('mode'),
-    autoStart: document.getElementById('autoStart'),
     startBtn: document.getElementById('startBtn'),
     jobId: document.getElementById('jobId'),
     jobStatus: document.getElementById('jobStatus'),
@@ -46,6 +45,7 @@
     uploadRowsBody: document.getElementById('uploadRowsBody'),
     uploadSearch: document.getElementById('uploadSearch'),
     uploadSurface: document.getElementById('uploadSurface'),
+    uploadTestingSection: document.getElementById('uploadTestingSection'),
     uploadEmptyState: document.getElementById('uploadEmptyState'),
     uploadTableWrap: document.getElementById('uploadTableWrap'),
     crmAttachmentsSection: document.getElementById('crmAttachmentsSection'),
@@ -82,6 +82,7 @@
     totalParsedRows: 0,
     isCompleted: false,
     authRole: '',
+    uploadTestingEnabled: false,
     crmAttachments: [],
     crmAttachmentsError: '',
     crmLoading: false,
@@ -190,6 +191,22 @@
     else state.uploadedJobs.unshift(partial);
     saveStoredJobs();
     renderUploadedRows();
+  }
+
+  function updateUploadedJobIfExists(partial) {
+    const id = String(partial.jobId || '').trim();
+    if (!id) return;
+    const idx = state.uploadedJobs.findIndex((j) => String(j.jobId) === id);
+    if (idx < 0) return;
+    state.uploadedJobs[idx] = { ...state.uploadedJobs[idx], ...partial };
+    saveStoredJobs();
+    renderUploadedRows();
+  }
+
+  function applyFeatureVisibility() {
+    if (els.uploadTestingSection) {
+      els.uploadTestingSection.classList.toggle('hidden', !state.uploadTestingEnabled);
+    }
   }
 
   function formatBytes(value) {
@@ -690,7 +707,7 @@
     updatePreviewEmptyState();
 
     if (state.jobId) {
-      upsertUploadedJob({
+      updateUploadedJobIfExists({
         jobId: state.jobId,
         status: payload.status || 'queued',
         step: payload.step || 'queued',
@@ -1364,7 +1381,7 @@
   async function uploadSelectedFile(file) {
     try {
       setUploadProgress(0, true);
-      const payload = await uploadWithProgress(file, els.mode ? els.mode.value : 'auto', Boolean(els.autoStart && els.autoStart.checked));
+      const payload = await uploadWithProgress(file, els.mode ? els.mode.value : 'auto', true);
       upsertUploadedJob({
         jobId: payload.job_id,
         fileName: file.name,
@@ -1376,6 +1393,9 @@
         progress: payload.started ? 1 : 0,
         parseMode: payload.parse_mode
       });
+      if (payload?.job_id && payload.started) {
+        await setActiveJob(payload.job_id, true);
+      }
       if (els.file) els.file.value = '';
       setUploadProgress(100, true);
       window.setTimeout(() => setUploadProgress(0, false), 500);
@@ -1392,7 +1412,7 @@
       await setActiveJob(id, true);
       const payload = await api(`/jobs/${id}/start`, { method: 'POST' });
       if (payload.started) {
-        upsertUploadedJob({ jobId: id, status: 'processing', step: 'initializing', progress: 1 });
+        updateUploadedJobIfExists({ jobId: id, status: 'processing', step: 'initializing', progress: 1 });
         startPolling();
       } else {
         pollStatus();
@@ -1707,6 +1727,13 @@
     if (els.crmAttachmentsSection) {
       els.crmAttachmentsSection.classList.toggle('hidden', !canAccessCrmAttachments);
     }
+    try {
+      const settings = await api('/ui/settings');
+      state.uploadTestingEnabled = Boolean(settings?.upload_testing_enabled);
+    } catch {
+      state.uploadTestingEnabled = false;
+    }
+    applyFeatureVisibility();
     if (canAccessCrmAttachments) {
       state.crmOffset = 0;
       await loadCrmAttachments();

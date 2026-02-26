@@ -108,11 +108,10 @@ Open:
 ## Notes
 - Jobs are queued to Redis and executed by Celery workers.
 - Retry/backoff knobs are configurable via `CELERY_TASK_MAX_RETRIES`, `CELERY_TASK_RETRY_BACKOFF_SECONDS`, and related `CELERY_TASK_*` env vars.
-- OCR backend is `easyocr` via `/Users/kenito/Desktop/bank-statement-analyzer/backend/app/ocr_engine.py`.
+- OCR backend for scanned documents is OpenAI Vision OCR.
 - Data is stored in `${DATA_DIR:-./data}/jobs/<job_id>/...`.
-- Scanned PDFs can route to OpenAI Vision OCR when enabled:
+- Scanned PDFs route to OpenAI Vision OCR:
   - `OPENAI_API_KEY`
-  - `ENABLE_OPENAI_OCR=true`
   - `OPENAI_OCR_USE_STRUCTURED_ROWS=true` (use OpenAI to return row fields + bounds directly)
   - `MAX_OPENAI_PAGES_PER_DOC=50`
   - `OPENAI_TIMEOUT_SECONDS=60`

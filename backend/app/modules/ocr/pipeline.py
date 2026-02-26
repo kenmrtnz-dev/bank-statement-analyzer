@@ -21,7 +21,7 @@ from app.services.ocr.router import (
 )
 from app.statement_parser import is_transaction_row, normalize_date, parse_page_with_profile_fallback
 
-OCR_BACKEND = "easyocr"
+OCR_BACKEND = "openai_vision"
 PREVIEW_MAX_PIXELS = int(os.getenv("PREVIEW_MAX_PIXELS", "6000000"))
 OPENAI_OCR_USE_STRUCTURED_ROWS = str(os.getenv("OPENAI_OCR_USE_STRUCTURED_ROWS", "true")).strip().lower() in {
     "1",
@@ -164,7 +164,7 @@ def _run_ocr_pipeline(
         cleaned_dir=cleaned_dir,
         report=report,
     )
-    ocr_router = build_scanned_ocr_router(page_count=len(page_files), fallback_backend=OCR_BACKEND)
+    ocr_router = build_scanned_ocr_router(page_count=len(page_files))
 
     parsed_output: Dict[str, List[Dict]] = {}
     bounds_output: Dict[str, List[Dict]] = {}
@@ -228,7 +228,7 @@ def process_ocr_page(
     page_h, page_w = _image_size(page_path)
 
     if ocr_router is None:
-        ocr_router = build_scanned_ocr_router(page_count=1, fallback_backend=OCR_BACKEND)
+        ocr_router = build_scanned_ocr_router(page_count=1)
 
     if OPENAI_OCR_USE_STRUCTURED_ROWS and ocr_router.engine_name == "openai_vision" and ocr_router.openai_client is not None:
         try:

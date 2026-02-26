@@ -5,7 +5,8 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 
-from app.modules.auth.deps import get_current_user, require_admin
+from app.modules.admin.service import get_ui_settings
+from app.modules.auth.deps import get_current_user, require_admin, require_evaluator_or_admin
 from app.modules.auth.service import (
     SESSION_COOKIE,
     authenticate_user,
@@ -55,6 +56,11 @@ def logout(request: Request):
 @router.get("/auth/me")
 def me(user=Depends(get_current_user)):
     return user
+
+
+@router.get("/ui/settings")
+def ui_settings(_user=Depends(require_evaluator_or_admin)):
+    return {"ok": True, **get_ui_settings()}
 
 
 @router.get("/admin")

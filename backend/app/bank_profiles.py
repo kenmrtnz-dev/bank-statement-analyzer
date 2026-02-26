@@ -17,7 +17,6 @@ class BankProfile:
     balance_tokens: List[str]
     date_order: List[str]
     noise_tokens: List[str]
-    ocr_backends: List[str]
     account_name_patterns: List[str]
     account_number_patterns: List[str]
 
@@ -100,7 +99,6 @@ def _load_profiles_config() -> Tuple[Dict[str, BankProfile], List[DetectionRule]
             balance_tokens=_normalize_items(raw.get("balance_tokens", [])),
             date_order=[str(v).strip().lower() for v in raw.get("date_order", []) if str(v).strip()],
             noise_tokens=_normalize_items(raw.get("noise_tokens", [])),
-            ocr_backends=[str(v).strip().lower() for v in raw.get("ocr_backends", []) if str(v).strip()],
             account_name_patterns=_normalize_capture_patterns(raw.get("account_name_patterns", [])),
             account_number_patterns=_normalize_capture_patterns(raw.get("account_number_patterns", [])),
         )

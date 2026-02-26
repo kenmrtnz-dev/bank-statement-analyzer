@@ -4,12 +4,45 @@ import os
 import shutil
 from pathlib import Path
 
-DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
+def _data_dir() -> Path:
+    return Path(os.getenv("DATA_DIR", "./data"))
+
+
+def _settings_file() -> Path:
+    return _data_dir() / "config" / "admin_settings.json"
+
+
+def get_ui_settings() -> dict:
+    path = _settings_file()
+    if not path.exists():
+        return {"upload_testing_enabled": False}
+    try:
+        import json
+
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        return {"upload_testing_enabled": bool(payload.get("upload_testing_enabled", False))}
+    except Exception:
+        return {"upload_testing_enabled": False}
+
+
+def set_upload_testing_enabled(enabled: bool) -> dict:
+    import json
+
+    path = _settings_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"upload_testing_enabled": bool(enabled)}
+    tmp = path.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+    os.replace(tmp, path)
+    return payload
 
 
 def clear_jobs_and_exports() -> dict:
-    jobs_dir = DATA_DIR / "jobs"
-    exports_dir = DATA_DIR / "exports"
+    root = _data_dir()
+    jobs_dir = root / "jobs"
+    exports_dir = root / "exports"
 
     removed_jobs = 0
     if jobs_dir.exists():
@@ -31,4 +64,3 @@ def clear_jobs_and_exports() -> dict:
     jobs_dir.mkdir(parents=True, exist_ok=True)
     exports_dir.mkdir(parents=True, exist_ok=True)
     return {"cleared_jobs": removed_jobs, "cleared_exports": removed_exports}
-

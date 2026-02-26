@@ -31,6 +31,68 @@
 
       <section class="workspace">
         <section id="uploadsView" class="view-pane">
+          <section id="uploadTestingSection" class="card uploads-dropzone-card hidden">
+            <div class="row-between files-head">
+              <div>
+                <h2>Upload Test PDF</h2>
+                <p class="muted">Testing feature for direct PDF upload and parser job creation.</p>
+              </div>
+            </div>
+            <form id="uploadForm" class="upload-row" enctype="multipart/form-data">
+              <input id="pdfFile" type="file" name="file" accept="application/pdf,.pdf" />
+              <label id="uploadSurface" for="pdfFile" class="upload-surface">
+                <div class="upload-center">
+                  <p class="upload-main">
+                    <span class="upload-main-title">Drop PDF here</span><br />
+                    or click to browse
+                  </p>
+                  <p class="upload-sub">Single file upload for parser validation.</p>
+                  <p class="upload-format">Accepted format: .pdf</p>
+                  <span class="browse-btn">Choose PDF</span>
+                </div>
+              </label>
+              <div id="uploadProgressWrap" class="upload-progress hidden" aria-live="polite">
+                <div class="upload-progress-head">
+                  <span class="upload-progress-label">Upload Progress</span>
+                  <span id="uploadProgressText" class="upload-progress-value">0%</span>
+                </div>
+                <div class="upload-progress-track">
+                  <div id="uploadProgressBar" class="upload-progress-bar"></div>
+                </div>
+              </div>
+            </form>
+
+            <div class="row-between files-head">
+              <h3>Uploaded Files</h3>
+              <div class="actions">
+                <div class="search-wrap">
+                  <span class="search-inline-icon" aria-hidden="true">⌕</span>
+                  <input id="uploadSearch" class="search-input" type="text" placeholder="Search uploads..." />
+                </div>
+              </div>
+            </div>
+            <div id="uploadEmptyState" class="upload-empty-state">
+              <div class="upload-empty-icon" aria-hidden="true">◌</div>
+              <p>No uploaded files yet.</p>
+              <small>Upload a PDF above to create a test parsing job.</small>
+            </div>
+            <div id="uploadTableWrap" class="table-wrap hidden">
+              <table>
+                <thead>
+                  <tr>
+                    <th>File</th>
+                    <th>Size</th>
+                    <th>Date</th>
+                    <th>Owner</th>
+                    <th>Status</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody id="uploadRowsBody"></tbody>
+              </table>
+            </div>
+          </section>
+
           <section id="crmAttachmentsSection" class="card table-card hidden">
             <div class="row-between files-head">
               <div>
@@ -167,6 +229,6 @@
       </section>
     </main>
 
-    <script src="/static/ui.js?v=20260226h"></script>
+    <script src="/static/ui.js?v=20260226m"></script>
   </body>
 </html>
