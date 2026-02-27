@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Bank Statement Analyzer</title>
-    <link rel="stylesheet" href="/static/ui.css?v=20260226c" />
+    <link rel="stylesheet" href="/static/ui.css?v=20260227d" />
   </head>
   <body>
     <main class="app-shell">
@@ -117,10 +117,9 @@
               <table>
                 <thead>
                   <tr>
-                    <th>ID</th>
+                    <th>Account Name</th>
                     <th>Type</th>
                     <th>Date Created</th>
-                    <th>Account Name</th>
                     <th>Assigned User</th>
                     <th>File Name</th>
                     <th>Status</th>
@@ -147,6 +146,7 @@
             <div class="actions">
               <a id="exportPdf" href="#" class="button-link disabled ghost" aria-disabled="true">Export PDF</a>
               <a id="exportExcel" href="#" class="button-link disabled ghost" aria-disabled="true">Export Excel</a>
+              <button id="exportCrm" type="button" class="button-link disabled ghost" aria-disabled="true">Export to CRM</button>
               <button id="startBtn" type="button" disabled>Start Job</button>
             </div>
           </header>
@@ -229,6 +229,6 @@
       </section>
     </main>
 
-    <script src="/static/ui.js?v=20260226o"></script>
+    <script src="/static/ui.js?v=20260227i"></script>
   </body>
 </html>

@@ -32,6 +32,37 @@ _JOB_UPDATE_LOCKS: Dict[str, threading.Lock] = {}
 _JOB_UPDATE_LOCKS_GUARD = threading.Lock()
 
 
+def _normalize_export_business_name(raw: str | None) -> str:
+    text = str(raw or "").strip().upper()
+    if not text:
+        return "UNKNOWNBUSINESS"
+    normalized = "".join(ch for ch in text if ch.isalnum())
+    return normalized or "UNKNOWNBUSINESS"
+
+
+def _resolve_export_business_name(job_id: str) -> str:
+    repo = JobsRepository(DATA_DIR)
+    meta = repo.read_json(repo.path(job_id, "meta.json"), default={})
+    if not isinstance(meta, dict):
+        meta = {}
+    candidates = [
+        meta.get("source_account_name"),
+        meta.get("account_name"),
+    ]
+    for candidate in candidates:
+        normalized = _normalize_export_business_name(str(candidate or "").strip())
+        if normalized != "UNKNOWNBUSINESS":
+            return normalized
+    return "UNKNOWNBUSINESS"
+
+
+def _build_export_filename(job_id: str, ext: str) -> str:
+    ts = dt.datetime.now().strftime("%m%d%Y%H%M")
+    business = _resolve_export_business_name(job_id)
+    clean_ext = str(ext or "").lower().lstrip(".")
+    return f"{ts}-{business}-6MOS-BANKSTATEMENTS.{clean_ext}"
+
+
 def normalize_page_name(page: str) -> str:
     value = str(page or "").strip().replace(".png", "")
     if not value:
@@ -319,7 +350,7 @@ def export_pdf(job_id: str) -> tuple[bytes, str]:
     rows = _flatten_rows(get_all_rows(job_id))
     summary = get_summary(job_id)
     pdf_bytes = _build_minimal_report_pdf(job_id, summary, rows)
-    return pdf_bytes, f"{job_id}-summary.pdf"
+    return pdf_bytes, _build_export_filename(job_id, "pdf")
 
 
 def export_csv(job_id: str) -> tuple[bytes, str]:
@@ -363,7 +394,7 @@ def export_excel(job_id: str) -> tuple[bytes, str]:
         )
 
     workbook_bytes = _build_minimal_xlsx(matrix)
-    return workbook_bytes, f"{job_id}-rows.xlsx"
+    return workbook_bytes, _build_export_filename(job_id, "xlsx")
 
 
 def _start_job_worker(job_id: str, parse_mode: str) -> bool:
