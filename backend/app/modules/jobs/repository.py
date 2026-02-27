@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from pathlib import Path
 from typing import Any, Dict
 
@@ -36,16 +37,26 @@ class JobsRepository:
 
     def write_json(self, path: Path, payload: Any):
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as handle:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
             json.dump(payload, handle, indent=2)
+            tmp = Path(handle.name)
         os.replace(tmp, path)
 
     def read_json(self, path: Path, default: Any):
         if not path.exists():
             return default
-        with open(path, encoding="utf-8") as handle:
-            return json.load(handle)
+        try:
+            with open(path, encoding="utf-8") as handle:
+                return json.load(handle)
+        except Exception:
+            return default
 
     def read_status(self, job_id: str) -> Dict[str, Any]:
         return self.read_json(self.path(job_id, "status.json"), default={})

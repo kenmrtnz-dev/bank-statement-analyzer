@@ -28,6 +28,7 @@
     reverseRowsBtn: document.getElementById('reverseRowsBtn'),
     exportPdf: document.getElementById('exportPdf'),
     exportExcel: document.getElementById('exportExcel'),
+    exportCrm: document.getElementById('exportCrm'),
     jobIdInput: document.getElementById('jobIdInput'),
     loadJobBtn: document.getElementById('loadJobBtn'),
     uploadsView: document.getElementById('uploadsView'),
@@ -87,7 +88,7 @@
     crmAttachmentsError: '',
     crmLoading: false,
     crmLoadingMore: false,
-    crmLimit: 25,
+    crmLimit: 12,
     crmOffset: 0,
     crmCurrentOffset: 0,
     crmNextOffset: 0,
@@ -96,10 +97,18 @@
     crmProcessByAttachment: {},
     crmStatusTimer: null,
     crmSearch: '',
+    crmSearchDebounceTimer: null,
+    crmLeadByJobId: {},
+    currentCrmLeadId: '',
     pageSaveTimers: {},
     pageSaveTokenByPage: {},
     parsedPanelMode: 'table',
-    currentParseMode: ''
+    currentParseMode: '',
+    reverseRowsBusy: false,
+    summaryRaw: null,
+    summaryIncludedMonths: new Set(),
+    summaryKnownMonthKeys: new Set(),
+    summarySelectionInitialized: false
   };
   const ROUTE_TO_VIEW = {
     '/uploads': 'uploads',
@@ -268,6 +277,13 @@
     return `${n < 0 ? '-' : ''}${currency}${abs}`;
   }
 
+  function formatCurrencyOrDash(value, currency = '₱') {
+    if (value === null || value === undefined || String(value).trim() === '') return '-';
+    const n = Number(value);
+    if (!Number.isFinite(n)) return '-';
+    return formatCurrency(n, currency);
+  }
+
   function escapeHtml(value) {
     return String(value ?? '')
       .replaceAll('&', '&amp;')
@@ -275,6 +291,49 @@
       .replaceAll('>', '&gt;')
       .replaceAll('"', '&quot;')
       .replaceAll("'", '&#39;');
+  }
+
+  function toFiniteNumber(value, fallback = 0) {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : fallback;
+  }
+
+  function monthlyRowKey(row, index) {
+    const month = String(row?.month || '').trim();
+    if (month) return month;
+    return `idx-${index}`;
+  }
+
+  function syncSummaryMonthSelection(monthlyRows) {
+    const rows = Array.isArray(monthlyRows) ? monthlyRows : [];
+    if (!rows.length) {
+      state.summaryIncludedMonths = new Set();
+      state.summaryKnownMonthKeys = new Set();
+      state.summarySelectionInitialized = false;
+      return [];
+    }
+
+    const keyedRows = rows.map((row, index) => ({ ...row, __monthKey: monthlyRowKey(row, index) }));
+    const availableKeys = new Set(keyedRows.map((row) => row.__monthKey));
+
+    if (!state.summarySelectionInitialized) {
+      state.summaryIncludedMonths = new Set(availableKeys);
+      state.summaryKnownMonthKeys = new Set(availableKeys);
+      state.summarySelectionInitialized = true;
+      return keyedRows;
+    }
+
+    const previousKnownKeys = new Set(state.summaryKnownMonthKeys);
+    const next = new Set();
+    for (const key of state.summaryIncludedMonths) {
+      if (availableKeys.has(key)) next.add(key);
+    }
+    for (const key of availableKeys) {
+      if (!previousKnownKeys.has(key)) next.add(key);
+    }
+    state.summaryIncludedMonths = next;
+    state.summaryKnownMonthKeys = new Set(availableKeys);
+    return keyedRows;
   }
 
   function renderUploadedRows() {
@@ -365,6 +424,30 @@
       // no-op
     }
     return text;
+  }
+
+  function getToastRoot() {
+    let root = document.getElementById('toastRoot');
+    if (root) return root;
+    root = document.createElement('div');
+    root.id = 'toastRoot';
+    root.className = 'toast-root';
+    document.body.appendChild(root);
+    return root;
+  }
+
+  function showToast(message, type = 'info', durationMs = 3200) {
+    const root = getToastRoot();
+    const toast = document.createElement('div');
+    const tone = String(type || 'info').toLowerCase();
+    toast.className = `toast toast-${tone}`;
+    toast.textContent = String(message || '').trim() || 'Done';
+    root.appendChild(toast);
+    window.requestAnimationFrame(() => toast.classList.add('is-visible'));
+    window.setTimeout(() => {
+      toast.classList.remove('is-visible');
+      window.setTimeout(() => toast.remove(), 180);
+    }, Math.max(1200, Number(durationMs) || 3200));
   }
 
   function normalizeProcessStatus(rawStatus) {
@@ -473,25 +556,9 @@
   function renderCrmAttachmentRows() {
     if (!els.crmAttachmentsRowsBody) return;
 
-    const search = String(state.crmSearch || '').trim().toLowerCase();
     const sourceItems = Array.isArray(state.crmAttachments) ? state.crmAttachments : [];
-    const items = sourceItems.filter((item) => {
-      if (!search) return true;
-      return [
-        item?.id,
-        item?.type,
-        item?.created_at,
-        item?.account_name,
-        item?.assigned_user,
-        item?.attachment_id,
-        item?.filename,
-        item?.process_job_id,
-        item?.process_status,
-      ]
-        .map((v) => String(v || '').toLowerCase())
-        .join(' ')
-        .includes(search);
-    });
+    const searchActive = Boolean(String(state.crmSearch || '').trim());
+    const items = sourceItems;
     const hasRows = items.length > 0;
     const hasError = Boolean(state.crmAttachmentsError);
     const showTable = state.crmLoading || hasRows || hasError;
@@ -506,7 +573,7 @@
 
     if (state.crmLoading) {
       const tr = document.createElement('tr');
-      tr.innerHTML = '<td colspan="8" class="table-empty-cell">Loading CRM files…</td>';
+      tr.innerHTML = '<td colspan="7" class="table-empty-cell">Loading CRM files…</td>';
       els.crmAttachmentsRowsBody.appendChild(tr);
       setCrmLoadMoreState();
       setCrmPaginationState();
@@ -515,7 +582,7 @@
 
     if (hasError) {
       const tr = document.createElement('tr');
-      tr.innerHTML = `<td colspan="8" class="table-empty-cell">${escapeHtml(state.crmAttachmentsError)}</td>`;
+      tr.innerHTML = `<td colspan="7" class="table-empty-cell">${escapeHtml(state.crmAttachmentsError)}</td>`;
       els.crmAttachmentsRowsBody.appendChild(tr);
       setCrmLoadMoreState();
       setCrmPaginationState();
@@ -523,9 +590,9 @@
     }
 
     if (!hasRows) {
-      if (search && sourceItems.length > 0) {
+      if (searchActive) {
         const tr = document.createElement('tr');
-        tr.innerHTML = '<td colspan="8" class="table-empty-cell">No matching CRM files.</td>';
+        tr.innerHTML = '<td colspan="7" class="table-empty-cell">No matching CRM files.</td>';
         els.crmAttachmentsRowsBody.appendChild(tr);
       }
       setCrmLoadMoreState();
@@ -546,17 +613,18 @@
         progress: Number(item.process_progress || 0)
       };
       const processStatus = normalizeProcessStatus(process.status);
+      const leadId = sourceType === 'Lead' ? recordId : '';
 
       let actionCell = '<span class="subtle-id">Unavailable</span>';
       if (isAvailable) {
         if (process.jobId && (processStatus === 'queued' || processStatus === 'processing')) {
-          actionCell = `<button class="row-action-btn action-queued" type="button" data-open-job-id="${escapeHtml(process.jobId)}">Open Processing</button>`;
+          actionCell = `<button class="row-action-btn action-queued" type="button" data-open-job-id="${escapeHtml(process.jobId)}" data-lead-id="${escapeHtml(leadId)}">Open Processing</button>`;
         } else if (process.jobId && (processStatus === 'completed' || processStatus === 'needs_review')) {
-          actionCell = `<button class="row-action-btn action-completed" type="button" data-open-job-id="${escapeHtml(process.jobId)}">Open Result</button>`;
+          actionCell = `<button class="row-action-btn action-completed" type="button" data-open-job-id="${escapeHtml(process.jobId)}" data-lead-id="${escapeHtml(leadId)}">Open Result</button>`;
         } else if (processStatus === 'failed') {
-          actionCell = `<button class="row-action-btn action-failed" type="button" data-process-attachment-id="${escapeHtml(attachmentId)}">Retry Process</button>`;
+          actionCell = `<button class="row-action-btn action-failed" type="button" data-process-attachment-id="${escapeHtml(attachmentId)}" data-lead-id="${escapeHtml(leadId)}">Retry Process</button>`;
         } else {
-          actionCell = `<button class="row-action-btn action-completed" type="button" data-process-attachment-id="${escapeHtml(attachmentId)}">Begin Process</button>`;
+          actionCell = `<button class="row-action-btn action-completed" type="button" data-process-attachment-id="${escapeHtml(attachmentId)}" data-lead-id="${escapeHtml(leadId)}">Begin Process</button>`;
         }
       }
 
@@ -565,17 +633,17 @@
         : `${escapeHtml(item.filename || '-')}${item.error ? `<div class="subtle-id">${escapeHtml(item.error)}</div>` : ''}`;
       const statusCell = `<span class="status-pill ${processStatusClass(processStatus)}">${escapeHtml(formatProcessStatusLabel(processStatus))}</span>${shouldShowProcessStep(processStatus, process.step) ? `<div class="subtle-id">${escapeHtml(process.step)}</div>` : ''}`;
       const recordEntity = sourceType === 'Business Profile' ? 'Account' : 'Lead';
-      const idCell = recordId
-        ? `<a href="https://staging-crm.discoverycsc.com/#${recordEntity}/view/${encodeURIComponent(recordId)}" target="_blank" rel="noopener noreferrer">${escapeHtml(recordId)}</a>`
-        : '-';
+      const accountName = escapeHtml(item.account_name || '-');
+      const accountNameCell = recordId
+        ? `<a href="https://staging-crm.discoverycsc.com/#${recordEntity}/view/${encodeURIComponent(recordId)}" target="_blank" rel="noopener noreferrer">${accountName}</a>`
+        : accountName;
       const createdAtCell = escapeHtml(formatDate(item.created_at || item.createdAt || ''));
 
       const tr = document.createElement('tr');
       tr.innerHTML = `
-        <td>${idCell}</td>
+        <td>${accountNameCell}</td>
         <td>${escapeHtml(sourceType || '-')}</td>
         <td>${createdAtCell}</td>
-        <td>${escapeHtml(item.account_name || '-')}</td>
         <td>${escapeHtml(item.assigned_user || '-')}</td>
         <td>${fileNameCell}</td>
         <td>${statusCell}</td>
@@ -613,6 +681,8 @@
         offset: String(requestOffset),
         probe: state.crmProbeMode,
       });
+      const searchQuery = String(state.crmSearch || '').trim();
+      if (searchQuery) params.set('q', searchQuery);
       const payload = await api(`/crm/attachments?${params.toString()}`);
       const items = Array.isArray(payload?.items) ? payload.items : [];
       state.crmAttachments = items;
@@ -668,7 +738,7 @@
     setView(view);
     if (view === 'processing' && routeJobId && routeJobId !== state.jobId) {
       setActiveJob(routeJobId, false).catch((err) => {
-        alert(`Load job failed: ${err.message}`);
+        alert(`Load job failed: ${normalizeApiErrorMessage(err?.message)}`);
       });
     }
     const targetPath = buildRoute(view, routeJobId);
@@ -736,6 +806,44 @@
         el.onclick = null;
       }
     }
+
+    if (els.exportCrm) {
+      if (!state.jobId || !enabled) {
+        els.exportCrm.classList.add('disabled');
+        els.exportCrm.setAttribute('aria-disabled', 'true');
+      } else {
+        els.exportCrm.classList.remove('disabled');
+        els.exportCrm.setAttribute('aria-disabled', 'false');
+      }
+    }
+  }
+
+  async function exportToCrm() {
+    if (!state.jobId) return;
+    if (!els.exportCrm || els.exportCrm.classList.contains('disabled')) return;
+    const button = els.exportCrm;
+    const originalLabel = button.textContent || 'Export to CRM';
+
+    button.classList.add('disabled');
+    button.setAttribute('aria-disabled', 'true');
+    button.textContent = 'Exporting…';
+    try {
+      const params = new URLSearchParams();
+      const mappedLeadId = String(state.crmLeadByJobId[state.jobId] || state.currentCrmLeadId || '').trim();
+      if (mappedLeadId) params.set('lead_id', mappedLeadId);
+      const path = `/crm/jobs/${encodeURIComponent(state.jobId)}/export-excel${params.toString() ? `?${params.toString()}` : ''}`;
+      const payload = await api(path, {
+        method: 'POST',
+      });
+      const leadId = String(payload?.lead_id || '').trim();
+      const attachmentId = String(payload?.attachment_id || '').trim();
+      showToast(`Exported to CRM successfully.${leadId ? ` Lead: ${leadId}.` : ''}${attachmentId ? ` Attachment: ${attachmentId}.` : ''}`, 'success');
+    } catch (err) {
+      showToast(`Export to CRM failed: ${normalizeApiErrorMessage(err?.message)}`, 'error', 4200);
+    } finally {
+      button.textContent = originalLabel;
+      updateExportAvailability();
+    }
   }
 
   function updateExportAvailability() {
@@ -770,9 +878,11 @@
       els.reverseRowsBtn.disabled = true;
       return;
     }
-    const page = String(state.currentPage || '').trim();
-    const rows = page ? state.parsedByPage[page] : null;
-    const canReverse = Array.isArray(rows) && rows.length > 1;
+    if (state.reverseRowsBusy) {
+      els.reverseRowsBtn.disabled = true;
+      return;
+    }
+    const canReverse = Object.values(state.parsedByPage).some((rows) => Array.isArray(rows) && rows.length > 1);
     els.reverseRowsBtn.disabled = !canReverse;
   }
 
@@ -1065,15 +1175,37 @@
     queuePageRowsSave(page);
   }
 
-  function reverseCurrentPageRows() {
-    const page = String(state.currentPage || '').trim();
-    if (!page) return;
-    const rows = Array.isArray(state.parsedByPage[page]) ? state.parsedByPage[page] : [];
-    if (rows.length < 2) return;
-
-    state.parsedByPage[page] = rows.slice().reverse();
-    renderRows();
-    queuePageRowsSave(page);
+  async function reverseAllPagesRows() {
+    if (state.reverseRowsBusy) return;
+    state.reverseRowsBusy = true;
+    updateReverseRowsActionState();
+    try {
+      let changed = false;
+      const pagesToProcess = Array.isArray(state.pages) && state.pages.length
+        ? state.pages.slice()
+        : Object.keys(state.parsedByPage || {});
+      for (const page of pagesToProcess) {
+        if (!Array.isArray(state.parsedByPage[page]) && state.jobId) {
+          try {
+            state.parsedByPage[page] = await api(`/jobs/${state.jobId}/parsed/${page}`);
+          } catch {
+            continue;
+          }
+        }
+        const rows = Array.isArray(state.parsedByPage[page]) ? state.parsedByPage[page] : [];
+        if (!Array.isArray(rows) || rows.length < 2) continue;
+        state.parsedByPage[page] = rows.slice().reverse();
+        queuePageRowsSave(page);
+        changed = true;
+      }
+      if (changed) {
+        renderRows();
+        await flushPendingPageSaves();
+      }
+    } finally {
+      state.reverseRowsBusy = false;
+      updateReverseRowsActionState();
+    }
   }
 
   function drawSelectedBound() {
@@ -1348,7 +1480,10 @@
     const id = String(jobId || '').trim();
     if (!id) return;
 
+    const status = await api(`/jobs/${id}`);
+
     state.jobId = id;
+    state.currentCrmLeadId = String(state.crmLeadByJobId[id] || '').trim();
     if (els.jobId) els.jobId.textContent = id;
     if (els.startBtn) els.startBtn.disabled = false;
     state.isCompleted = false;
@@ -1360,7 +1495,6 @@
     renderSummary(null);
     if (switchToProcessing) syncRoute('/processing', false, id);
 
-    const status = await api(`/jobs/${id}`);
     setStatus(status);
     const terminal = new Set(['done', 'failed']);
     if (terminal.has(String(status.status || '').toLowerCase())) {
@@ -1428,15 +1562,33 @@
     try {
       await setActiveJob(value, true);
     } catch (err) {
-      alert(`Load job failed: ${err.message}`);
+      alert(`Load job failed: ${normalizeApiErrorMessage(err?.message)}`);
     }
   }
 
   if (els.form) els.form.addEventListener('submit', createJob);
   if (els.startBtn) els.startBtn.addEventListener('click', () => startJob());
+  if (els.exportCrm) {
+    els.exportCrm.addEventListener('click', (e) => {
+      e.preventDefault();
+      exportToCrm();
+    });
+  }
+  if (els.summary) {
+    els.summary.addEventListener('change', (e) => {
+      const target = e.target;
+      if (!(target instanceof HTMLInputElement)) return;
+      if (!target.matches('input[data-month-key]')) return;
+      const key = String(target.getAttribute('data-month-key') || '').trim();
+      if (!key) return;
+      if (target.checked) state.summaryIncludedMonths.add(key);
+      else state.summaryIncludedMonths.delete(key);
+      if (state.summaryRaw) renderSummary(state.summaryRaw);
+    });
+  }
   if (els.reverseRowsBtn) {
     els.reverseRowsBtn.addEventListener('click', () => {
-      reverseCurrentPageRows();
+      reverseAllPagesRows();
     });
   }
   if (els.parsedDebugToggleBtn) {
@@ -1524,7 +1676,7 @@
       if (!jobId) return;
       if (action === 'none') return;
       if (action === 'start') startJob(jobId);
-      else setActiveJob(jobId, true).catch((err) => alert(`Load job failed: ${err.message}`));
+      else setActiveJob(jobId, true).catch((err) => alert(`Load job failed: ${normalizeApiErrorMessage(err?.message)}`));
     });
   }
 
@@ -1578,14 +1730,20 @@
       const openBtn = target.closest('button[data-open-job-id]');
       if (openBtn) {
         const openJobId = String(openBtn.getAttribute('data-open-job-id') || '').trim();
+        const leadId = String(openBtn.getAttribute('data-lead-id') || '').trim();
         if (!openJobId) return;
-        setActiveJob(openJobId, true).catch((err) => alert(`Load job failed: ${err.message}`));
+        if (leadId) {
+          state.crmLeadByJobId[openJobId] = leadId;
+          state.currentCrmLeadId = leadId;
+        }
+        setActiveJob(openJobId, true).catch((err) => alert(`Load job failed: ${normalizeApiErrorMessage(err?.message)}`));
         return;
       }
 
       const btn = target.closest('button[data-process-attachment-id]');
       if (!btn) return;
       const attachmentId = String(btn.getAttribute('data-process-attachment-id') || '').trim();
+      const leadId = String(btn.getAttribute('data-lead-id') || '').trim();
       if (!attachmentId) return;
       const priorLabel = btn.textContent || 'Begin Process';
       btn.disabled = true;
@@ -1594,6 +1752,11 @@
         .then((payload) => {
           const jobId = String(payload?.job_id || '').trim();
           if (!jobId) throw new Error('missing_job_id');
+          const resolvedLeadId = String(payload?.lead_id || leadId || '').trim();
+          if (resolvedLeadId) {
+            state.crmLeadByJobId[jobId] = resolvedLeadId;
+            state.currentCrmLeadId = resolvedLeadId;
+          }
           state.crmProcessByAttachment[attachmentId] = { jobId, status: 'queued', step: 'queued', progress: 0 };
           renderCrmAttachmentRows();
           startCrmStatusPolling();
@@ -1617,7 +1780,15 @@
   if (els.crmSearch) {
     els.crmSearch.addEventListener('input', () => {
       state.crmSearch = String(els.crmSearch.value || '').trim();
-      renderCrmAttachmentRows();
+      state.crmOffset = 0;
+      if (state.crmSearchDebounceTimer) window.clearTimeout(state.crmSearchDebounceTimer);
+      state.crmSearchDebounceTimer = window.setTimeout(() => {
+        state.crmSearchDebounceTimer = null;
+        loadCrmAttachments(true).catch((err) => {
+          state.crmAttachmentsError = `CRM load failed: ${normalizeApiErrorMessage(err?.message)}`;
+          renderCrmAttachmentRows();
+        });
+      }, 220);
     });
   }
 
@@ -1745,21 +1916,58 @@
 
   function renderSummary(summary) {
     const hasData = summary && typeof summary === 'object' && Object.keys(summary).length > 0;
+    if (!hasData) {
+      state.summaryRaw = null;
+      state.summaryIncludedMonths = new Set();
+      state.summaryKnownMonthKeys = new Set();
+      state.summarySelectionInitialized = false;
+    } else {
+      state.summaryRaw = summary;
+    }
+
     if (els.summary) {
       els.summary.classList.toggle('hidden', !hasData);
       if (!hasData) {
         els.summary.innerHTML = '';
       } else {
+        const monthlyRows = syncSummaryMonthSelection(summary.monthly);
+        const includedMonthlyRows = monthlyRows.filter((row) => state.summaryIncludedMonths.has(row.__monthKey));
+        const hasMonthlyRows = monthlyRows.length > 0;
+
+        const computedDebitTransactions = hasMonthlyRows
+          ? includedMonthlyRows.reduce((sum, row) => sum + toFiniteNumber(row.debit_count), 0)
+          : toFiniteNumber(summary.debit_transactions);
+        const computedCreditTransactions = hasMonthlyRows
+          ? includedMonthlyRows.reduce((sum, row) => sum + toFiniteNumber(row.credit_count), 0)
+          : toFiniteNumber(summary.credit_transactions);
+        const computedTotalTransactions = hasMonthlyRows
+          ? computedDebitTransactions + computedCreditTransactions
+          : toFiniteNumber(summary.total_transactions);
+        const computedTotalDebit = hasMonthlyRows
+          ? includedMonthlyRows.reduce((sum, row) => sum + toFiniteNumber(row.debit), 0)
+          : toFiniteNumber(summary.total_debit);
+        const computedTotalCredit = hasMonthlyRows
+          ? includedMonthlyRows.reduce((sum, row) => sum + toFiniteNumber(row.credit), 0)
+          : toFiniteNumber(summary.total_credit);
+        const computedAdb = hasMonthlyRows
+          ? (includedMonthlyRows.length
+            ? includedMonthlyRows.reduce((sum, row) => sum + toFiniteNumber(row.adb), 0) / includedMonthlyRows.length
+            : 0)
+          : toFiniteNumber(summary.adb);
+
+        const totalCreditNumber = computedTotalCredit;
+        const computedTotalCreditMonthlyAverage = Number.isFinite(totalCreditNumber)
+          ? (totalCreditNumber / Math.max(includedMonthlyRows.length || 6, 1)) * 0.30
+          : summary.total_credit_monthly_average;
         const metrics = [
-          { label: 'Total Transactions', value: formatNumber(summary.total_transactions), negative: Number(summary.total_transactions) < 0 },
-          { label: 'Debit Transactions', value: formatNumber(summary.debit_transactions), negative: Number(summary.debit_transactions) < 0 },
-          { label: 'Credit Transactions', value: formatNumber(summary.credit_transactions), negative: Number(summary.credit_transactions) < 0 },
-          { label: 'Total Debit', value: formatCurrency(summary.total_debit), negative: Number(summary.total_debit) < 0 },
-          { label: 'Total Credit', value: formatCurrency(summary.total_credit), negative: Number(summary.total_credit) < 0 },
-          { label: 'Ending Balance', value: formatCurrency(summary.ending_balance), negative: Number(summary.ending_balance) < 0 },
-          { label: 'Average Daily Balance (ADB)', value: formatCurrency(summary.adb), negative: Number(summary.adb) < 0 }
+          { label: 'Total Transactions', value: formatNumber(computedTotalTransactions), negative: computedTotalTransactions < 0 },
+          { label: 'Debit Transactions', value: formatNumber(computedDebitTransactions), negative: computedDebitTransactions < 0 },
+          { label: 'Credit Transactions', value: formatNumber(computedCreditTransactions), negative: computedCreditTransactions < 0 },
+          { label: 'Total Debit', value: formatCurrencyOrDash(computedTotalDebit), negative: computedTotalDebit < 0 },
+          { label: 'Total Credit', value: formatCurrencyOrDash(computedTotalCredit), negative: computedTotalCredit < 0 },
+          { label: 'Total Credit Monthly Average', value: formatCurrencyOrDash(computedTotalCreditMonthlyAverage), negative: Number(computedTotalCreditMonthlyAverage) < 0 },
+          { label: 'Average Daily Balance (ADB)', value: formatCurrencyOrDash(computedAdb), negative: Number(computedAdb) < 0 }
         ];
-        const monthlyRows = Array.isArray(summary.monthly) ? summary.monthly : [];
 
         els.summary.innerHTML = `
           <section class="summary-section">
@@ -1779,9 +1987,12 @@
               <table class="summary-monthly-table">
                 <thead>
                   <tr>
+                    <th class="include">Include</th>
                     <th>Month</th>
                     <th class="num">Total Debit</th>
                     <th class="num">Total Credit</th>
+                    <th class="num">Debit Count</th>
+                    <th class="num">Credit Count</th>
                     <th class="num">Avg Debit</th>
                     <th class="num">Avg Credit</th>
                     <th class="num">ADB</th>
@@ -1792,15 +2003,25 @@
                     monthlyRows.length
                       ? monthlyRows.map((row) => `
                           <tr>
+                            <td class="include">
+                              <input
+                                type="checkbox"
+                                class="summary-monthly-checkbox"
+                                data-month-key="${escapeHtml(row.__monthKey)}"
+                                ${state.summaryIncludedMonths.has(row.__monthKey) ? 'checked' : ''}
+                              />
+                            </td>
                             <td>${escapeHtml(row.month || '-')}</td>
-                            <td class="num${Number(row.debit) < 0 ? ' is-negative' : ''}">${escapeHtml(formatCurrency(row.debit))}</td>
-                            <td class="num${Number(row.credit) < 0 ? ' is-negative' : ''}">${escapeHtml(formatCurrency(row.credit))}</td>
-                            <td class="num${Number(row.avg_debit) < 0 ? ' is-negative' : ''}">${escapeHtml(formatCurrency(row.avg_debit))}</td>
-                            <td class="num${Number(row.avg_credit) < 0 ? ' is-negative' : ''}">${escapeHtml(formatCurrency(row.avg_credit))}</td>
-                            <td class="num${Number(row.adb) < 0 ? ' is-negative' : ''}">${escapeHtml(formatCurrency(row.adb))}</td>
+                            <td class="num${Number(row.debit) < 0 ? ' is-negative' : ''}">${escapeHtml(formatCurrencyOrDash(row.debit))}</td>
+                            <td class="num${Number(row.credit) < 0 ? ' is-negative' : ''}">${escapeHtml(formatCurrencyOrDash(row.credit))}</td>
+                            <td class="num">${escapeHtml(formatNumber(row.debit_count || 0))}</td>
+                            <td class="num">${escapeHtml(formatNumber(row.credit_count || 0))}</td>
+                            <td class="num${Number(row.avg_debit) < 0 ? ' is-negative' : ''}">${escapeHtml(formatCurrencyOrDash(row.avg_debit))}</td>
+                            <td class="num${Number(row.avg_credit) < 0 ? ' is-negative' : ''}">${escapeHtml(formatCurrencyOrDash(row.avg_credit))}</td>
+                            <td class="num${Number(row.adb) < 0 ? ' is-negative' : ''}">${escapeHtml(formatCurrencyOrDash(row.adb))}</td>
                           </tr>
                         `).join('')
-                      : '<tr><td colspan="6" class="summary-table-empty">No monthly data available.</td></tr>'
+                      : '<tr><td colspan="9" class="summary-table-empty">No monthly data available.</td></tr>'
                   }
                 </tbody>
               </table>

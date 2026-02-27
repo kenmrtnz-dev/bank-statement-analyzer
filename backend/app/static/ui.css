@@ -847,6 +847,19 @@ button:active,
   text-align: right;
 }
 
+.summary-monthly-table th.include,
+.summary-monthly-table td.include {
+  text-align: center;
+  width: 72px;
+}
+
+.summary-monthly-checkbox {
+  width: 14px;
+  height: 14px;
+  cursor: pointer;
+  accent-color: #2d64b2;
+}
+
 .summary-monthly-table tbody td {
   padding: 8px 10px;
   border-top: 1px solid #edf0f7;
@@ -1067,8 +1080,10 @@ button:active,
 }
 
 #crmAttachmentsTableWrap {
-  height: clamp(360px, 62vh, 680px);
+  height: auto;
+  min-height: clamp(360px, 62vh, 680px);
   max-height: none;
+  overflow-y: visible;
 }
 
 #crmAttachmentsTableWrap thead th {
@@ -1348,6 +1363,54 @@ tr.selected {
   }
 
   #crmAttachmentsTableWrap {
-    height: clamp(280px, 52vh, 520px);
+    height: auto;
+    min-height: clamp(280px, 52vh, 520px);
   }
+}
+
+.toast-root {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 9999;
+  display: grid;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.toast {
+  min-width: 260px;
+  max-width: min(440px, calc(100vw - 32px));
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.35;
+  box-shadow: 0 8px 20px rgba(28, 35, 56, 0.2);
+  transform: translateY(8px);
+  opacity: 0;
+  transition: opacity 160ms ease, transform 160ms ease;
+}
+
+.toast.is-visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.toast.toast-info {
+  background: #eef3ff;
+  border: 1px solid #cddcff;
+  color: #294372;
+}
+
+.toast.toast-success {
+  background: #e9f9f0;
+  border: 1px solid #bde7cc;
+  color: #1f6b44;
+}
+
+.toast.toast-error {
+  background: #fff0f2;
+  border: 1px solid #f3c6ce;
+  color: #9a2f43;
 }

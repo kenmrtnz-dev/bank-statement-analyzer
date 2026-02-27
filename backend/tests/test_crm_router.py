@@ -26,21 +26,22 @@ def test_crm_attachments_list_endpoint(client, monkeypatch):
 
     captured = {}
 
-    def _fake_list(limit=25, offset=0, probe=None):
+    def _fake_list(limit=25, offset=0, probe=None, q=None):
         captured["limit"] = limit
         captured["offset"] = offset
         captured["probe"] = probe
+        captured["q"] = q
         return payload
 
     monkeypatch.setattr(crm_router_module, "list_bank_statement_attachments", _fake_list)
 
-    res = client.get("/crm/attachments?limit=10&offset=20&probe=eager")
+    res = client.get("/crm/attachments?limit=10&offset=20&probe=eager&q=borrower")
     assert res.status_code == 200
     body = res.json()
     assert body["lead_count"] == 1
     assert body["attachment_count"] == 1
     assert body["items"][0]["attachment_id"] == "att-1"
-    assert captured == {"limit": 10, "offset": 20, "probe": "eager"}
+    assert captured == {"limit": 10, "offset": 20, "probe": "eager", "q": "borrower"}
 
 
 def test_crm_attachment_download_endpoint(client, monkeypatch):
@@ -70,6 +71,7 @@ def test_crm_attachment_begin_process_endpoint(client, monkeypatch):
             "started": True,
             "attachment_id": attachment_id,
             "source_filename": "statement.pdf",
+            "lead_id": "lead-42",
         },
     )
 
@@ -78,4 +80,27 @@ def test_crm_attachment_begin_process_endpoint(client, monkeypatch):
     body = res.json()
     assert body["job_id"] == "job-123"
     assert body["attachment_id"] == "att-2"
+    assert body["lead_id"] == "lead-42"
     assert body["started"] is True
+
+
+def test_crm_export_excel_to_lead_endpoint(client, monkeypatch):
+    monkeypatch.setattr(
+        crm_router_module,
+        "export_job_excel_to_crm_lead",
+        lambda job_id, lead_id=None: {
+            "job_id": job_id,
+            "lead_id": lead_id or "lead-1",
+            "attachment_id": "att-result-1",
+            "filename": "job-1-rows.xlsx",
+            "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "size": 2048,
+        },
+    )
+
+    res = client.post("/crm/jobs/job-1/export-excel?lead_id=lead-1")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["job_id"] == "job-1"
+    assert body["lead_id"] == "lead-1"
+    assert body["attachment_id"] == "att-result-1"

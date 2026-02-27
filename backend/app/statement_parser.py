@@ -227,22 +227,68 @@ def parse_words_page(
     page_width: float,
     page_height: float,
     profile: BankProfile,
+    header_hint: Optional[Dict] = None,
 ) -> Tuple[List[Dict], List[Dict], Dict]:
     rows = []
     bounds = []
 
     grouped = _group_words_by_line(words)
-    header = _find_header_anchors(grouped, profile)
+    detected_header = _find_header_anchors(grouped, profile)
     diagnostics = {
-        "header_detected": bool(header),
-        "header_y": header["y"] if header else None,
+        "header_detected": bool(detected_header),
+        "header_y": detected_header["y"] if detected_header else None,
+        "header_hint_used": False,
         "row_candidates": 0,
     }
-    if not header:
-        rows, bounds = _parse_rows_without_header(grouped, page_width, page_height, profile)
-        diagnostics["fallback_mode"] = "no_header_line_parse"
-        diagnostics["row_candidates"] = len(grouped)
-        return rows, bounds, diagnostics
+    if detected_header:
+        rows, bounds = _parse_grouped_lines_with_header(
+            grouped_lines=grouped,
+            page_width=page_width,
+            page_height=page_height,
+            profile=profile,
+            header=detected_header,
+            diagnostics=diagnostics,
+            skip_before_header=True,
+        )
+        diagnostics["header_anchors"] = _serialize_header_anchors(detected_header)
+        if rows:
+            return rows, bounds, diagnostics
+    elif _is_valid_header_hint(header_hint):
+        hint_header = dict(header_hint or {})
+        hint_header["y"] = float("-inf")
+        rows, bounds = _parse_grouped_lines_with_header(
+            grouped_lines=grouped,
+            page_width=page_width,
+            page_height=page_height,
+            profile=profile,
+            header=hint_header,
+            diagnostics=diagnostics,
+            skip_before_header=False,
+        )
+        diagnostics["header_hint_used"] = True
+        diagnostics["fallback_mode"] = "header_hint_reuse"
+        diagnostics["header_anchors"] = _serialize_header_anchors(hint_header)
+        if rows:
+            return rows, bounds, diagnostics
+
+    rows, bounds = _parse_rows_without_header(grouped, page_width, page_height, profile)
+    diagnostics["fallback_mode"] = "no_header_line_parse"
+    diagnostics["row_candidates"] = len(grouped)
+    return rows, bounds, diagnostics
+
+
+def _parse_grouped_lines_with_header(
+    grouped_lines: List[Dict],
+    page_width: float,
+    page_height: float,
+    profile: BankProfile,
+    header: Dict,
+    diagnostics: Dict,
+    *,
+    skip_before_header: bool,
+) -> Tuple[List[Dict], List[Dict]]:
+    rows: List[Dict] = []
+    bounds: List[Dict] = []
 
     date_x = header["date"]
     description_x = header.get("description")
@@ -250,9 +296,9 @@ def parse_words_page(
     credit_x = header["credit"]
     balance_x = header["balance"]
 
-    for line in grouped:
+    for line in grouped_lines:
         y = line["cy"]
-        if y <= header["y"] + 2:
+        if skip_before_header and y <= header["y"] + 2:
             continue
 
         line_text = " ".join(w["text"] for w in line["words"])
@@ -331,13 +377,33 @@ def parse_words_page(
         row_bounds["row_id"] = row_id
         bounds.append(row_bounds)
 
-    if not rows:
-        f_rows, f_bounds = _parse_rows_without_header(grouped, page_width, page_height, profile)
-        if f_rows:
-            diagnostics["fallback_mode"] = "line_parse_after_empty_header"
-            return f_rows, f_bounds, diagnostics
+    return rows, bounds
 
-    return rows, bounds, diagnostics
+
+def _serialize_header_anchors(header: Dict) -> Dict:
+    out: Dict[str, float] = {}
+    for key in ("date", "description", "debit", "credit", "balance"):
+        value = header.get(key)
+        if value is None:
+            continue
+        try:
+            out[key] = float(value)
+        except Exception:
+            continue
+    return out
+
+
+def _is_valid_header_hint(header_hint: Optional[Dict]) -> bool:
+    if not isinstance(header_hint, dict):
+        return False
+    required = ("date", "debit", "credit", "balance")
+    for key in required:
+        value = header_hint.get(key)
+        try:
+            float(value)
+        except Exception:
+            return False
+    return True
 
 
 def parse_page_with_profile_fallback(
@@ -345,12 +411,14 @@ def parse_page_with_profile_fallback(
     page_width: float,
     page_height: float,
     detected_profile: BankProfile,
+    header_hint: Optional[Dict] = None,
 ) -> Tuple[List[Dict], List[Dict], Dict]:
     base_rows, base_bounds, base_diag = parse_words_page(
         words,
         page_width,
         page_height,
         detected_profile,
+        header_hint=header_hint,
     )
     base_ratio = _rows_conversion_ratio(base_rows, base_diag)
 
@@ -368,6 +436,7 @@ def parse_page_with_profile_fallback(
             page_width,
             page_height,
             generic_profile,
+            header_hint=header_hint,
         )
         fb_ratio = _rows_conversion_ratio(fb_rows, fb_diag)
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import datetime as dt
 import json
 import os
 import re
@@ -14,7 +16,9 @@ import httpx
 from fastapi import HTTPException
 from fastapi.responses import Response
 
+from app.modules.jobs.repository import JobsRepository
 from app.modules.jobs.service import create_job
+from app.modules.jobs.service import export_excel
 
 DEFAULT_ESPOCRM_BASE_URL = "https://staging-crm.discoverycsc.com/api/v1"
 LEAD_SELECT_FIELDS = "id,accountName,cBankStatementsIds,createdAt,createdByName,assignedUserName"
@@ -162,6 +166,29 @@ def _resolve_probe_mode(probe: str | None) -> str:
     if mode in {"lazy", "eager"}:
         return mode
     return DEFAULT_ATTACHMENT_PROBE_MODE
+
+
+def _normalize_search_query(raw: str | None) -> str:
+    return str(raw or "").strip().lower()
+
+
+def _matches_attachment_search(item: dict[str, Any], query: str) -> bool:
+    if not query:
+        return True
+    hay = " ".join(
+        [
+            str(item.get("id") or ""),
+            str(item.get("type") or ""),
+            str(item.get("created_at") or ""),
+            str(item.get("account_name") or ""),
+            str(item.get("assigned_user") or ""),
+            str(item.get("attachment_id") or ""),
+            str(item.get("filename") or ""),
+            str(item.get("process_job_id") or ""),
+            str(item.get("process_status") or ""),
+        ]
+    ).lower()
+    return query in hay
 
 
 def _cache_get(cache: dict, key: Any) -> Any:
@@ -376,13 +403,14 @@ def _collect_attachment_page(
     headers: dict[str, str],
     limit: int,
     offset: int,
+    search_query: str = "",
 ) -> dict[str, Any]:
     max_size = 100
     lead_offset = 0
     account_offset = 0
     lead_count = 0
     account_count = 0
-    attachment_seen = 0
+    matched_seen = 0
     items: list[dict[str, Any]] = []
     has_more = False
 
@@ -435,35 +463,37 @@ def _collect_attachment_page(
                 assigned_user = _extract_assigned_user_name(record)
                 attachment_ids = _normalize_attachment_ids(record.get("cBankStatementsIds"))
                 for attachment_id in attachment_ids:
-                    if attachment_seen < offset:
-                        attachment_seen += 1
+                    row = {
+                        "id": record_id,
+                        "type": str(source["label"]),
+                        "created_at": str(record.get("createdAt") or "").strip(),
+                        "account_name": account_name,
+                        "assigned_user": assigned_user,
+                        "attachment_id": attachment_id,
+                        "filename": "",
+                        "content_type": "",
+                        "size_bytes": 0,
+                        "status": "available",
+                        "error": "",
+                        "download_url": f"/crm/attachments/{quote(attachment_id, safe='')}/file",
+                        "process_job_id": "",
+                        "process_status": "not_started",
+                        "process_step": "",
+                        "process_progress": 0,
+                    }
+                    if not _matches_attachment_search(row, search_query):
+                        continue
+
+                    if matched_seen < offset:
+                        matched_seen += 1
                         continue
 
                     if len(items) >= limit:
                         has_more = True
                         break
 
-                    attachment_seen += 1
-                    items.append(
-                        {
-                            "id": record_id,
-                            "type": str(source["label"]),
-                            "created_at": str(record.get("createdAt") or "").strip(),
-                            "account_name": account_name,
-                            "assigned_user": assigned_user,
-                            "attachment_id": attachment_id,
-                            "filename": "",
-                            "content_type": "",
-                            "size_bytes": 0,
-                            "status": "available",
-                            "error": "",
-                            "download_url": f"/crm/attachments/{quote(attachment_id, safe='')}/file",
-                            "process_job_id": "",
-                            "process_status": "not_started",
-                            "process_step": "",
-                            "process_progress": 0,
-                        }
-                    )
+                    matched_seen += 1
+                    items.append(row)
                 if has_more:
                     break
             if has_more:
@@ -498,13 +528,78 @@ def _extract_assigned_user_name(lead: dict[str, Any]) -> str:
     return ""
 
 
+def _normalize_business_name(raw: str | None) -> str:
+    text = str(raw or "").strip().upper()
+    if not text:
+        return "UNKNOWNBUSINESS"
+    normalized = "".join(ch for ch in text if ch.isalnum())
+    return normalized or "UNKNOWNBUSINESS"
+
+
+def _build_crm_export_basename(account_name: str | None, now: dt.datetime | None = None) -> str:
+    clock = now or dt.datetime.now()
+    ts = clock.strftime("%m%d%Y%H%M")
+    business = _normalize_business_name(account_name)
+    return f"{ts}-{business}-6MOS-BANKSTATEMENTS"
+
+
+def _find_attachment_owner_record(
+    client: httpx.Client,
+    base_url: str,
+    headers: dict[str, str],
+    attachment_id: str,
+) -> dict[str, str] | None:
+    cleaned_attachment_id = str(attachment_id or "").strip()
+    if not cleaned_attachment_id:
+        return None
+
+    sources = [
+        {"entity_name": "Lead", "select_fields": LEAD_SELECT_FIELDS, "label": "Lead"},
+        {"entity_name": "Account", "select_fields": ACCOUNT_SELECT_FIELDS, "label": "Business Profile"},
+    ]
+
+    for source in sources:
+        offset = 0
+        while True:
+            batch, has_more_entities = _fetch_entity_batch(
+                client,
+                base_url,
+                headers,
+                entity_name=str(source["entity_name"]),
+                select_fields=str(source["select_fields"]),
+                offset=offset,
+                max_size=100,
+            )
+            if not batch:
+                break
+
+            for record in batch:
+                attachment_ids = _normalize_attachment_ids(record.get("cBankStatementsIds"))
+                if cleaned_attachment_id not in attachment_ids:
+                    continue
+                return {
+                    "record_id": str(record.get("id") or "").strip(),
+                    "record_type": str(source["label"]),
+                    "entity_name": str(source["entity_name"]),
+                    "account_name": str(record.get("accountName") or record.get("name") or "").strip(),
+                }
+
+            if not has_more_entities:
+                break
+            offset += len(batch)
+
+    return None
+
+
 def list_bank_statement_attachments(
     limit: int = DEFAULT_ATTACHMENTS_PAGE_SIZE,
     offset: int = 0,
     probe: str | None = None,
+    q: str | None = None,
 ) -> dict[str, Any]:
     limit, offset = _resolve_page_params(limit, offset)
     probe_mode = _resolve_probe_mode(probe)
+    search_query = _normalize_search_query(q)
     cache_ttl_seconds = max(1, _env_int("CRM_ATTACHMENT_CACHE_TTL_SECONDS", DEFAULT_ATTACHMENT_CACHE_TTL_SECONDS))
     probe_concurrency = max(
         1,
@@ -518,7 +613,7 @@ def list_bank_statement_attachments(
     base_url, api_key = _get_espocrm_settings()
     headers = _build_headers(api_key)
     process_index = _load_attachment_process_index()
-    page_cache_key = (f"{base_url}|v{ATTACHMENTS_PAGE_CACHE_VERSION}", offset, limit)
+    page_cache_key = (f"{base_url}|v{ATTACHMENTS_PAGE_CACHE_VERSION}", offset, limit, probe_mode, search_query)
 
     cached_page = _cache_get(_ATTACHMENT_PAGE_CACHE, page_cache_key)
     if isinstance(cached_page, dict):
@@ -540,6 +635,7 @@ def list_bank_statement_attachments(
                 headers=headers,
                 limit=limit,
                 offset=offset,
+                search_query=search_query,
             )
         _cache_set(_ATTACHMENT_PAGE_CACHE, page_cache_key, page_payload, ttl_seconds=cache_ttl_seconds)
 
@@ -603,6 +699,7 @@ def list_bank_statement_attachments(
         "cache_ttl_seconds": cache_ttl_seconds,
         "probe_concurrency": probe_concurrency if probe_mode == "eager" else 0,
         "filename_probe_concurrency": filename_probe_concurrency if probe_mode != "eager" else 0,
+        "query": search_query,
     }
 
 
@@ -689,6 +786,13 @@ def create_job_from_attachment(attachment_id: str, requested_mode: str = "auto")
     if not source_name.lower().endswith(".pdf"):
         source_name = f"{source_name}.pdf"
 
+    owner: dict[str, str] | None = None
+    try:
+        with httpx.Client(timeout=DEFAULT_TIMEOUT, follow_redirects=True) as client:
+            owner = _find_attachment_owner_record(client, base_url, headers, cleaned_attachment_id)
+    except HTTPException:
+        owner = None
+
     payload = create_job(
         file_bytes=response.content,
         filename=source_name,
@@ -703,15 +807,148 @@ def create_job_from_attachment(attachment_id: str, requested_mode: str = "auto")
             existing_meta = {}
         existing_meta["source_attachment_id"] = cleaned_attachment_id
         existing_meta["source_attachment_filename"] = source_name
+        if owner:
+            existing_meta["source_record_id"] = str(owner.get("record_id") or "")
+            existing_meta["source_record_type"] = str(owner.get("record_type") or "")
+            existing_meta["source_entity_name"] = str(owner.get("entity_name") or "")
+            existing_meta["source_account_name"] = str(owner.get("account_name") or "")
+            if str(owner.get("entity_name") or "").strip() == "Lead":
+                existing_meta["source_lead_id"] = str(owner.get("record_id") or "")
         _write_json_file(meta_path, existing_meta)
 
     payload["attachment_id"] = cleaned_attachment_id
     payload["source_filename"] = source_name
+    if owner:
+        payload["account_name"] = str(owner.get("account_name") or "")
+    if owner and str(owner.get("entity_name") or "").strip() == "Lead":
+        payload["lead_id"] = str(owner.get("record_id") or "")
     return payload
+
+
+def export_job_excel_to_crm_lead(job_id: str, lead_id: str | None = None) -> dict[str, Any]:
+    cleaned_job_id = str(job_id or "").strip()
+    if not cleaned_job_id:
+        raise HTTPException(status_code=400, detail="job_id_required")
+
+    repo = JobsRepository(os.getenv("DATA_DIR", "./data"))
+    if not repo.job_dir(cleaned_job_id).exists():
+        raise HTTPException(status_code=404, detail="job_not_found")
+
+    meta = _read_json_file(repo.path(cleaned_job_id, "meta.json"), {})
+    if not isinstance(meta, dict):
+        meta = {}
+
+    resolved_lead_id = str(lead_id or "").strip()
+    if not resolved_lead_id:
+        resolved_lead_id = str(meta.get("source_lead_id") or "").strip()
+    if not resolved_lead_id:
+        source_entity_name = str(meta.get("source_entity_name") or "").strip()
+        source_record_id = str(meta.get("source_record_id") or "").strip()
+        if source_entity_name == "Lead" and source_record_id:
+            resolved_lead_id = source_record_id
+    if not resolved_lead_id:
+        raise HTTPException(status_code=400, detail="lead_id_required_for_crm_export")
+
+    base_url, api_key = _get_espocrm_settings()
+    auth_headers = _build_headers(api_key)
+
+    workbook_bytes, _ = export_excel(cleaned_job_id)
+    account_name = str(meta.get("source_account_name") or "").strip()
+    source_attachment_id = str(meta.get("source_attachment_id") or "").strip()
+    if not account_name and source_attachment_id:
+        try:
+            with httpx.Client(timeout=DEFAULT_TIMEOUT, follow_redirects=True) as client:
+                owner = _find_attachment_owner_record(client, base_url, auth_headers, source_attachment_id)
+            if owner:
+                account_name = str(owner.get("account_name") or "").strip()
+                meta["source_account_name"] = account_name
+                if not meta.get("source_record_id"):
+                    meta["source_record_id"] = str(owner.get("record_id") or "")
+                if not meta.get("source_record_type"):
+                    meta["source_record_type"] = str(owner.get("record_type") or "")
+                if not meta.get("source_entity_name"):
+                    meta["source_entity_name"] = str(owner.get("entity_name") or "")
+                if str(owner.get("entity_name") or "").strip() == "Lead" and not meta.get("source_lead_id"):
+                    meta["source_lead_id"] = str(owner.get("record_id") or "")
+                repo.write_json(repo.path(cleaned_job_id, "meta.json"), meta)
+        except HTTPException:
+            pass
+
+    safe_filename = f"{_build_crm_export_basename(account_name)}.xlsx"
+
+    mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    encoded = base64.b64encode(workbook_bytes).decode("ascii").replace("\n", "").replace("\r", "")
+    file_payload = f"data:{mime};base64,{encoded}"
+
+    headers = dict(auth_headers)
+    headers["Content-Type"] = "application/json"
+
+    attachment_body = {
+        "role": "Attachment",
+        "parentType": "Lead",
+        "field": "cBankStatementResult",
+        "name": safe_filename,
+        "size": len(workbook_bytes),
+        "type": mime,
+        "file": file_payload,
+    }
+
+    attachment_id = ""
+    try:
+        with httpx.Client(timeout=httpx.Timeout(120.0, connect=10.0), follow_redirects=True) as client:
+            upload_res = client.post(
+                f"{base_url}/Attachment",
+                headers=headers,
+                json=attachment_body,
+            )
+            if upload_res.status_code in (401, 403):
+                raise HTTPException(status_code=502, detail="espocrm_auth_failed")
+            if upload_res.status_code >= 400:
+                raise HTTPException(status_code=502, detail=f"espocrm_attachment_create_failed_{upload_res.status_code}")
+            try:
+                upload_payload = upload_res.json()
+            except ValueError as exc:
+                raise HTTPException(status_code=502, detail="espocrm_attachment_create_invalid_json") from exc
+
+            attachment_id = str((upload_payload or {}).get("id") or "").strip()
+            if not attachment_id:
+                raise HTTPException(status_code=502, detail="espocrm_attachment_id_missing")
+
+            lead_update_body = {
+                "cBankStatementResultIds": [attachment_id],
+                "cBankStatementResultNames": {
+                    attachment_id: safe_filename,
+                },
+                "cBankStatementResultTypes": {
+                    attachment_id: mime,
+                },
+            }
+
+            update_res = client.put(
+                f"{base_url}/Lead/{quote(resolved_lead_id, safe='')}",
+                headers=headers,
+                json=lead_update_body,
+            )
+            if update_res.status_code in (401, 403):
+                raise HTTPException(status_code=502, detail="espocrm_auth_failed")
+            if update_res.status_code >= 400:
+                raise HTTPException(status_code=502, detail=f"espocrm_lead_update_failed_{update_res.status_code}")
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail="espocrm_export_request_failed") from exc
+
+    return {
+        "job_id": cleaned_job_id,
+        "lead_id": resolved_lead_id,
+        "attachment_id": attachment_id,
+        "filename": safe_filename,
+        "mime_type": mime,
+        "size": len(workbook_bytes),
+    }
 
 
 __all__ = [
     "create_job_from_attachment",
     "download_bank_statement_attachment",
+    "export_job_excel_to_crm_lead",
     "list_bank_statement_attachments",
 ]
