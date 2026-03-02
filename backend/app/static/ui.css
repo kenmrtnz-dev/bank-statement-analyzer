@@ -733,6 +733,39 @@ button:active,
   box-shadow: inset 0 0 0 1px #dbe1ef;
 }
 
+.preview-panel-tabs {
+  margin-top: 8px;
+  display: inline-flex;
+  gap: 8px;
+}
+
+.preview-panel-tab {
+  height: 30px;
+  border-radius: 999px;
+  border: 1px solid #d1d7e8;
+  background: #ffffff;
+  color: #4f5b7c;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 0 12px;
+  box-shadow: none;
+}
+
+.preview-panel-tab.active {
+  border-color: #5a4ff0;
+  color: #3f35d6;
+  background: #f3f1ff;
+}
+
+.disbalance-table-wrap {
+  margin-top: 8px;
+  max-height: 320px;
+}
+
+.disbalance-table-wrap td {
+  font-size: 12px;
+}
+
 #previewImage {
   width: 100%;
   display: block;
@@ -964,6 +997,11 @@ button:active,
   background: #e3f7ec;
 }
 
+.status-uploaded {
+  color: #0f766e;
+  background: #dcf5f2;
+}
+
 .status-failed {
   color: #a63748;
   background: #ffe8ee;
@@ -1072,6 +1110,36 @@ button:active,
   max-height: 360px;
   border: 1px solid var(--line);
   border-radius: 12px;
+}
+
+.crm-status-tabs {
+  margin-top: 8px;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.crm-status-tab {
+  height: 30px;
+  border-radius: 999px;
+  border: 1px solid #d1d7e8;
+  background: #ffffff;
+  color: #4f5b7c;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 0 12px;
+  box-shadow: none;
+}
+
+.crm-status-tab:hover {
+  border-color: #b9c2e2;
+  background: #f8faff;
+}
+
+.crm-status-tab.active {
+  border-color: #5a4ff0;
+  color: #3f35d6;
+  background: #f3f1ff;
 }
 
 #crmAttachmentsSection {
@@ -1273,6 +1341,21 @@ td {
 
 #rowsBody tr.balance-mismatch-row.selected .table-row-input-balance.balance-mismatch {
   background: rgba(220, 38, 38, 0.12);
+}
+
+#rowsBody .table-row-input-description.bank-code-flagged {
+  color: #a22e45;
+  border-color: rgba(162, 46, 69, 0.35);
+  background: rgba(162, 46, 69, 0.08);
+  font-weight: 700;
+}
+
+#rowsBody tr.selected .table-row-input-description.bank-code-flagged {
+  background: rgba(162, 46, 69, 0.15);
+}
+
+#rowsBody tr.bank-code-flag-row:hover {
+  background: #fff2f5;
 }
 
 tr.clickable {

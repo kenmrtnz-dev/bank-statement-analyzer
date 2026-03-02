@@ -26,11 +26,22 @@ def test_get_summary_recomputes_when_cached_summary_is_missing_new_fields(monkey
         "total_credit": 600.0,
         "ending_balance": 600.0,
         "adb": 600.0,
-        "monthly": [{"month": "2026-01", "debit": 0.0, "credit": 600.0, "avg_debit": 0.0, "avg_credit": 600.0, "adb": 600.0}],
+        "monthly": [
+            {
+                "month": "2026-01",
+                "debit": 0.0,
+                "credit": 600.0,
+                "avg_debit": 0.0,
+                "avg_credit": 600.0,
+                "adb": 600.0,
+            }
+        ],
     }
     (jobs_root / "result" / "summary.json").write_text(json.dumps(stale_summary), encoding="utf-8")
 
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{(tmp_path / 'ocr.db').resolve()}")
+    monkeypatch.setenv("DB_AUTO_CREATE_SCHEMA", "true")
     from app.modules.jobs import service as jobs_service
 
     monkeypatch.setattr(jobs_service, "DATA_DIR", str(tmp_path))

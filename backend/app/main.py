@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
-import os
 
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
@@ -11,6 +11,7 @@ from app.api.routers.ui import router as ui_router
 from app.modules.admin.router import router as admin_router
 from app.modules.auth.router import router as auth_router
 from app.modules.crm.router import router as crm_router
+from app.modules.jobs.repository import ensure_job_transactions_schema
 from app.modules.jobs.router import router as jobs_router
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
@@ -20,6 +21,7 @@ def _bootstrap_dirs():
     root = Path(DATA_DIR)
     (root / "jobs").mkdir(parents=True, exist_ok=True)
     (root / "exports").mkdir(parents=True, exist_ok=True)
+    ensure_job_transactions_schema(root)
 
 
 @asynccontextmanager

@@ -219,7 +219,7 @@ def _normalize_process_status(raw_status: Any) -> str:
     status = str(raw_status or "").strip().lower()
     if status == "done":
         return "completed"
-    if status in {"queued", "processing", "completed", "failed", "needs_review"}:
+    if status in {"queued", "processing", "completed", "failed", "needs_review", "uploaded"}:
         return status
     return "not_started"
 
@@ -262,8 +262,14 @@ def _load_attachment_process_index() -> dict[str, dict[str, Any]]:
         if not isinstance(status_payload, dict):
             status_payload = {}
 
+        meta_file = job_dir / "meta.json"
         status_file = job_dir / "status.json"
-        updated_at = int(status_file.stat().st_mtime) if status_file.exists() else int(job_dir.stat().st_mtime)
+        updated_at_candidates = [int(job_dir.stat().st_mtime)]
+        if status_file.exists():
+            updated_at_candidates.append(int(status_file.stat().st_mtime))
+        if meta_file.exists():
+            updated_at_candidates.append(int(meta_file.stat().st_mtime))
+        updated_at = max(updated_at_candidates)
         current = latest_by_attachment.get(attachment_id)
         if current and int(current.get("_updated_at") or 0) >= updated_at:
             continue
@@ -274,11 +280,19 @@ def _load_attachment_process_index() -> dict[str, dict[str, Any]]:
         except (TypeError, ValueError):
             progress = 0
 
+        process_status = _normalize_process_status(status_payload.get("status"))
+        process_step = str(status_payload.get("step") or "").strip()
+        process_progress = max(0, min(100, progress))
+        if bool(meta.get("crm_export_uploaded")):
+            process_status = "uploaded"
+            process_step = "uploaded"
+            process_progress = 100
+
         latest_by_attachment[attachment_id] = {
             "process_job_id": str(job_dir.name),
-            "process_status": _normalize_process_status(status_payload.get("status")),
-            "process_step": str(status_payload.get("step") or "").strip(),
-            "process_progress": max(0, min(100, progress)),
+            "process_status": process_status,
+            "process_step": process_step,
+            "process_progress": process_progress,
             "_updated_at": updated_at,
         }
 
@@ -935,6 +949,13 @@ def export_job_excel_to_crm_lead(job_id: str, lead_id: str | None = None) -> dic
                 raise HTTPException(status_code=502, detail=f"espocrm_lead_update_failed_{update_res.status_code}")
     except httpx.RequestError as exc:
         raise HTTPException(status_code=502, detail="espocrm_export_request_failed") from exc
+
+    meta["crm_export_uploaded"] = True
+    meta["crm_export_uploaded_at"] = dt.datetime.utcnow().isoformat() + "Z"
+    meta["crm_export_attachment_id"] = attachment_id
+    meta["crm_export_lead_id"] = resolved_lead_id
+    meta["crm_export_filename"] = safe_filename
+    repo.write_json(repo.path(cleaned_job_id, "meta.json"), meta)
 
     return {
         "job_id": cleaned_job_id,

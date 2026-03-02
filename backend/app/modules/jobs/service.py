@@ -6,10 +6,9 @@ import io
 import json
 import math
 import os
-import time
+import threading
 import uuid
 import zipfile
-import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from xml.sax.saxutils import escape as xml_escape
@@ -18,7 +17,7 @@ from fastapi import HTTPException
 from pdf2image import convert_from_path
 from PIL import Image
 
-from app.modules.jobs.repository import JobsRepository
+from app.modules.jobs.repository import JobsRepository, JobTransactionsRepository
 from app.modules.ocr import prepare_ocr_pages, process_ocr_page, resolve_parse_mode, run_pipeline
 from app.statement_parser import normalize_date
 
@@ -258,10 +257,15 @@ def get_all_bounds(job_id: str) -> Dict[str, List[Dict]]:
     repo = JobsRepository(DATA_DIR)
     _require_job(repo, job_id)
 
+    parsed_repo = JobTransactionsRepository(DATA_DIR)
+    if parsed_repo.has_rows(job_id):
+        return parsed_repo.get_bounds_by_job(job_id)
+
     path = repo.path(job_id, "result", "bounds.json")
     if not path.exists():
         raise HTTPException(status_code=404, detail="bounds_not_ready")
-    return repo.read_json(path, default={})
+    payload = repo.read_json(path, default={})
+    return payload if isinstance(payload, dict) else {}
 
 
 def get_page_rows(job_id: str, page: str) -> List[Dict]:
@@ -309,10 +313,11 @@ def update_page_rows(job_id: str, page: str, rows: List[Dict]) -> Dict:
 
     lock = _get_job_update_lock(job_id)
     with lock:
+        parsed_repo = JobTransactionsRepository(DATA_DIR)
+        parsed_repo.replace_page_rows(job_id=job_id, page_key=page_name, rows=normalized_rows, is_manual_edit=True)
         rows_by_page = _load_parsed_rows(repo, job_id, required=True)
-        rows_by_page[page_name] = normalized_rows
-
         repo.write_json(repo.path(job_id, "result", "parsed_rows.json"), rows_by_page)
+        repo.write_json(repo.path(job_id, "result", "bounds.json"), parsed_repo.get_bounds_by_job(job_id))
         summary = compute_summary(_flatten_rows(rows_by_page))
         repo.write_json(repo.path(job_id, "result", "summary.json"), summary)
 
@@ -344,6 +349,17 @@ def get_summary(job_id: str) -> Dict:
     summary = compute_summary(rows)
     repo.write_json(summary_path, summary)
     return summary
+
+
+def get_parse_diagnostics(job_id: str) -> Dict:
+    repo = JobsRepository(DATA_DIR)
+    _require_job(repo, job_id)
+
+    path = repo.path(job_id, "result", "parse_diagnostics.json")
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="parse_diagnostics_not_ready")
+    payload = repo.read_json(path, default={})
+    return payload if isinstance(payload, dict) else {}
 
 
 def export_pdf(job_id: str) -> tuple[bytes, str]:
@@ -446,7 +462,10 @@ def process_job(job_id: str, parse_mode: str, task_id: Optional[str] = None) -> 
     selected_mode = str(parse_mode or "auto").strip().lower()
     if selected_mode != "ocr":
         result = run_pipeline(root, parse_mode, report=report)
-        rows = _flatten_rows(result.get("parsed_rows") or {})
+        parsed_output = _normalize_rows_by_page_for_output(result.get("parsed_rows") or {})
+        bounds_output = result.get("bounds") if isinstance(result.get("bounds"), dict) else {}
+        _persist_parsed_rows(repo, job_id, parsed_output, bounds_by_page=bounds_output, is_manual_edit=False)
+        rows = _flatten_rows(_load_parsed_rows(repo, job_id, required=True))
         summary = compute_summary(rows)
         repo.write_json(repo.path(job_id, "result", "summary.json"), summary)
 
@@ -465,7 +484,6 @@ def process_job(job_id: str, parse_mode: str, task_id: Optional[str] = None) -> 
     input_pdf = repo.path(job_id, "input", "document.pdf")
     pages_dir = repo.path(job_id, "pages")
     cleaned_dir = repo.path(job_id, "cleaned")
-    ocr_dir = repo.path(job_id, "ocr")
     result_dir = repo.path(job_id, "result")
     fragments_dir = result_dir / "page_fragments"
     fragments_dir.mkdir(parents=True, exist_ok=True)
@@ -511,7 +529,13 @@ def process_job(job_id: str, parse_mode: str, task_id: Optional[str] = None) -> 
     for page_name in pending_pages:
         page_payload = page_status.get(page_name) or {}
         page_index = int(page_payload.get("page_index") or 1)
-        task_id_page = _enqueue_page_job(job_id=job_id, parse_mode=parse_mode, page_name=page_name, page_index=page_index, page_count=len(page_files))
+        task_id_page = _enqueue_page_job(
+            job_id=job_id,
+            parse_mode=parse_mode,
+            page_name=page_name,
+            page_index=page_index,
+            page_count=len(page_files),
+        )
         page_payload["task_id"] = task_id_page
         page_payload["status"] = "queued"
         page_payload["updated_at"] = dt.datetime.utcnow().isoformat() + "Z"
@@ -677,7 +701,14 @@ def finalize_job_processing(job_id: str, parse_mode: str, task_id: Optional[str]
 
     parsed_output: Dict[str, List[Dict]] = {}
     bounds_output: Dict[str, List[Dict]] = {}
-    diagnostics: Dict[str, Dict] = {"job": {"source_type": "ocr", "ocr_backend": "openai_vision", "parse_mode": parse_mode}, "pages": {}}
+    diagnostics: Dict[str, Dict] = {
+        "job": {
+            "source_type": "ocr",
+            "ocr_backend": "openai_vision",
+            "parse_mode": parse_mode,
+        },
+        "pages": {},
+    }
 
     success_pages = 0
     failed_list: List[Dict[str, str]] = []
@@ -698,11 +729,12 @@ def finalize_job_processing(job_id: str, parse_mode: str, task_id: Optional[str]
 
     result_dir = repo.path(job_id, "result")
     parsed_output = _normalize_rows_by_page_for_output(parsed_output)
+    _persist_parsed_rows(repo, job_id, parsed_output, bounds_by_page=bounds_output, is_manual_edit=False)
     repo.write_json(result_dir / "parsed_rows.json", parsed_output)
     repo.write_json(result_dir / "bounds.json", bounds_output)
     repo.write_json(result_dir / "parse_diagnostics.json", diagnostics)
 
-    rows = _flatten_rows(parsed_output)
+    rows = _flatten_rows(_load_parsed_rows(repo, job_id, required=True))
     summary = compute_summary(rows)
     repo.write_json(result_dir / "summary.json", summary)
 
@@ -1047,7 +1079,31 @@ def _require_job(repo: JobsRepository, job_id: str):
         raise HTTPException(status_code=404, detail="job_not_found")
 
 
+def _persist_parsed_rows(
+    repo: JobsRepository,
+    job_id: str,
+    rows_by_page: Dict[str, List[Dict]],
+    *,
+    bounds_by_page: Dict[str, List[Dict]] | None = None,
+    is_manual_edit: bool,
+) -> None:
+    parsed_repo = JobTransactionsRepository(DATA_DIR)
+    parsed_repo.replace_job_rows(
+        job_id=job_id,
+        rows_by_page=rows_by_page,
+        bounds_by_page=bounds_by_page or {},
+        is_manual_edit=is_manual_edit,
+    )
+
+
 def _load_parsed_rows(repo: JobsRepository, job_id: str, required: bool = False) -> Dict[str, List[Dict]]:
+    parsed_repo = JobTransactionsRepository(DATA_DIR)
+    if parsed_repo.has_rows(job_id):
+        data = parsed_repo.get_rows_by_job(job_id)
+        normalized = _normalize_rows_by_page_for_output(data)
+        normalized = _backfill_ocr_row_numbers_from_openai_raw(repo, job_id, normalized)
+        return normalized
+
     path = repo.path(job_id, "result", "parsed_rows.json")
     if not path.exists():
         if required:
@@ -1057,6 +1113,10 @@ def _load_parsed_rows(repo: JobsRepository, job_id: str, required: bool = False)
     if not isinstance(data, dict):
         return {}
     normalized = _normalize_rows_by_page_for_output(data)
+    bounds_path = repo.path(job_id, "result", "bounds.json")
+    bounds_payload = repo.read_json(bounds_path, default={}) if bounds_path.exists() else {}
+    if isinstance(bounds_payload, dict):
+        _persist_parsed_rows(repo, job_id, normalized, bounds_by_page=bounds_payload, is_manual_edit=False)
     normalized = _backfill_ocr_row_numbers_from_openai_raw(repo, job_id, normalized)
     return normalized
 
@@ -1117,6 +1177,7 @@ def _normalize_row_date_for_output(value) -> str:
     for fmt in ("%m/%d/%Y", "%d/%m/%Y", "%m-%d-%Y", "%d-%m-%Y", "%Y-%m-%d"):
         try:
             parsed = dt.datetime.strptime(raw, fmt).date()
+            parsed = _coerce_statement_century(parsed)
             return parsed.strftime("%m/%d/%Y")
         except Exception:
             continue
@@ -1335,10 +1396,22 @@ def _parse_date(value: str) -> Optional[dt.date]:
         return None
     for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%m-%d-%Y", "%d-%m-%Y"):
         try:
-            return dt.datetime.strptime(raw, fmt).date()
+            parsed = dt.datetime.strptime(raw, fmt).date()
+            return _coerce_statement_century(parsed)
         except Exception:
             continue
     return None
+
+
+def _coerce_statement_century(value: dt.date) -> dt.date:
+    year = int(value.year)
+    now_limit = dt.date.today().year + 1
+    if 1900 <= year < 2000 and (year + 100) <= now_limit:
+        try:
+            return value.replace(year=year + 100)
+        except ValueError:
+            return value
+    return value
 
 
 def compute_summary(rows: List[Dict]) -> Dict:
@@ -1468,7 +1541,8 @@ def _build_minimal_report_pdf(job_id: str, summary: Dict, rows: List[Dict]) -> b
     ]
     for row in rows[:25]:
         lines.append(
-            f"{row.get('date') or '-'} | {row.get('description') or '-'} | D:{row.get('debit')} C:{row.get('credit')} B:{row.get('balance')}"
+            f"{row.get('date') or '-'} | {row.get('description') or '-'} | "
+            f"D:{row.get('debit')} C:{row.get('credit')} B:{row.get('balance')}"
         )
 
     content = ["BT", "/F1 11 Tf", "40 790 Td", "14 TL"]
@@ -1485,7 +1559,10 @@ def _build_minimal_report_pdf(job_id: str, summary: Dict, rows: List[Dict]) -> b
     objects.append(b"<< /Type /Catalog /Pages 2 0 R >>")
     objects.append(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
     objects.append(
-        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"
+        (
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] "
+            b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"
+        )
     )
     objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
     objects.append(f"<< /Length {len(stream)} >>\nstream\n".encode("ascii") + stream + b"\nendstream")

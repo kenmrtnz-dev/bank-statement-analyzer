@@ -4,100 +4,311 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Admin Console · Bank Statement Analyzer</title>
-    <link rel="stylesheet" href="/static/admin.css?v=20260226d" />
+    <link rel="stylesheet" href="/static/admin.css?v=20260302d" />
   </head>
   <body>
     <main class="admin-shell">
-      <header class="admin-topbar">
-        <div class="topbar-left">
-          <span class="topbar-badge">ADMIN</span>
-          <h1>Bank Statement Admin Console</h1>
-          <p>Manage evaluator accounts and backend storage maintenance tasks.</p>
-        </div>
-        <div class="topbar-actions">
-          <a class="ghost-link" href="/login">Login Page</a>
-          <button id="adminLogoutBtn" type="button">Logout</button>
-        </div>
-      </header>
-
-      <section class="admin-kpis">
-        <article class="kpi-card">
-          <span class="kpi-label">Role Model</span>
-          <strong class="kpi-value">Admin / Evaluator</strong>
-          <p>Simple role split with cookie session auth.</p>
-        </article>
-        <article class="kpi-card">
-          <span class="kpi-label">Evaluator Access</span>
-          <strong class="kpi-value">Analyzer Workspace</strong>
-          <p>Main app and job APIs are evaluator-only.</p>
-        </article>
-      </section>
-
-      <section class="admin-grid">
-        <article class="admin-card user-mgmt-card">
-          <div class="card-head">
-            <h2>Create Evaluator Account</h2>
-            <span class="card-tag">User Mgmt</span>
+      <aside class="admin-sidebar">
+        <section class="admin-brand">
+          <div class="brand-copy">
+            <span class="sidebar-eyebrow">Bank Statement Analyzer</span>
+            <strong>Admin Panel</strong>
+            <p>Operational controls for access, parser rules, and stored data.</p>
           </div>
-          <p>Provision evaluator credentials for access to upload, parsing, and review pages.</p>
-          <form id="createEvaluatorForm" class="stack">
-            <label>
-              Username
-              <input id="evUsername" type="text" placeholder="evaluator_username" required />
-            </label>
-            <label>
-              Password
-              <input id="evPassword" type="password" minlength="6" placeholder="minimum 6 characters" required />
-            </label>
-            <button type="submit">Create Evaluator</button>
-          </form>
-          <p id="createEvaluatorFeedback" class="inline-feedback hidden"></p>
-        </article>
-      </section>
+        </section>
 
-      <section class="admin-maintenance">
-        <article class="admin-card">
-          <div class="card-head">
-            <h2>Feature Toggles</h2>
-            <span class="card-tag">Testing</span>
-          </div>
-          <p>Enable or disable the direct upload section used for parser testing.</p>
-          <form id="featureToggleForm" class="stack">
-            <label>
-              <input id="uploadTestingToggle" type="checkbox" />
-              Enable Upload Testing Section
-            </label>
-            <div class="feature-toggle-actions">
-              <button type="submit">Save Toggle</button>
+        <nav class="admin-nav" aria-label="Admin sections">
+          <button class="admin-nav-btn is-active" type="button" data-tab-target="accounts">
+            <span class="nav-icon" aria-hidden="true">AC</span>
+            <span class="nav-copy">
+              <strong>Accounts</strong>
+              <small>Create evaluator access</small>
+            </span>
+          </button>
+          <button class="admin-nav-btn" type="button" data-tab-target="transactions">
+            <span class="nav-icon" aria-hidden="true">TX</span>
+            <span class="nav-copy">
+              <strong>Transactions</strong>
+              <small>Audit parsed rows</small>
+            </span>
+          </button>
+          <button class="admin-nav-btn" type="button" data-tab-target="flag-codes">
+            <span class="nav-icon" aria-hidden="true">FC</span>
+            <span class="nav-copy">
+              <strong>Flag Codes</strong>
+              <small>Manage rule sets</small>
+            </span>
+          </button>
+          <button class="admin-nav-btn" type="button" data-tab-target="settings">
+            <span class="nav-icon" aria-hidden="true">ST</span>
+            <span class="nav-copy">
+              <strong>Settings</strong>
+              <small>Workspace controls</small>
+            </span>
+          </button>
+        </nav>
+
+        <section class="sidebar-card">
+          <span class="sidebar-card-label">Current Session</span>
+          <strong id="sessionUserLabel">Loading…</strong>
+          <p>Only administrators can access this workspace.</p>
+          <div class="sidebar-inline-metrics">
+            <div class="sidebar-inline-metric">
+              <span>Role</span>
+              <strong id="sessionRoleLabel">Admin</strong>
             </div>
-          </form>
-          <p id="featureToggleFeedback" class="inline-feedback hidden"></p>
-        </article>
-
-        <article class="admin-card">
-          <div class="card-head">
-            <h2>Storage Maintenance</h2>
-            <span class="card-tag danger-tag">High Impact</span>
+            <div class="sidebar-inline-metric">
+              <span>Testing</span>
+              <strong id="sidebarUploadTestingStatus">Disabled</strong>
+            </div>
           </div>
-          <p>Permanently remove all stored jobs and generated export files from backend storage.</p>
-          <form id="clearStoreForm" class="stack">
-            <button type="submit">Clear Jobs and Files</button>
-          </form>
-        </article>
-      </section>
+        </section>
 
-      <p id="adminMessage" class="admin-message hidden"></p>
+        <div class="sidebar-actions">
+          <a class="ghost-link" href="/login">Login Page</a>
+          <button id="adminLogoutBtn" class="ghost-button" type="button">Logout</button>
+        </div>
+      </aside>
+
+      <section class="admin-workspace">
+        <div class="workspace-meta">
+          <span class="workspace-breadcrumb">Administration / <span id="activeTabLabel">Accounts</span></span>
+        </div>
+
+        <section class="admin-panel is-active" data-tab-panel="accounts">
+          <div class="panel-grid">
+            <article class="admin-card user-mgmt-card">
+              <div class="card-head">
+                <h2>Create Evaluator Account</h2>
+                <span class="card-tag">Accounts</span>
+              </div>
+              <p>Provision evaluator credentials for upload, parsing, and review workflows.</p>
+              <form id="createEvaluatorForm" class="stack">
+                <label>
+                  Username
+                  <input id="evUsername" type="text" placeholder="evaluator_username" required />
+                </label>
+                <label>
+                  Password
+                  <input id="evPassword" type="password" minlength="6" placeholder="minimum 6 characters" required />
+                </label>
+                <button type="submit">Create Evaluator</button>
+              </form>
+              <p id="createEvaluatorFeedback" class="inline-feedback hidden"></p>
+            </article>
+
+            <div class="panel-stack">
+              <article class="admin-card">
+                <div class="card-head">
+                  <h2>Access Model</h2>
+                  <span class="card-tag">Policy</span>
+                </div>
+                <ul class="admin-list">
+                  <li>Admin accounts manage evaluator credentials and backend controls.</li>
+                  <li>Evaluator accounts access upload, parsing, and review workflows.</li>
+                  <li>Credentials are write-only from this console to avoid exposing stored secrets.</li>
+                </ul>
+              </article>
+
+              <article class="admin-card">
+                <div class="card-head">
+                  <h2>Session Guardrails</h2>
+                  <span class="card-tag">Live</span>
+                </div>
+                <div class="detail-grid">
+                  <div class="detail-item">
+                    <span>Signed in as</span>
+                    <strong id="sessionSummaryUser">-</strong>
+                  </div>
+                  <div class="detail-item">
+                    <span>Role</span>
+                    <strong>admin</strong>
+                  </div>
+                  <div class="detail-item">
+                    <span>Route Access</span>
+                    <strong>/admin</strong>
+                  </div>
+                  <div class="detail-item">
+                    <span>Auth Method</span>
+                    <strong>Cookie Session</strong>
+                  </div>
+                </div>
+              </article>
+            </div>
+          </div>
+        </section>
+
+        <section class="admin-panel" data-tab-panel="transactions">
+          <article class="admin-card">
+            <div class="card-head">
+              <div class="card-title-group">
+                <h2>Stored Transactions</h2>
+                <p>Inspect parsed transaction rows stored in the database. Results are limited to 50 rows per page.</p>
+              </div>
+              <span id="transactionsResultCount" class="card-tag">Loading…</span>
+            </div>
+
+            <form id="transactionsFilterForm" class="stack">
+              <div class="transactions-filters">
+                <label>
+                  Job ID
+                  <input id="txFilterJobId" type="text" placeholder="Filter by job id" />
+                </label>
+                <label>
+                  Page Key
+                  <input id="txFilterPageKey" type="text" placeholder="e.g. page_001" />
+                </label>
+                <label>
+                  Search
+                  <input id="txFilterQuery" type="text" placeholder="description, date, row id" />
+                </label>
+              </div>
+              <div class="transactions-filter-actions">
+                <button type="submit">Apply Filters</button>
+                <button id="resetTransactionsFiltersBtn" type="button" class="ghost-button">Reset</button>
+              </div>
+            </form>
+
+            <div class="transactions-admin-table-wrap">
+              <table class="transactions-admin-table">
+                <thead>
+                  <tr>
+                    <th>Job ID</th>
+                    <th>Page</th>
+                    <th>Row</th>
+                    <th>Date</th>
+                    <th>Description</th>
+                    <th>Debit</th>
+                    <th>Credit</th>
+                    <th>Balance</th>
+                    <th>Bounds</th>
+                    <th>Updated</th>
+                  </tr>
+                </thead>
+                <tbody id="transactionsRowsBody">
+                  <tr>
+                    <td colspan="10">Loading transactions…</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <div class="transactions-pagination">
+              <span id="transactionsPageInfo">Page 1 of 1</span>
+              <div class="transactions-pagination-actions">
+                <button id="transactionsPrevBtn" type="button" class="ghost-button">Previous</button>
+                <button id="transactionsNextBtn" type="button" class="ghost-button">Next</button>
+              </div>
+            </div>
+            <p id="transactionsFeedback" class="inline-feedback hidden"></p>
+          </article>
+        </section>
+
+        <section class="admin-panel" data-tab-panel="flag-codes">
+          <article class="admin-card">
+            <div class="card-head">
+              <div class="card-title-group">
+                <h2>Database Flag Codes</h2>
+                <p>Maintain normalized flag-code rows stored in the database.</p>
+              </div>
+              <span id="flagCodeRuleCountTag" class="card-tag">0 rows</span>
+            </div>
+
+            <form id="flagCodesFilterForm" class="stack">
+              <div class="transactions-filters">
+                <label>
+                  Bank ID
+                  <input id="flagFilterBankId" type="text" placeholder="e.g. 1" />
+                </label>
+                <label>
+                  Bank Name
+                  <input id="flagFilterBankName" type="text" placeholder="e.g. Banco de Oro" />
+                </label>
+                <label>
+                  Search
+                  <input id="flagFilterQuery" type="text" placeholder="bank id, name, or tx code" />
+                </label>
+              </div>
+              <div class="transactions-filter-actions">
+                <button type="submit">Apply Filters</button>
+                <button id="resetFlagCodesFiltersBtn" type="button" class="ghost-button">Reset</button>
+              </div>
+            </form>
+
+            <form id="bankCodeFlagsForm" class="stack">
+              <div class="bank-codes-table-wrap transactions-admin-table-wrap">
+                <table class="bank-codes-table transactions-admin-table flag-codes-admin-table">
+                  <thead>
+                    <tr>
+                      <th>Bank ID</th>
+                      <th>Bank Name</th>
+                      <th>Tx Code</th>
+                      <th>Particulars</th>
+                      <th>Action</th>
+                    </tr>
+                  </thead>
+                  <tbody id="bankCodeRowsBody"></tbody>
+                </table>
+              </div>
+              <div class="bank-codes-actions">
+                <button id="addBankCodeRowBtn" type="button" class="ghost-button">Add Row</button>
+                <button type="submit">Save Flag Codes</button>
+              </div>
+            </form>
+            <p id="bankCodeFlagsFeedback" class="inline-feedback hidden"></p>
+          </article>
+        </section>
+
+        <section class="admin-panel" data-tab-panel="settings">
+          <div class="panel-grid">
+            <article class="admin-card">
+              <div class="card-head">
+                <h2>Workspace Controls</h2>
+                <span class="card-tag">Settings</span>
+              </div>
+              <p>Enable or disable the direct upload section used for parser testing.</p>
+              <form id="featureToggleForm" class="stack">
+                <label class="toggle-row">
+                  <input id="uploadTestingToggle" type="checkbox" />
+                  <span class="toggle-copy">
+                    <strong>Enable Upload Testing Section</strong>
+                    <small>Controls the testing-only upload area in the main application.</small>
+                  </span>
+                </label>
+                <div class="feature-toggle-actions">
+                  <button type="submit">Save Toggle</button>
+                </div>
+              </form>
+              <p id="featureToggleFeedback" class="inline-feedback hidden"></p>
+            </article>
+
+            <article class="admin-card danger-zone">
+              <div class="card-head">
+                <h2>Clear Data</h2>
+                <span class="card-tag danger-tag">High Impact</span>
+              </div>
+              <p>Permanently remove all stored jobs, exports, and saved transaction rows from backend storage.</p>
+              <form id="clearStoreForm" class="stack">
+                <button type="submit" class="danger-button">Clear Jobs and Files</button>
+              </form>
+            </article>
+          </div>
+        </section>
+
+        <p id="adminMessage" class="admin-message hidden"></p>
+      </section>
     </main>
+
     <div id="confirmModal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
       <div class="modal-card">
-        <h3 id="confirmTitle">Confirm storage clear</h3>
-        <p>This will permanently delete all jobs and generated export files. This action cannot be undone.</p>
+        <h3 id="confirmTitle">Confirm clear data</h3>
+        <p>This will permanently delete all jobs, exports, and stored transaction rows. This action cannot be undone.</p>
         <div class="modal-actions">
           <button id="confirmCancelBtn" type="button" class="modal-cancel">Cancel</button>
-          <button id="confirmClearBtn" type="button" class="modal-danger">Yes, clear storage</button>
+          <button id="confirmClearBtn" type="button" class="modal-danger">Yes, clear data</button>
         </div>
       </div>
     </div>
-    <script src="/static/admin.js?v=20260226c"></script>
+    <script src="/static/admin.js?v=20260302d"></script>
   </body>
 </html>

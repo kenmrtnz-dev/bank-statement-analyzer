@@ -1,15 +1,17 @@
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
-
 from app import main
 from app.modules.auth import service as auth_service
 from app.modules.jobs import service as jobs_service
+from fastapi.testclient import TestClient
 
 
 @pytest.fixture
 def app_with_temp_data(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{(tmp_path / 'ocr.db').resolve()}")
+    monkeypatch.setenv("DB_AUTO_CREATE_SCHEMA", "true")
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     monkeypatch.setattr(jobs_service, "DATA_DIR", str(tmp_path))
     monkeypatch.setattr(auth_service, "DATA_DIR", tmp_path)

@@ -17,6 +17,7 @@ from app.modules.jobs.service import (
     get_cleaned_path,
     get_ocr_page,
     get_ocr_openai_raw_page,
+    get_parse_diagnostics,
     get_page_bounds,
     get_page_rows,
     get_pages_status,
@@ -129,6 +130,11 @@ def get_parsed_all_endpoint(job_id: uuid.UUID):
 @router.get("/jobs/{job_id}/summary")
 def get_summary_endpoint(job_id: uuid.UUID):
     return get_summary(str(job_id))
+
+
+@router.get("/jobs/{job_id}/parse-diagnostics")
+def get_parse_diagnostics_endpoint(job_id: uuid.UUID):
+    return get_parse_diagnostics(str(job_id))
 
 
 @router.get("/jobs/{job_id}/export/pdf")
