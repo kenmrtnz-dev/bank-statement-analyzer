@@ -20,6 +20,12 @@
     pagePrevBtn: document.getElementById('pagePrevBtn'),
     pageNextBtn: document.getElementById('pageNextBtn'),
     pageIndicator: document.getElementById('pageIndicator'),
+    previewTabButtons: Array.from(document.querySelectorAll('[data-preview-tab]')),
+    previewTabPreviewBtn: document.getElementById('previewTabPreviewBtn'),
+    previewTabDisbalanceBtn: document.getElementById('previewTabDisbalanceBtn'),
+    previewImagePanel: document.getElementById('previewImagePanel'),
+    previewDisbalancePanel: document.getElementById('previewDisbalancePanel'),
+    disbalanceRowsBody: document.getElementById('disbalanceRowsBody'),
     previewImage: document.getElementById('previewImage'),
     previewEmpty: document.getElementById('previewEmpty'),
     overlay: document.getElementById('overlay'),
@@ -52,6 +58,7 @@
     crmAttachmentsSection: document.getElementById('crmAttachmentsSection'),
     crmRefreshBtn: document.getElementById('crmRefreshBtn'),
     crmSearch: document.getElementById('crmSearch'),
+    crmStatusTabs: Array.from(document.querySelectorAll('[data-crm-status-tab]')),
     crmLoadMoreBtn: document.getElementById('crmLoadMoreBtn'),
     crmPager: document.getElementById('crmPager'),
     crmPrevBtn: document.getElementById('crmPrevBtn'),
@@ -97,18 +104,26 @@
     crmProcessByAttachment: {},
     crmStatusTimer: null,
     crmSearch: '',
+    crmStatusTab: 'not_started',
     crmSearchDebounceTimer: null,
     crmLeadByJobId: {},
+    crmUploadedByJobId: {},
     currentCrmLeadId: '',
     pageSaveTimers: {},
     pageSaveTokenByPage: {},
     parsedPanelMode: 'table',
     currentParseMode: '',
     reverseRowsBusy: false,
+    previewPanelTab: 'preview',
+    previewPanelHeightRef: 0,
+    disbalanceLoading: false,
+    disbalanceLoadPromise: null,
     summaryRaw: null,
     summaryIncludedMonths: new Set(),
     summaryKnownMonthKeys: new Set(),
-    summarySelectionInitialized: false
+    summarySelectionInitialized: false,
+    bankCodeFlags: [],
+    pageProfileByPage: {}
   };
   const ROUTE_TO_VIEW = {
     '/uploads': 'uploads',
@@ -401,13 +416,18 @@
 
   function setCrmPaginationState() {
     if (!els.crmPager) return;
-    const hasRows = Array.isArray(state.crmAttachments) && state.crmAttachments.length > 0;
+    const sourceItems = Array.isArray(state.crmAttachments) ? state.crmAttachments : [];
+    const filteredItems = getCrmTabFilteredItems(sourceItems);
+    const hasRows = sourceItems.length > 0;
     const show = !state.crmAttachmentsError && (hasRows || state.crmCurrentOffset > 0 || state.crmHasMore || state.crmLoading);
     els.crmPager.classList.toggle('hidden', !show);
 
-    const from = hasRows ? state.crmCurrentOffset + 1 : 0;
-    const to = hasRows ? state.crmCurrentOffset + state.crmAttachments.length : 0;
-    if (els.crmPageInfo) els.crmPageInfo.textContent = `Showing ${from}-${to}`;
+    if (els.crmPageInfo) {
+      const visible = filteredItems.length;
+      const start = hasRows ? state.crmCurrentOffset + 1 : 0;
+      const end = hasRows ? state.crmCurrentOffset + visible : 0;
+      els.crmPageInfo.textContent = hasRows ? `Showing ${start}-${end}` : 'Showing 0-0';
+    }
     if (els.crmPrevBtn) els.crmPrevBtn.disabled = state.crmLoading || state.crmLoadingMore || state.crmCurrentOffset <= 0;
     if (els.crmNextBtn) els.crmNextBtn.disabled = state.crmLoading || state.crmLoadingMore || !state.crmHasMore;
   }
@@ -453,7 +473,7 @@
   function normalizeProcessStatus(rawStatus) {
     const status = String(rawStatus || '').trim().toLowerCase();
     if (status === 'done') return 'completed';
-    if (['queued', 'processing', 'completed', 'failed', 'needs_review'].includes(status)) return status;
+    if (['queued', 'processing', 'completed', 'failed', 'needs_review', 'uploaded'].includes(status)) return status;
     return 'not_started';
   }
 
@@ -461,6 +481,7 @@
     const key = normalizeProcessStatus(status);
     if (key === 'not_started') return 'Not Started';
     if (key === 'needs_review') return 'Needs Review';
+    if (key === 'uploaded') return 'Uploaded';
     return key.charAt(0).toUpperCase() + key.slice(1);
   }
 
@@ -484,6 +505,88 @@
     return normalizedStep !== normalizedStatus;
   }
 
+  function normalizeCrmStatusTab(rawTab) {
+    const tab = String(rawTab || '').trim().toLowerCase();
+    if (tab === 'queued' || tab === 'completed') return tab;
+    return 'not_started';
+  }
+
+  function resolveCrmProcessState(item) {
+    const attachmentId = String(item?.attachment_id || '').trim();
+    const fallback = {
+      jobId: String(item?.process_job_id || '').trim(),
+      status: normalizeProcessStatus(item?.process_status),
+      step: String(item?.process_step || '').trim(),
+      progress: Number(item?.process_progress || 0),
+    };
+    if (fallback.jobId && state.crmUploadedByJobId[fallback.jobId]) {
+      fallback.status = 'uploaded';
+      fallback.step = 'uploaded';
+      fallback.progress = 100;
+    }
+    if (!attachmentId) return fallback;
+    const cached = state.crmProcessByAttachment[attachmentId];
+    if (!cached) return fallback;
+    const resolved = {
+      jobId: String(cached.jobId || fallback.jobId).trim(),
+      status: normalizeProcessStatus(cached.status || fallback.status),
+      step: String(cached.step || fallback.step).trim(),
+      progress: Number(cached.progress ?? fallback.progress ?? 0),
+    };
+    if (resolved.jobId && state.crmUploadedByJobId[resolved.jobId]) {
+      resolved.status = 'uploaded';
+      resolved.step = 'uploaded';
+      resolved.progress = 100;
+    }
+    return resolved;
+  }
+
+  function crmProcessMatchesTab(processStatus, tab) {
+    const status = normalizeProcessStatus(processStatus);
+    const tabKey = normalizeCrmStatusTab(tab);
+    if (tabKey === 'queued') return status === 'queued' || status === 'processing';
+    if (tabKey === 'completed') return status === 'completed' || status === 'needs_review' || status === 'uploaded';
+    return status === 'not_started' || status === 'failed';
+  }
+
+  function getCrmTabFilteredItems(sourceItems) {
+    const items = Array.isArray(sourceItems) ? sourceItems : [];
+    const tab = normalizeCrmStatusTab(state.crmStatusTab);
+    return items.filter((item) => crmProcessMatchesTab(resolveCrmProcessState(item).status, tab));
+  }
+
+  function renderCrmStatusTabs() {
+    const tabs = Array.isArray(els.crmStatusTabs) ? els.crmStatusTabs : [];
+    if (!tabs.length) return;
+
+    const counts = { not_started: 0, queued: 0, completed: 0 };
+    const sourceItems = Array.isArray(state.crmAttachments) ? state.crmAttachments : [];
+    for (const item of sourceItems) {
+      const status = resolveCrmProcessState(item).status;
+      if (crmProcessMatchesTab(status, 'queued')) counts.queued += 1;
+      else if (crmProcessMatchesTab(status, 'completed')) counts.completed += 1;
+      else counts.not_started += 1;
+    }
+
+    const active = normalizeCrmStatusTab(state.crmStatusTab);
+    for (const button of tabs) {
+      const tab = normalizeCrmStatusTab(button.dataset.crmStatusTab);
+      const selected = tab === active;
+      const baseLabel = String(button.dataset.label || button.textContent || '').trim() || 'Status';
+      button.textContent = `${baseLabel} (${counts[tab] || 0})`;
+      button.classList.toggle('active', selected);
+      button.setAttribute('aria-selected', selected ? 'true' : 'false');
+    }
+  }
+
+  function setCrmStatusTab(tab) {
+    const next = normalizeCrmStatusTab(tab);
+    if (next === state.crmStatusTab) return;
+    state.crmStatusTab = next;
+    renderCrmStatusTabs();
+    renderCrmAttachmentRows();
+  }
+
   function syncCrmProcessMapFromItems(items) {
     const next = {};
     for (const item of items) {
@@ -492,12 +595,46 @@
       const previous = state.crmProcessByAttachment[attachmentId] || {};
       const jobId = String(item?.process_job_id || previous.jobId || '').trim();
       const step = String(item?.process_step || previous.step || '').trim();
-      const status = normalizeProcessStatus(item?.process_status || previous.status || 'not_started');
+      let status = normalizeProcessStatus(item?.process_status || previous.status || 'not_started');
       const rawProgress = item?.process_progress ?? previous.progress ?? 0;
-      const progress = Number.isFinite(Number(rawProgress)) ? Number(rawProgress) : 0;
-      next[attachmentId] = { jobId, status, step, progress };
+      let progress = Number.isFinite(Number(rawProgress)) ? Number(rawProgress) : 0;
+      let nextStep = step;
+      if (jobId && state.crmUploadedByJobId[jobId]) {
+        status = 'uploaded';
+        nextStep = 'uploaded';
+        progress = 100;
+      }
+      next[attachmentId] = { jobId, status, step: nextStep, progress };
     }
     state.crmProcessByAttachment = next;
+  }
+
+  function markCrmExportUploadedByJob(jobId) {
+    const targetJobId = String(jobId || '').trim();
+    if (!targetJobId) return;
+    state.crmUploadedByJobId[targetJobId] = { uploadedAt: Date.now() };
+
+    for (const [attachmentId, process] of Object.entries(state.crmProcessByAttachment || {})) {
+      if (String(process?.jobId || '').trim() !== targetJobId) continue;
+      state.crmProcessByAttachment[attachmentId] = {
+        ...process,
+        status: 'uploaded',
+        step: 'uploaded',
+        progress: 100,
+      };
+    }
+
+    if (Array.isArray(state.crmAttachments) && state.crmAttachments.length) {
+      for (const item of state.crmAttachments) {
+        const processJobId = String(item?.process_job_id || '').trim();
+        if (processJobId !== targetJobId) continue;
+        item.process_status = 'uploaded';
+        item.process_step = 'uploaded';
+        item.process_progress = 100;
+      }
+    }
+
+    renderCrmAttachmentRows();
   }
 
   function startCrmStatusPolling() {
@@ -557,15 +694,17 @@
     if (!els.crmAttachmentsRowsBody) return;
 
     const sourceItems = Array.isArray(state.crmAttachments) ? state.crmAttachments : [];
+    renderCrmStatusTabs();
     const searchActive = Boolean(String(state.crmSearch || '').trim());
-    const items = sourceItems;
+    const items = getCrmTabFilteredItems(sourceItems);
+    const hasSourceRows = sourceItems.length > 0;
     const hasRows = items.length > 0;
     const hasError = Boolean(state.crmAttachmentsError);
-    const showTable = state.crmLoading || hasRows || hasError;
+    const showTable = state.crmLoading || hasRows || hasError || hasSourceRows;
 
     if (els.crmAttachmentsTableWrap) els.crmAttachmentsTableWrap.classList.toggle('hidden', !showTable);
     if (els.crmAttachmentsEmptyState) {
-      const showEmpty = !state.crmLoading && !hasRows && !hasError;
+      const showEmpty = !state.crmLoading && !hasSourceRows && !hasError;
       els.crmAttachmentsEmptyState.classList.toggle('hidden', !showEmpty);
     }
 
@@ -590,11 +729,15 @@
     }
 
     if (!hasRows) {
+      const tr = document.createElement('tr');
       if (searchActive) {
-        const tr = document.createElement('tr');
         tr.innerHTML = '<td colspan="7" class="table-empty-cell">No matching CRM files.</td>';
-        els.crmAttachmentsRowsBody.appendChild(tr);
+      } else if (hasSourceRows) {
+        tr.innerHTML = '<td colspan="7" class="table-empty-cell">No CRM files in this tab.</td>';
+      } else {
+        tr.innerHTML = '<td colspan="7" class="table-empty-cell">No CRM files found.</td>';
       }
+      els.crmAttachmentsRowsBody.appendChild(tr);
       setCrmLoadMoreState();
       setCrmPaginationState();
       return;
@@ -606,12 +749,7 @@
       const attachmentId = String(item.attachment_id || '').trim();
       const recordId = String(item.id || item.lead_id || '').trim();
       const sourceType = String(item.type || 'Lead').trim();
-      const process = state.crmProcessByAttachment[attachmentId] || {
-        jobId: String(item.process_job_id || '').trim(),
-        status: normalizeProcessStatus(item.process_status),
-        step: String(item.process_step || '').trim(),
-        progress: Number(item.process_progress || 0)
-      };
+      const process = resolveCrmProcessState(item);
       const processStatus = normalizeProcessStatus(process.status);
       const leadId = sourceType === 'Lead' ? recordId : '';
 
@@ -619,7 +757,7 @@
       if (isAvailable) {
         if (process.jobId && (processStatus === 'queued' || processStatus === 'processing')) {
           actionCell = `<button class="row-action-btn action-queued" type="button" data-open-job-id="${escapeHtml(process.jobId)}" data-lead-id="${escapeHtml(leadId)}">Open Processing</button>`;
-        } else if (process.jobId && (processStatus === 'completed' || processStatus === 'needs_review')) {
+        } else if (process.jobId && (processStatus === 'completed' || processStatus === 'needs_review' || processStatus === 'uploaded')) {
           actionCell = `<button class="row-action-btn action-completed" type="button" data-open-job-id="${escapeHtml(process.jobId)}" data-lead-id="${escapeHtml(leadId)}">Open Result</button>`;
         } else if (processStatus === 'failed') {
           actionCell = `<button class="row-action-btn action-failed" type="button" data-process-attachment-id="${escapeHtml(attachmentId)}" data-lead-id="${escapeHtml(leadId)}">Retry Process</button>`;
@@ -837,6 +975,7 @@
       });
       const leadId = String(payload?.lead_id || '').trim();
       const attachmentId = String(payload?.attachment_id || '').trim();
+      markCrmExportUploadedByJob(state.jobId);
       showToast(`Exported to CRM successfully.${leadId ? ` Lead: ${leadId}.` : ''}${attachmentId ? ` Attachment: ${attachmentId}.` : ''}`, 'success');
     } catch (err) {
       showToast(`Export to CRM failed: ${normalizeApiErrorMessage(err?.message)}`, 'error', 4200);
@@ -855,6 +994,7 @@
     if (els.rowsBody) els.rowsBody.innerHTML = '';
     if (els.rowCount) els.rowCount.textContent = '0 rows';
     if (els.parsedJsonBody) els.parsedJsonBody.textContent = '';
+    renderDisbalanceTable();
     updateReverseRowsActionState();
     syncParsedSectionHeightToPreview();
   }
@@ -884,6 +1024,197 @@
     }
     const canReverse = Object.values(state.parsedByPage).some((rows) => Array.isArray(rows) && rows.length > 1);
     els.reverseRowsBtn.disabled = !canReverse;
+  }
+
+  function normalizePreviewPanelTab(rawTab) {
+    return String(rawTab || '').trim().toLowerCase() === 'disbalance' ? 'disbalance' : 'preview';
+  }
+
+  function formatSignedAmount(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return '-';
+    const formatted = Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    return `${n < 0 ? '-' : ''}${formatted}`;
+  }
+
+  function pageSortValue(page) {
+    const text = String(page || '').trim().toLowerCase();
+    const m = text.match(/page[_-]?(\d+)/);
+    return m ? Number(m[1]) : Number.MAX_SAFE_INTEGER;
+  }
+
+  function collectDisbalanceEntries() {
+    const pages = Array.isArray(state.pages) && state.pages.length
+      ? state.pages.slice().sort((a, b) => pageSortValue(a) - pageSortValue(b))
+      : Object.keys(state.parsedByPage || {}).sort((a, b) => pageSortValue(a) - pageSortValue(b));
+
+    const entries = [];
+    for (const page of pages) {
+      const rows = Array.isArray(state.parsedByPage[page]) ? state.parsedByPage[page] : [];
+      if (rows.length < 2) continue;
+      const mismatchIds = computeBalanceMismatchRowIds(rows);
+      if (!mismatchIds.size) continue;
+
+      for (let idx = 1; idx < rows.length; idx += 1) {
+        const prev = rows[idx - 1] || {};
+        const current = rows[idx] || {};
+        const rowId = String(current?.row_id || '').trim() || String(idx + 1).padStart(3, '0');
+        if (!mismatchIds.has(rowId)) continue;
+
+        const prevBal = parseAmountForFormatting(prev.balance);
+        const currBal = parseAmountForFormatting(current.balance);
+        const debit = parseAmountForFormatting(current.debit);
+        const credit = parseAmountForFormatting(current.credit);
+        if (!Number.isFinite(prevBal) || !Number.isFinite(currBal)) continue;
+
+        const expected = prevBal - (Number.isFinite(debit) ? debit : 0) + (Number.isFinite(credit) ? credit : 0);
+        const delta = currBal - expected;
+        entries.push({
+          page,
+          rowId,
+          date: normalizeEditableCellValue(current.date).trim(),
+          description: normalizeEditableCellValue(current.description).trim(),
+          expected,
+          actual: currBal,
+          delta,
+        });
+      }
+    }
+    return entries;
+  }
+
+  function renderDisbalanceTable() {
+    if (!els.disbalanceRowsBody) return;
+    const rowsBody = els.disbalanceRowsBody;
+    rowsBody.innerHTML = '';
+
+    if (state.disbalanceLoading) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = '<td colspan="8" class="table-empty-cell">Loading disbalance rows…</td>';
+      rowsBody.appendChild(tr);
+      return;
+    }
+
+    const entries = collectDisbalanceEntries();
+    if (els.previewTabDisbalanceBtn) {
+      els.previewTabDisbalanceBtn.textContent = `Disbalance (${entries.length})`;
+    }
+
+    if (!entries.length) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = '<td colspan="8" class="table-empty-cell">No disbalance found.</td>';
+      rowsBody.appendChild(tr);
+      return;
+    }
+
+    for (const entry of entries) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td>${escapeHtml(entry.page)}</td>
+        <td>${escapeHtml(entry.rowId)}</td>
+        <td>${escapeHtml(formatParsedRowDate(entry.date))}</td>
+        <td>${escapeHtml(entry.description || '-')}</td>
+        <td>${escapeHtml(formatSignedAmount(entry.expected))}</td>
+        <td>${escapeHtml(formatSignedAmount(entry.actual))}</td>
+        <td class="${entry.delta < 0 ? 'is-negative' : ''}">${escapeHtml(formatSignedAmount(entry.delta))}</td>
+        <td><button class="row-action-btn action-review disbalance-jump-btn" type="button" data-page="${escapeHtml(entry.page)}" data-row-id="${escapeHtml(entry.rowId)}">Go to Row</button></td>
+      `;
+      rowsBody.appendChild(tr);
+    }
+  }
+
+  async function ensureAllPagesParsedLoaded() {
+    if (!state.jobId) return;
+    const missingPages = (state.pages || []).filter((page) => !Array.isArray(state.parsedByPage[page]));
+    if (!missingPages.length) return;
+    if (state.disbalanceLoadPromise) return state.disbalanceLoadPromise;
+
+    state.disbalanceLoading = true;
+    renderDisbalanceTable();
+
+    state.disbalanceLoadPromise = (async () => {
+      for (const page of missingPages) {
+        try {
+          state.parsedByPage[page] = await api(`/jobs/${state.jobId}/parsed/${page}`);
+        } catch {
+          state.parsedByPage[page] = [];
+        }
+      }
+    })();
+
+    try {
+      await state.disbalanceLoadPromise;
+    } finally {
+      state.disbalanceLoadPromise = null;
+      state.disbalanceLoading = false;
+      renderDisbalanceTable();
+    }
+  }
+
+  function setPreviewPanelTab(tab) {
+    const next = normalizePreviewPanelTab(tab);
+    if (next === 'disbalance' && state.previewPanelTab !== 'disbalance' && els.previewSectionCard) {
+      const currentHeight = Math.round(els.previewSectionCard.getBoundingClientRect().height || 0);
+      if (Number.isFinite(currentHeight) && currentHeight > 0) {
+        state.previewPanelHeightRef = currentHeight;
+      }
+    }
+    state.previewPanelTab = next;
+    const isDisbalance = next === 'disbalance';
+
+    if (els.previewImagePanel) els.previewImagePanel.classList.toggle('hidden', isDisbalance);
+    if (els.previewDisbalancePanel) els.previewDisbalancePanel.classList.toggle('hidden', !isDisbalance);
+    if (els.previewSectionCard) {
+      if (isDisbalance && state.previewPanelHeightRef > 0) {
+        els.previewSectionCard.style.minHeight = `${state.previewPanelHeightRef}px`;
+      } else {
+        els.previewSectionCard.style.removeProperty('min-height');
+      }
+    }
+
+    const buttons = Array.isArray(els.previewTabButtons) ? els.previewTabButtons : [];
+    for (const button of buttons) {
+      const active = normalizePreviewPanelTab(button.dataset.previewTab) === next;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-selected', active ? 'true' : 'false');
+    }
+
+    if (isDisbalance) {
+      renderDisbalanceTable();
+      ensureAllPagesParsedLoaded().catch(() => {
+        renderDisbalanceTable();
+      });
+    } else if (els.previewTabDisbalanceBtn) {
+      const count = collectDisbalanceEntries().length;
+      els.previewTabDisbalanceBtn.textContent = `Disbalance (${count})`;
+    }
+    syncParsedSectionHeightToPreview();
+    updatePreviewEmptyState();
+  }
+
+  async function jumpToParsedRow(page, rowId) {
+    const targetPage = String(page || '').trim();
+    const targetRowId = String(rowId || '').trim();
+    if (!targetPage || !targetRowId) return;
+
+    if (state.parsedPanelMode === 'json') {
+      setParsedPanelMode('table');
+    }
+
+    if (state.currentPage !== targetPage) {
+      state.currentPage = targetPage;
+      if (els.pageSelect) els.pageSelect.value = state.currentPage;
+      updatePageNav();
+      await loadCurrentPageData();
+    } else {
+      renderRows();
+    }
+
+    selectRow(targetRowId);
+    const targetTr = Array.from(els.rowsBody?.querySelectorAll('tr') || []).find(
+      (rowEl) => String(rowEl.dataset.rowId || '').trim() === targetRowId,
+    );
+    targetTr?.scrollIntoView({ block: 'center', behavior: 'smooth' });
   }
 
   async function ensureCurrentPageOpenaiRawLoaded() {
@@ -924,6 +1255,9 @@
 
     const previewHeight = Math.round(els.previewSectionCard.getBoundingClientRect().height || 0);
     if (!Number.isFinite(previewHeight) || previewHeight <= 0) return;
+    if (state.previewPanelTab === 'preview') {
+      state.previewPanelHeightRef = previewHeight;
+    }
 
     els.parsedSectionCard.style.height = `${previewHeight}px`;
     const parsedHeader = els.parsedSectionCard.querySelector('.row-between');
@@ -938,6 +1272,97 @@
       (acc, pageRows) => acc + (Array.isArray(pageRows) ? pageRows.length : 0),
       0,
     );
+  }
+
+  const BANK_TO_PROFILE_ALIASES = {
+    AUB: ['AUB'],
+    BDO: ['BDO'],
+    BPI: ['BPI'],
+    METROBANK: ['METROBANK'],
+    RCBC: ['RCBC'],
+    SECB: ['SECB', 'SECURITY_BANK'],
+    'SECURITY BANK': ['SECB', 'SECURITY_BANK']
+  };
+
+  function normalizeProfileAlias(value) {
+    return String(value || '').trim().toUpperCase().replaceAll(' ', '_');
+  }
+
+  function normalizeBankCode(value) {
+    return String(value || '').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '');
+  }
+
+  function inferProfileAliasesFromBank(bankName) {
+    const bank = String(bankName || '').trim().toUpperCase();
+    const aliases = BANK_TO_PROFILE_ALIASES[bank] || BANK_TO_PROFILE_ALIASES[bank.replaceAll('_', ' ')] || [bank];
+    return aliases
+      .map((value) => normalizeProfileAlias(value))
+      .filter(Boolean)
+      .filter((value, idx, arr) => arr.indexOf(value) === idx);
+  }
+
+  function normalizeBankCodeFlagRows(rawRows) {
+    if (!Array.isArray(rawRows)) return [];
+    const output = [];
+    for (const item of rawRows) {
+      if (!item || typeof item !== 'object') continue;
+      const bank = String(item.bank || '').trim().toUpperCase();
+      if (!bank) continue;
+
+      const rawCodes = Array.isArray(item.codes)
+        ? item.codes
+        : String(item.codes || '')
+          .replaceAll('\n', ',')
+          .split(',');
+      const codes = rawCodes
+        .map((code) => normalizeBankCode(code))
+        .filter(Boolean)
+        .filter((code, idx, arr) => arr.indexOf(code) === idx);
+      if (!codes.length) continue;
+
+      const profileAliases = Array.isArray(item.profile_aliases) && item.profile_aliases.length
+        ? item.profile_aliases
+          .map((alias) => normalizeProfileAlias(alias))
+          .filter(Boolean)
+          .filter((alias, idx, arr) => arr.indexOf(alias) === idx)
+        : inferProfileAliasesFromBank(bank);
+
+      output.push({ bank, codes, profileAliases });
+    }
+    return output;
+  }
+
+  function escapeRegex(value) {
+    return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  function descriptionContainsCode(description, code) {
+    const text = String(description || '').toUpperCase();
+    const token = String(code || '').toUpperCase();
+    if (!text || !token) return false;
+    const pattern = new RegExp(`(^|[^A-Z0-9])${escapeRegex(token)}([^A-Z0-9]|$)`);
+    return pattern.test(text);
+  }
+
+  function resolveActiveBankCodeEntries(page) {
+    const entries = Array.isArray(state.bankCodeFlags) ? state.bankCodeFlags : [];
+    if (!entries.length) return [];
+    const profile = normalizeProfileAlias(state.pageProfileByPage[page]);
+    if (!profile) return entries;
+    const matched = entries.filter((entry) => Array.isArray(entry.profileAliases) && entry.profileAliases.includes(profile));
+    return matched.length ? matched : entries;
+  }
+
+  function getDescriptionFlagMatch(description, page) {
+    const entries = resolveActiveBankCodeEntries(page);
+    for (const entry of entries) {
+      for (const code of entry.codes || []) {
+        if (descriptionContainsCode(description, code)) {
+          return { bank: entry.bank, code };
+        }
+      }
+    }
+    return null;
   }
 
   function normalizeEditableCellValue(value) {
@@ -1011,6 +1436,26 @@
       if (input) {
         input.classList.toggle('balance-mismatch', isMismatch);
       }
+    }
+    renderDisbalanceTable();
+  }
+
+  function applyDescriptionFlagStyles(page) {
+    if (!els.rowsBody) return;
+    const rows = Array.isArray(state.parsedByPage[page]) ? state.parsedByPage[page] : [];
+    const rowById = new Map(
+      rows.map((row, idx) => [String(row?.row_id || '').trim() || String(idx + 1).padStart(3, '0'), row])
+    );
+
+    for (const tr of els.rowsBody.querySelectorAll('tr')) {
+      const rowId = String(tr.dataset.rowId || '').trim();
+      const row = rowById.get(rowId);
+      const input = tr.querySelector('.table-row-input-description');
+      if (!(input instanceof HTMLInputElement)) continue;
+      const match = getDescriptionFlagMatch(normalizeEditableCellValue(row?.description), page);
+      input.classList.toggle('bank-code-flagged', Boolean(match));
+      tr.classList.toggle('bank-code-flag-row', Boolean(match));
+      input.title = match ? `Flagged transaction code ${match.code} (${match.bank})` : '';
     }
   }
 
@@ -1292,6 +1737,7 @@
           row[field] = input.value;
           queuePageRowsSave(page);
           applyBalanceMismatchStyles(page);
+          applyDescriptionFlagStyles(page);
         });
         input.addEventListener('change', () => {
           const normalized = AMOUNT_ROW_FIELDS.has(field)
@@ -1301,6 +1747,7 @@
           input.value = normalized;
           queuePageRowsSave(page);
           applyBalanceMismatchStyles(page);
+          applyDescriptionFlagStyles(page);
         });
         input.addEventListener('blur', () => {
           const normalized = AMOUNT_ROW_FIELDS.has(field)
@@ -1310,6 +1757,7 @@
           input.value = normalized;
           queuePageRowsSave(page);
           applyBalanceMismatchStyles(page);
+          applyDescriptionFlagStyles(page);
         });
 
         td.appendChild(input);
@@ -1356,6 +1804,7 @@
     }
     updateReverseRowsActionState();
     applyBalanceMismatchStyles(page);
+    applyDescriptionFlagStyles(page);
     drawSelectedBound();
   }
 
@@ -1417,12 +1866,26 @@
     loadPreview();
   }
 
+  function parsePageProfilesFromDiagnostics(payload) {
+    const pages = payload && typeof payload === 'object' ? payload.pages : null;
+    if (!pages || typeof pages !== 'object') return {};
+    const profileByPage = {};
+    for (const [page, item] of Object.entries(pages)) {
+      if (!item || typeof item !== 'object') continue;
+      const profile = normalizeProfileAlias(item.profile_selected || item.bank_profile || item.profile_detected || '');
+      if (!profile) continue;
+      profileByPage[String(page)] = profile;
+    }
+    return profileByPage;
+  }
+
   async function loadResultData() {
     await flushPendingPageSaves();
     if (!state.jobId) return;
-    const [cleaned, summary] = await Promise.all([
+    const [cleaned, summary, diagnostics] = await Promise.all([
       api(`/jobs/${state.jobId}/cleaned`),
-      api(`/jobs/${state.jobId}/summary`)
+      api(`/jobs/${state.jobId}/summary`),
+      api(`/jobs/${state.jobId}/parse-diagnostics`).catch(() => null)
     ]);
 
     const pages = (cleaned.pages || [])
@@ -1435,11 +1898,15 @@
     state.parsedByPage = {};
     state.boundsByPage = {};
     state.openaiRawByPage = {};
+    state.pageProfileByPage = parsePageProfilesFromDiagnostics(diagnostics);
+    state.disbalanceLoading = false;
+    state.disbalanceLoadPromise = null;
     state.totalParsedRows = Number(summary?.total_transactions || 0);
 
     renderSummary(state.totalParsedRows > 0 ? (summary || null) : null);
     renderPages();
     await loadCurrentPageData();
+    renderDisbalanceTable();
     updateExportAvailability();
     updatePreviewEmptyState();
   }
@@ -1489,6 +1956,9 @@
     state.isCompleted = false;
     state.totalParsedRows = 0;
     state.openaiRawByPage = {};
+    state.pageProfileByPage = {};
+    state.disbalanceLoading = false;
+    state.disbalanceLoadPromise = null;
     setExportLinks(false);
     setParsedPanelMode(state.parsedPanelMode);
     clearRows();
@@ -1792,6 +2262,36 @@
     });
   }
 
+  if (Array.isArray(els.previewTabButtons) && els.previewTabButtons.length) {
+    for (const button of els.previewTabButtons) {
+      button.addEventListener('click', () => {
+        setPreviewPanelTab(button.dataset.previewTab);
+      });
+    }
+  }
+
+  if (els.disbalanceRowsBody) {
+    els.disbalanceRowsBody.addEventListener('click', (e) => {
+      const target = e.target;
+      if (!(target instanceof HTMLElement)) return;
+      const btn = target.closest('.disbalance-jump-btn');
+      if (!btn) return;
+      const page = String(btn.getAttribute('data-page') || '').trim();
+      const rowId = String(btn.getAttribute('data-row-id') || '').trim();
+      jumpToParsedRow(page, rowId).catch((err) => {
+        alert(`Unable to jump to row: ${normalizeApiErrorMessage(err?.message)}`);
+      });
+    });
+  }
+
+  if (Array.isArray(els.crmStatusTabs) && els.crmStatusTabs.length) {
+    for (const button of els.crmStatusTabs) {
+      button.addEventListener('click', () => {
+        setCrmStatusTab(button.dataset.crmStatusTab);
+      });
+    }
+  }
+
   if (els.menuUploads) {
     els.menuUploads.addEventListener('click', (e) => {
       e.preventDefault();
@@ -1829,6 +2329,7 @@
   setCrmPaginationState();
   renderCrmAttachmentRows();
   setParsedPanelMode('table');
+  setPreviewPanelTab('preview');
   syncRoute(`${window.location.pathname}${window.location.search}` || '/uploads', true);
   setExportLinks(false);
   renderSummary(null);
@@ -1901,8 +2402,10 @@
     try {
       const settings = await api('/ui/settings');
       state.uploadTestingEnabled = Boolean(settings?.upload_testing_enabled);
+      state.bankCodeFlags = normalizeBankCodeFlagRows(settings?.bank_code_flags);
     } catch {
       state.uploadTestingEnabled = false;
+      state.bankCodeFlags = [];
     }
     applyFeatureVisibility();
     if (canAccessCrmAttachments) {

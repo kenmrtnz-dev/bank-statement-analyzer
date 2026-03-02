@@ -138,7 +138,7 @@ def normalize_date(value: str, order: List[str]) -> Optional[str]:
 def _match_to_date(groups: Tuple[str, ...], mode: str) -> Optional[dt.date]:
     try:
         if mode == "ymd":
-            year = int(groups[0])
+            year = _normalize_year(groups[0])
             month = int(groups[1])
             day = int(groups[2])
             return dt.date(year, month, day)
@@ -169,7 +169,12 @@ def _match_to_date(groups: Tuple[str, ...], mode: str) -> Optional[dt.date]:
 def _normalize_year(raw: str) -> int:
     year = int(raw)
     if year < 100:
-        return 2000 + year
+        year = 2000 + year
+    # OCR on statements can misread 2025 as 1925.
+    # Promote 19xx values to 20xx only when the result stays near present day.
+    now_limit = dt.date.today().year + 1
+    if 1900 <= year < 2000 and (year + 100) <= now_limit:
+        year += 100
     return year
 
 
@@ -207,10 +212,9 @@ def _parse_ocr_compact_month_date(text: str) -> Optional[str]:
 
             day = int(day_txt)
             if len(year_txt) >= 4:
-                year = int(year_txt[:4])
+                year = _normalize_year(year_txt[:4])
             else:
-                year = int(year_txt[:2])
-                year += 2000
+                year = _normalize_year(year_txt[:2])
             month = MONTHS[month_key.lower()[:3]]
             try:
                 if 1 <= day <= 31:

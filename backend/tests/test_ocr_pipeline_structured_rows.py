@@ -5,6 +5,7 @@ def test_normalize_structured_row_date_to_mdy():
     assert _normalize_structured_row_date("2026-02-23") == "02/23/2026"
     assert _normalize_structured_row_date("23/02/2026") == "02/23/2026"
     assert _normalize_structured_row_date("2-3-2026") == "02/03/2026"
+    assert _normalize_structured_row_date("10/10/1925") == "10/10/2025"
 
 
 def test_normalize_structured_ai_rows_keeps_row_number_and_formats_date():

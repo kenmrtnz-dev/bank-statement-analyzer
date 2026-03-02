@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Bank Statement Analyzer</title>
-    <link rel="stylesheet" href="/static/ui.css?v=20260227d" />
+    <link rel="stylesheet" href="/static/ui.css?v=20260227h" />
   </head>
   <body>
     <main class="app-shell">
@@ -108,6 +108,17 @@
                 <button id="crmLoadMoreBtn" type="button" class="ghost hidden">Load More</button>
               </div>
             </div>
+            <div id="crmStatusTabs" class="crm-status-tabs" role="tablist" aria-label="CRM process status tabs">
+              <button type="button" class="crm-status-tab active" data-crm-status-tab="not_started" data-label="Not Started" role="tab" aria-selected="true">
+                Not Started
+              </button>
+              <button type="button" class="crm-status-tab" data-crm-status-tab="queued" data-label="Queued" role="tab" aria-selected="false">
+                Queued
+              </button>
+              <button type="button" class="crm-status-tab" data-crm-status-tab="completed" data-label="Completed" role="tab" aria-selected="false">
+                Completed
+              </button>
+            </div>
             <div id="crmAttachmentsEmptyState" class="upload-empty-state hidden">
               <div class="upload-empty-icon" aria-hidden="true">◌</div>
               <p>No CRM bank statement files found.</p>
@@ -179,12 +190,37 @@
                   <select id="pageSelect" class="hidden"></select>
                 </div>
               </div>
-              <div class="preview-wrap" id="previewWrap">
-                <div id="previewEmpty" class="preview-empty">Page preview will appear here.</div>
-                <img id="previewImage" alt="Page preview" />
-                <canvas id="overlay"></canvas>
+              <div class="preview-panel-tabs" role="tablist" aria-label="Preview panel tabs">
+                <button id="previewTabPreviewBtn" class="preview-panel-tab active" type="button" data-preview-tab="preview" role="tab" aria-selected="true">Preview</button>
+                <button id="previewTabDisbalanceBtn" class="preview-panel-tab" type="button" data-preview-tab="disbalance" role="tab" aria-selected="false">Disbalance</button>
               </div>
-              <div class="hint">Click a row to show bounds on the image.</div>
+              <div id="previewImagePanel">
+                <div class="preview-wrap" id="previewWrap">
+                  <div id="previewEmpty" class="preview-empty">Page preview will appear here.</div>
+                  <img id="previewImage" alt="Page preview" />
+                  <canvas id="overlay"></canvas>
+                </div>
+                <div class="hint">Click a row to show bounds on the image.</div>
+              </div>
+              <div id="previewDisbalancePanel" class="hidden">
+                <div class="table-wrap disbalance-table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Page</th>
+                        <th>Row</th>
+                        <th>Date</th>
+                        <th>Description</th>
+                        <th>Expected</th>
+                        <th>Actual</th>
+                        <th>Delta</th>
+                        <th>Action</th>
+                      </tr>
+                    </thead>
+                    <tbody id="disbalanceRowsBody"></tbody>
+                  </table>
+                </div>
+              </div>
             </article>
 
             <section class="card table-card section-card">
@@ -229,6 +265,6 @@
       </section>
     </main>
 
-    <script src="/static/ui.js?v=20260227i"></script>
+    <script src="/static/ui.js?v=20260227m"></script>
   </body>
 </html>

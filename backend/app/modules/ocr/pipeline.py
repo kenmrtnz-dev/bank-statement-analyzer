@@ -462,10 +462,22 @@ def _normalize_structured_row_date(value: str) -> str:
     for fmt in ("%m/%d/%Y", "%d/%m/%Y", "%m-%d-%Y", "%d-%m-%Y", "%Y-%m-%d"):
         try:
             parsed = dt.datetime.strptime(raw, fmt).date()
+            parsed = _coerce_statement_century(parsed)
             return parsed.strftime("%m/%d/%Y")
         except Exception:
             continue
     return raw
+
+
+def _coerce_statement_century(value: dt.date) -> dt.date:
+    year = int(value.year)
+    now_limit = dt.date.today().year + 1
+    if 1900 <= year < 2000 and (year + 100) <= now_limit:
+        try:
+            return value.replace(year=year + 100)
+        except ValueError:
+            return value
+    return value
 
 
 def _classify_row_type(row: Dict, profile) -> str | None:

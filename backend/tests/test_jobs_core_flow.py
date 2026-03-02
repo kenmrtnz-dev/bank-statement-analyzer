@@ -1,8 +1,8 @@
 import json
+import sqlite3
 from pathlib import Path
 
 from app.modules.jobs import service as jobs_service
-
 
 
 def test_health(client):
@@ -111,10 +111,18 @@ def test_job_flow_with_mocked_pipeline(client, monkeypatch):
     assert parsed.status_code == 200
     assert parsed.json()["page_001"][0]["description"] == "Deposit"
 
+    db_path = Path(jobs_service.DATA_DIR) / "ocr.db"
+    with sqlite3.connect(db_path) as conn:
+        stored = conn.execute(
+            "SELECT description, credit, x1 FROM job_transactions WHERE job_id = ? ORDER BY row_index",
+            (job_id,),
+        ).fetchall()
+    assert stored == [("Deposit", 1000, 0.1)]
+
     updated_rows = [
         {
             "row_id": "001",
-            "date": "02/01/2026",
+            "date": "10/10/1925",
             "description": "Edited Deposit",
             "debit": "50.00",
             "credit": "",
@@ -124,12 +132,20 @@ def test_job_flow_with_mocked_pipeline(client, monkeypatch):
     update = client.put(f"/jobs/{job_id}/parsed/page_001", json=updated_rows)
     assert update.status_code == 200
     assert update.json()["rows"][0]["description"] == "Edited Deposit"
+    assert update.json()["rows"][0]["date"] == "10/10/2025"
     assert update.json()["summary"]["debit_transactions"] == 1
     assert update.json()["summary"]["total_debit"] == 50.0
 
     parsed_after_update = client.get(f"/jobs/{job_id}/parsed")
     assert parsed_after_update.status_code == 200
     assert parsed_after_update.json()["page_001"][0]["description"] == "Edited Deposit"
+
+    with sqlite3.connect(db_path) as conn:
+        stored_after_update = conn.execute(
+            "SELECT description, debit, credit, balance, x1 FROM job_transactions WHERE job_id = ? ORDER BY row_index",
+            (job_id,),
+        ).fetchall()
+    assert stored_after_update == [("Edited Deposit", 50, None, 950, 0.1)]
 
     bounds = client.get(f"/jobs/{job_id}/rows/page_001/bounds")
     assert bounds.status_code == 200
@@ -138,6 +154,10 @@ def test_job_flow_with_mocked_pipeline(client, monkeypatch):
     summary = client.get(f"/jobs/{job_id}/summary")
     assert summary.status_code == 200
     assert summary.json().get("total_transactions") == 1
+
+    diagnostics = client.get(f"/jobs/{job_id}/parse-diagnostics")
+    assert diagnostics.status_code == 200
+    assert diagnostics.json().get("pages", {}).get("page_001", {}).get("rows_parsed") == 1
 
     export_pdf = client.get(f"/jobs/{job_id}/export/pdf")
     assert export_pdf.status_code == 200
