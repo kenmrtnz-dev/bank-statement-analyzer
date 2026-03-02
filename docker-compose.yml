@@ -12,8 +12,10 @@ services:
       - ./backend/app:/app/app:ro
       - ocr_data:/data
     depends_on:
-      - redis
-      - db
+      redis:
+        condition: service_started
+      db:
+        condition: service_healthy
     command: >
       uvicorn app.main:app
       --host 0.0.0.0
@@ -31,8 +33,10 @@ services:
       - ./backend/app:/app/app:ro
       - ocr_data:/data
     depends_on:
-      - redis
-      - db
+      redis:
+        condition: service_started
+      db:
+        condition: service_healthy
     command: >
       sh -c "celery -A app.worker.celery_app.celery worker
       --loglevel=INFO
@@ -55,6 +59,12 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-ocr}
       POSTGRES_USER: ${POSTGRES_USER:-ocr}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ocrpass}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ocr} -d ${POSTGRES_DB:-ocr}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
     ports:
       - "5432:5432"
     volumes:

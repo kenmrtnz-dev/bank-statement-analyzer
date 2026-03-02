@@ -2,23 +2,27 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 import os
 import tempfile
 import threading
+import time
 import uuid
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Callable, Dict
 
 from sqlalchemy import create_engine, delete, func, inspect, or_, select, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import OperationalError
 
 from app.infra.db.models import BankCodeFlagRecord, Base, JobTransactionRecord
 
 _DB_ENGINE_CACHE: dict[str, Engine] = {}
 _DB_ENGINE_CACHE_GUARD = threading.Lock()
 _DB_SCHEMA_READY: set[str] = set()
+logger = logging.getLogger(__name__)
 
 class JobsRepository:
     def __init__(self, data_dir: str | Path):
@@ -101,6 +105,56 @@ def _resolve_database_url(data_dir: str | Path) -> str:
     return f"sqlite:///{db_path.resolve()}"
 
 
+def _db_connect_max_wait_seconds() -> float:
+    raw = str(os.getenv("DB_CONNECT_MAX_WAIT_SECONDS") or "45").strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 45.0
+
+
+def _db_connect_retry_interval_seconds() -> float:
+    raw = str(os.getenv("DB_CONNECT_RETRY_INTERVAL_SECONDS") or "2").strip()
+    try:
+        return max(0.1, float(raw))
+    except ValueError:
+        return 2.0
+
+
+def _run_schema_bootstrap(
+    data_dir: str | Path,
+    operation: Callable[[str, Engine], None],
+) -> None:
+    url = _resolve_database_url(data_dir)
+    engine = _get_db_engine(data_dir)
+    if url.startswith("sqlite"):
+        operation(url, engine)
+        return
+
+    deadline = time.monotonic() + _db_connect_max_wait_seconds()
+    retry_interval = _db_connect_retry_interval_seconds()
+
+    while True:
+        try:
+            operation(url, engine)
+            return
+        except OperationalError as exc:
+            if time.monotonic() >= deadline:
+                raise
+            logger.warning(
+                "Database bootstrap failed for %s (%s). Retrying in %.1fs until startup timeout.",
+                url,
+                exc,
+                retry_interval,
+            )
+            with _DB_ENGINE_CACHE_GUARD:
+                cached = _DB_ENGINE_CACHE.pop(url, None)
+            if cached is not None:
+                cached.dispose()
+            time.sleep(retry_interval)
+            engine = _get_db_engine(data_dir)
+
+
 def _get_db_engine(data_dir: str | Path) -> Engine:
     url = _resolve_database_url(data_dir)
     with _DB_ENGINE_CACHE_GUARD:
@@ -116,24 +170,27 @@ def _get_db_engine(data_dir: str | Path) -> Engine:
 def ensure_job_transactions_schema(data_dir: str | Path) -> None:
     if not _env_bool("DB_AUTO_CREATE_SCHEMA", True):
         return
-    url = _resolve_database_url(data_dir)
-    engine = _get_db_engine(data_dir)
-    with _DB_ENGINE_CACHE_GUARD:
-        if url in _DB_SCHEMA_READY:
-            return
+
+    def _apply(url: str, engine: Engine) -> None:
+        with _DB_ENGINE_CACHE_GUARD:
+            if url in _DB_SCHEMA_READY:
+                return
         Base.metadata.create_all(engine, tables=[JobTransactionRecord.__table__])
-        _DB_SCHEMA_READY.add(url)
+        with _DB_ENGINE_CACHE_GUARD:
+            _DB_SCHEMA_READY.add(url)
+
+    _run_schema_bootstrap(data_dir, _apply)
 
 
 def ensure_bank_code_flags_schema(data_dir: str | Path) -> None:
     if not _env_bool("DB_AUTO_CREATE_SCHEMA", True):
         return
-    url = _resolve_database_url(data_dir)
-    engine = _get_db_engine(data_dir)
-    with _DB_ENGINE_CACHE_GUARD:
+
+    def _apply(url: str, engine: Engine) -> None:
         key = f"{url}#bank_code_flags"
-        if key in _DB_SCHEMA_READY:
-            return
+        with _DB_ENGINE_CACHE_GUARD:
+            if key in _DB_SCHEMA_READY:
+                return
         inspector = inspect(engine)
         if "bank_code_flags" in inspector.get_table_names():
             existing_columns = {column.get("name") for column in inspector.get_columns("bank_code_flags")}
@@ -141,7 +198,10 @@ def ensure_bank_code_flags_schema(data_dir: str | Path) -> None:
                 with engine.begin() as conn:
                     conn.execute(text("DROP TABLE bank_code_flags"))
         Base.metadata.create_all(engine, tables=[BankCodeFlagRecord.__table__])
-        _DB_SCHEMA_READY.add(key)
+        with _DB_ENGINE_CACHE_GUARD:
+            _DB_SCHEMA_READY.add(key)
+
+    _run_schema_bootstrap(data_dir, _apply)
 
 
 def _to_decimal(value: Any) -> Decimal | None:
