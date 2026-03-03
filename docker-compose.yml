@@ -9,7 +9,7 @@ services:
     ports:
       - "8000:8000"
     environment:
-      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-ocr}:${POSTGRES_PASSWORD:-ocrpass}@db:5432/${POSTGRES_DB:-ocr}
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-ocr}:${POSTGRES_PASSWORD:-ocrpass}@db:${POSTGRES_PORT:-5433}/${POSTGRES_DB:-ocr}
     volumes:
       - ./backend/app:/app/app:ro
       - ocr_data:/data
@@ -32,7 +32,7 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-ocr}:${POSTGRES_PASSWORD:-ocrpass}@db:5432/${POSTGRES_DB:-ocr}
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-ocr}:${POSTGRES_PASSWORD:-ocrpass}@db:${POSTGRES_PORT:-5433}/${POSTGRES_DB:-ocr}
     volumes:
       - ./backend/app:/app/app:ro
       - ocr_data:/data
@@ -59,18 +59,19 @@ services:
   db:
     image: postgres:16-alpine
     container_name: ocr_db
+    command: ["postgres", "-p", "${POSTGRES_PORT:-5433}"]
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-ocr}
       POSTGRES_USER: ${POSTGRES_USER:-ocr}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ocrpass}
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ocr} -d ${POSTGRES_DB:-ocr}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ocr} -d ${POSTGRES_DB:-ocr} -p ${POSTGRES_PORT:-5433}"]
       interval: 5s
       timeout: 5s
       retries: 12
       start_period: 5s
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "${POSTGRES_PORT:-5433}:${POSTGRES_PORT:-5433}"
     volumes:
       - pg_data:/var/lib/postgresql/data
 
