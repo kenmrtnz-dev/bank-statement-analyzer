@@ -366,18 +366,31 @@
     els.uploadRowsBody.innerHTML = '';
     for (const row of rows) {
       const tr = document.createElement('tr');
-      const status = String(row.status || 'queued').toLowerCase();
-      const normalizedStatus = status === 'done' ? 'completed' : status;
-      const actionMeta =
+      const normalizedStatus = normalizeProcessStatus(row.status || 'queued');
+      const progress = Math.max(0, Math.min(100, Number(row.progress ?? 0)));
+      const showProgress = normalizedStatus === 'queued' || normalizedStatus === 'processing';
+      const actionButtons =
         normalizedStatus === 'processing'
-          ? { label: 'Processing…', action: 'none', disabled: true, className: 'action-processing' }
-          : normalizedStatus === 'completed'
-            ? { label: 'View Results', action: 'open', disabled: false, className: 'action-completed' }
-            : normalizedStatus === 'failed'
-              ? { label: 'Retry', action: 'start', disabled: false, className: 'action-failed' }
-              : normalizedStatus === 'needs_review'
-                ? { label: 'Open Review', action: 'open', disabled: false, className: 'action-review' }
-                : { label: 'Begin Processing', action: 'start', disabled: false, className: 'action-queued' };
+          ? `
+              <div class="row-action-group">
+                <button class="row-action-btn action-open" type="button" data-action="open" data-job-id="${escapeHtml(row.jobId)}">Open Processing</button>
+                <button class="row-action-btn action-cancel" type="button" data-action="cancel" data-job-id="${escapeHtml(row.jobId)}">Cancel</button>
+              </div>
+            `
+          : normalizedStatus === 'queued'
+            ? `
+                <div class="row-action-group">
+                  <button class="row-action-btn action-queued" type="button" data-action="start" data-job-id="${escapeHtml(row.jobId)}">Begin Processing</button>
+                  <button class="row-action-btn action-cancel" type="button" data-action="cancel" data-job-id="${escapeHtml(row.jobId)}">Cancel</button>
+                </div>
+              `
+            : normalizedStatus === 'completed'
+              ? `<button class="row-action-btn action-completed" type="button" data-action="open" data-job-id="${escapeHtml(row.jobId)}">View Results</button>`
+              : normalizedStatus === 'failed'
+                ? `<button class="row-action-btn action-failed" type="button" data-action="start" data-job-id="${escapeHtml(row.jobId)}">Retry</button>`
+                : normalizedStatus === 'needs_review'
+                  ? `<button class="row-action-btn action-review" type="button" data-action="open" data-job-id="${escapeHtml(row.jobId)}">Open Review</button>`
+                  : `<button class="row-action-btn action-queued" type="button" data-action="start" data-job-id="${escapeHtml(row.jobId)}">Begin Processing</button>`;
       tr.innerHTML = `
         <td class="file-name-cell">
           <strong>${escapeHtml(row.fileName || 'document.pdf')}</strong>
@@ -386,9 +399,22 @@
         <td>${escapeHtml(formatBytes(row.sizeBytes))}</td>
         <td>${escapeHtml(formatDate(row.lastModified || row.createdAt))}</td>
         <td>You</td>
-        <td><span class="status-pill status-${escapeHtml(normalizedStatus)}">${escapeHtml(normalizedStatus)}</span></td>
         <td>
-          <button class="row-action-btn ${actionMeta.className}" type="button" data-action="${actionMeta.action}" data-job-id="${escapeHtml(row.jobId)}" ${actionMeta.disabled ? 'disabled' : ''}>${actionMeta.label}</button>
+          <div class="upload-status-cell">
+            <span class="status-pill status-${escapeHtml(normalizedStatus)}">${escapeHtml(formatProcessStatusLabel(normalizedStatus))}</span>
+            ${shouldShowProcessStep(normalizedStatus, row.step) ? `<div class="subtle-id">${escapeHtml(normalizeProcessStepForDisplay(row.step))}</div>` : ''}
+            ${showProgress ? `
+              <div class="upload-row-progress" aria-label="Processing progress">
+                <div class="upload-row-progress-track">
+                  <div class="upload-row-progress-bar" style="width: ${progress}%"></div>
+                </div>
+                <div class="upload-row-progress-value">${progress}%</div>
+              </div>
+            ` : ''}
+          </div>
+        </td>
+        <td>
+          ${actionButtons}
         </td>
       `;
       els.uploadRowsBody.appendChild(tr);
@@ -473,7 +499,8 @@
   function normalizeProcessStatus(rawStatus) {
     const status = String(rawStatus || '').trim().toLowerCase();
     if (status === 'done') return 'completed';
-    if (['queued', 'processing', 'completed', 'failed', 'needs_review', 'uploaded'].includes(status)) return status;
+    if (status === 'done_with_warnings') return 'needs_review';
+    if (['queued', 'processing', 'completed', 'failed', 'needs_review', 'uploaded', 'cancelled'].includes(status)) return status;
     return 'not_started';
   }
 
@@ -482,6 +509,7 @@
     if (key === 'not_started') return 'Not Started';
     if (key === 'needs_review') return 'Needs Review';
     if (key === 'uploaded') return 'Uploaded';
+    if (key === 'cancelled') return 'Cancelled';
     return key.charAt(0).toUpperCase() + key.slice(1);
   }
 
@@ -495,6 +523,7 @@
     const value = String(rawStep || '').trim().toLowerCase();
     if (!value) return '';
     if (value === 'done') return 'completed';
+    if (value === 'done_with_warnings' || value === 'completed_with_warnings') return 'needs_review';
     return value;
   }
 
@@ -546,7 +575,7 @@
     const tabKey = normalizeCrmStatusTab(tab);
     if (tabKey === 'queued') return status === 'queued' || status === 'processing';
     if (tabKey === 'completed') return status === 'completed' || status === 'needs_review' || status === 'uploaded';
-    return status === 'not_started' || status === 'failed';
+    return status === 'not_started' || status === 'failed' || status === 'cancelled';
   }
 
   function getCrmTabFilteredItems(sourceItems) {
@@ -889,24 +918,27 @@
 
   function setStatus(payload) {
     const raw = String(payload.status || 'idle').toLowerCase();
-    const mapped = raw === 'done' ? 'completed' : raw;
+    const mapped = raw === 'done' ? 'completed' : raw === 'done_with_warnings' ? 'needs_review' : raw;
     if (els.jobStatus) {
-      els.jobStatus.textContent = mapped;
-      els.jobStatus.classList.remove('status-idle', 'status-processing', 'status-completed', 'status-failed');
-      if (mapped === 'processing') els.jobStatus.classList.add('status-processing');
+      els.jobStatus.textContent = mapped === 'idle' ? 'idle' : formatProcessStatusLabel(mapped);
+      els.jobStatus.classList.remove('status-idle', 'status-queued', 'status-processing', 'status-completed', 'status-failed', 'status-needs_review', 'status-cancelled');
+      if (mapped === 'queued') els.jobStatus.classList.add('status-queued');
+      else if (mapped === 'processing') els.jobStatus.classList.add('status-processing');
       else if (mapped === 'completed') els.jobStatus.classList.add('status-completed');
       else if (mapped === 'failed') els.jobStatus.classList.add('status-failed');
+      else if (mapped === 'needs_review') els.jobStatus.classList.add('status-needs_review');
+      else if (mapped === 'cancelled') els.jobStatus.classList.add('status-cancelled');
       else els.jobStatus.classList.add('status-idle');
     }
     if (els.jobStep) els.jobStep.textContent = payload.step || '-';
     const progress = Math.max(0, Math.min(100, Number(payload.progress ?? 0)));
     if (els.jobProgress) els.jobProgress.textContent = `${progress}%`;
     if (els.jobProgressFill) els.jobProgressFill.style.width = `${progress}%`;
-    state.isCompleted = mapped === 'completed';
+    state.isCompleted = mapped === 'completed' || mapped === 'needs_review';
     state.currentParseMode = String(payload.parse_mode || state.currentParseMode || '').trim().toLowerCase();
 
     if (els.startBtn) {
-      const allowStart = Boolean(state.jobId) && !['processing', 'completed', 'failed'].includes(mapped);
+      const allowStart = Boolean(state.jobId) && !['processing', 'completed', 'needs_review', 'failed'].includes(mapped);
       els.startBtn.disabled = !allowStart;
       els.startBtn.classList.toggle('start-emphasis', mapped === 'idle' && Boolean(state.jobId));
     }
@@ -1921,14 +1953,17 @@
     try {
       const payload = await api(`/jobs/${state.jobId}`);
       setStatus(payload);
-      const status = String(payload.status || '').toLowerCase();
-      if (status === 'done') {
+      const status = normalizeProcessStatus(payload?.status);
+      if (status === 'completed' || status === 'needs_review') {
         stopPolling();
         await loadResultData();
       }
       if (status === 'failed') {
         stopPolling();
         alert(`Job failed: ${payload.message || 'unknown error'}`);
+      }
+      if (status === 'cancelled') {
+        stopPolling();
       }
     } catch (err) {
       stopPolling();
@@ -1966,9 +2001,11 @@
     if (switchToProcessing) syncRoute('/processing', false, id);
 
     setStatus(status);
-    const terminal = new Set(['done', 'failed']);
-    if (terminal.has(String(status.status || '').toLowerCase())) {
-      if (String(status.status || '').toLowerCase() === 'done') await loadResultData();
+    const normalizedStatus = normalizeProcessStatus(status?.status);
+    const terminal = new Set(['completed', 'needs_review', 'failed', 'cancelled']);
+    if (terminal.has(normalizedStatus)) {
+      stopPolling();
+      if (normalizedStatus === 'completed' || normalizedStatus === 'needs_review') await loadResultData();
       return;
     }
     startPolling();
@@ -2023,6 +2060,42 @@
       }
     } catch (err) {
       alert(`Start failed: ${err.message}`);
+    }
+  }
+
+  async function cancelJob(jobId = state.jobId) {
+    const id = String(jobId || '').trim();
+    if (!id) return false;
+
+    try {
+      const payload = await api(`/jobs/${id}/cancel`, { method: 'POST' });
+      const latestStatus = await api(`/jobs/${id}`).catch(() => null);
+      const resolvedStatus = latestStatus?.status || payload?.status || 'cancelled';
+      const resolvedStep = latestStatus?.step || normalizeProcessStepForDisplay(payload?.status) || 'cancelled';
+      const existing = state.uploadedJobs.find((item) => String(item?.jobId || '').trim() === id) || null;
+      const resolvedProgress = Number(
+        latestStatus?.progress ?? existing?.progress ?? 0
+      );
+
+      updateUploadedJobIfExists({
+        jobId: id,
+        status: resolvedStatus,
+        step: resolvedStep,
+        progress: resolvedProgress,
+        parseMode: latestStatus?.parse_mode || existing?.parseMode
+      });
+
+      if (state.jobId === id) {
+        stopPolling();
+        if (latestStatus) setStatus(latestStatus);
+      }
+
+      if (payload?.cancelled) showToast('Job cancelled.', 'success');
+      else showToast(`Job is already ${formatProcessStatusLabel(resolvedStatus)}.`, 'info');
+      return true;
+    } catch (err) {
+      alert(`Cancel failed: ${normalizeApiErrorMessage(err?.message)}`);
+      return false;
     }
   }
 
@@ -2145,6 +2218,18 @@
       const action = String(btn.getAttribute('data-action') || '');
       if (!jobId) return;
       if (action === 'none') return;
+      if (action === 'cancel') {
+        const priorLabel = btn.textContent || 'Cancel';
+        btn.disabled = true;
+        btn.textContent = 'Cancelling…';
+        cancelJob(jobId).then((updated) => {
+          if (!updated && document.body.contains(btn)) {
+            btn.disabled = false;
+            btn.textContent = priorLabel;
+          }
+        });
+        return;
+      }
       if (action === 'start') startJob(jobId);
       else setActiveJob(jobId, true).catch((err) => alert(`Load job failed: ${normalizeApiErrorMessage(err?.message)}`));
     });

@@ -951,6 +951,39 @@ button:active,
   font-size: 11px;
 }
 
+.upload-status-cell {
+  min-width: 150px;
+  display: grid;
+  gap: 6px;
+}
+
+.upload-row-progress {
+  display: grid;
+  gap: 4px;
+}
+
+.upload-row-progress-track {
+  height: 8px;
+  border-radius: 999px;
+  border: 1px solid #dde2f1;
+  background: #eef1f8;
+  overflow: hidden;
+}
+
+.upload-row-progress-bar {
+  height: 100%;
+  width: 0%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #4f79e6 0%, #6b9bff 100%);
+  transition: width 160ms ease-out;
+}
+
+.upload-row-progress-value {
+  color: #64708d;
+  font-size: 10px;
+  font-weight: 700;
+}
+
 .status-pill {
   display: inline-flex;
   align-items: center;
@@ -1012,6 +1045,17 @@ button:active,
   background: #fff6d8;
 }
 
+.status-cancelled {
+  color: #6a7288;
+  background: #eceff5;
+}
+
+.row-action-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
 .row-action-btn {
   height: 27px;
   border-radius: 999px;
@@ -1039,12 +1083,14 @@ button:active,
   color: #4e5a7b;
 }
 
-.row-action-btn.action-processing {
-  border-color: #d8deee;
-  color: #8f98af;
-  background: #f5f7fc;
-  cursor: not-allowed;
-  transform: none;
+.row-action-btn.action-open {
+  border-color: #cad9f7;
+  color: #2e61b2;
+}
+
+.row-action-btn.action-cancel {
+  border-color: #ead0d7;
+  color: #9b4458;
 }
 
 .row-action-btn.action-completed {
