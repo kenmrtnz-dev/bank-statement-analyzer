@@ -1,0 +1,12 @@
+.DS_Store
+.env
+.git
+.pytest_cache
+.venv
+__pycache__
+backend/.venv
+backend/tests
+frontend/node_modules
+frontend/dist
+storage/*
+!storage/.gitkeep

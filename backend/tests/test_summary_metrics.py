@@ -1,4 +1,4 @@
-from app.modules.jobs.service import compute_summary
+from app.jobs.service import compute_summary
 
 
 def test_compute_summary_includes_credit_monthly_average_and_monthly_counts():

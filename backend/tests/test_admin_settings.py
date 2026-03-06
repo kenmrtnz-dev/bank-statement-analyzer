@@ -1,4 +1,6 @@
-from app.modules.jobs.repository import JobTransactionsRepository
+import json
+
+from app.jobs.repository import JobTransactionsRepository
 
 
 def test_ui_settings_available_for_evaluator(client):
@@ -136,3 +138,154 @@ def test_admin_can_list_paginated_job_transactions_with_filters(client, tmp_path
     assert paged_body["pagination"]["per_page"] == 1
     assert paged_body["pagination"]["total_rows"] == 3
     assert len(paged_body["rows"]) == 1
+
+
+def test_admin_can_list_jobs_with_owner_and_status_filters(client, tmp_path):
+    job_one = tmp_path / "jobs" / "job-one"
+    (job_one / "input").mkdir(parents=True, exist_ok=True)
+    (job_one / "input" / "document.pdf").write_bytes(b"%PDF-1.4\n%%EOF")
+    (job_one / "meta.json").write_text(
+        json.dumps(
+            {
+                "original_filename": "statement-a.pdf",
+                "requested_mode": "auto",
+                "created_by": "eval_alpha",
+                "created_role": "evaluator",
+                "created_at": "2026-03-01T08:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (job_one / "status.json").write_text(
+        json.dumps(
+            {
+                "status": "processing",
+                "step": "ocr_parsing",
+                "progress": 44,
+                "parse_mode": "ocr",
+                "updated_at": "2026-03-01T08:20:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    job_two = tmp_path / "jobs" / "job-two"
+    (job_two / "input").mkdir(parents=True, exist_ok=True)
+    (job_two / "input" / "document.pdf").write_bytes(b"%PDF-1.4\n%%EOF")
+    (job_two / "meta.json").write_text(
+        json.dumps(
+            {
+                "original_filename": "statement-b.pdf",
+                "requested_mode": "text",
+                "created_by": "eval_bravo",
+                "created_role": "evaluator",
+                "created_at": "2026-03-02T10:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (job_two / "status.json").write_text(
+        json.dumps(
+            {
+                "status": "done",
+                "step": "completed",
+                "progress": 100,
+                "parse_mode": "text",
+                "updated_at": "2026-03-02T10:40:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    client.post("/auth/logout")
+    login_admin = client.post("/auth/login", data={"username": "admin", "password": "admin123"})
+    assert login_admin.status_code == 200
+
+    res = client.get("/admin/jobs", params={"status": "done", "owner": "eval_bravo"})
+    assert res.status_code == 200
+    payload = res.json()
+    assert payload.get("ok") is True
+    assert payload["pagination"]["total_rows"] == 1
+    assert len(payload["rows"]) == 1
+    row = payload["rows"][0]
+    assert row["job_id"] == "job-two"
+    assert row["owner_username"] == "eval_bravo"
+    assert row["status"] == "done"
+    assert row["progress"] == 100
+    assert row["has_results"] is True
+
+
+def test_admin_can_view_job_results_and_download_exports(client, tmp_path):
+    job_id = "job-result-1"
+    job_root = tmp_path / "jobs" / job_id
+    (job_root / "input").mkdir(parents=True, exist_ok=True)
+    (job_root / "result").mkdir(parents=True, exist_ok=True)
+    (job_root / "input" / "document.pdf").write_bytes(b"%PDF-1.4\n%%EOF")
+    (job_root / "meta.json").write_text(
+        json.dumps(
+            {
+                "original_filename": "result-source.pdf",
+                "requested_mode": "text",
+                "created_by": "eval_result",
+                "created_role": "evaluator",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (job_root / "status.json").write_text(
+        json.dumps(
+            {
+                "status": "done",
+                "step": "completed",
+                "progress": 100,
+                "parse_mode": "text",
+                "updated_at": "2026-03-03T04:30:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (job_root / "result" / "parsed_rows.json").write_text(
+        json.dumps(
+            {
+                "page_001": [
+                    {
+                        "row_id": "001",
+                        "date": "2026-03-03",
+                        "description": "Deposit",
+                        "debit": "",
+                        "credit": "100.00",
+                        "balance": "100.00",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    client.post("/auth/logout")
+    login_admin = client.post("/auth/login", data={"username": "admin", "password": "admin123"})
+    assert login_admin.status_code == 200
+
+    res = client.get(f"/admin/jobs/{job_id}/result")
+    assert res.status_code == 200
+    payload = res.json()
+    assert payload.get("ok") is True
+    assert payload["job_id"] == job_id
+    assert payload["results"]["ready"] is True
+    assert payload["results"]["total_rows"] == 1
+    assert len(payload["results"]["rows"]) == 1
+    assert payload["results"]["rows"][0]["description"] == "Deposit"
+    assert payload["summary"]["total_transactions"] == 1
+    assert payload["summary"]["total_credit"] == 100.0
+    assert payload["downloads"]["pdf"] == f"/admin/jobs/{job_id}/export/pdf"
+    assert payload["downloads"]["excel"] == f"/admin/jobs/{job_id}/export/excel"
+
+    pdf_res = client.get(f"/admin/jobs/{job_id}/export/pdf")
+    assert pdf_res.status_code == 200
+    assert pdf_res.headers.get("content-type", "").startswith("application/pdf")
+
+    excel_res = client.get(f"/admin/jobs/{job_id}/export/excel")
+    assert excel_res.status_code == 200
+    assert "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" in excel_res.headers.get(
+        "content-type", ""
+    )

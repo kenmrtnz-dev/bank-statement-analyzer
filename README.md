@@ -22,42 +22,52 @@ Minimal bank-statement workflow:
 
 ## Architecture (Current)
 ```text
+frontend/
+  src/
+storage/
 backend/
   app/
     main.py
+    admin/
+      router.py
+      service.py
+    auth/
+      router.py
+      service.py
+      deps.py
+    crm/
+      router.py
+      service.py
+    jobs/
+      router.py
+      service.py
+      repository.py
+      schemas.py
+    ocr/
+      pipeline.py
+      image_tools.py
+    parser/
+      pipeline.py
+      extractors/google_vision.py
+      templates/*.json
     api/
       routers/
         ui.py
-    modules/
-      auth/
-        router.py
-        service.py
-        deps.py
-      admin/
-        router.py
-        service.py
-      jobs/
-        router.py
-        service.py
-        repository.py
-        schemas.py
-      ocr/
-        pipeline.py
-        image_tools.py
-      worker/
-        celery_app.py
-        tasks.py
+    worker/
+      celery_app.py
+      tasks.py
     bank_profiles.py
     statement_parser.py
     pdf_text_extract.py
-    ocr_engine.py
     image_cleaner.py
 ```
 
 ## API
-- `POST /jobs` (multipart: `file`, optional `mode=auto|text|ocr`, optional `auto_start=true|false`)
+- `POST /jobs` (multipart: `file`, optional `mode=auto|text|ocr|pdftotext|google_vision`, optional `auto_start=true|false`)
 - `POST /jobs/draft` (upload only, no processing)
 - `POST /jobs/{job_id}/start`
+- `POST /jobs/{job_id}/cancel` (cancel queued/in-flight processing, keep stored job files)
+- `DELETE /jobs/{job_id}` (same as cancel)
 - `GET /jobs/{job_id}`
 - `GET /jobs/{job_id}/parsed`
 - `GET /jobs/{job_id}/parsed/{page}`
@@ -109,12 +119,19 @@ Open:
 - Jobs are queued to Redis and executed by Celery workers.
 - Retry/backoff knobs are configurable via `CELERY_TASK_MAX_RETRIES`, `CELERY_TASK_RETRY_BACKOFF_SECONDS`, and related `CELERY_TASK_*` env vars.
 - OCR backend for scanned documents is OpenAI Vision OCR.
-- Data is stored in `${DATA_DIR:-./data}/jobs/<job_id>/...`.
+- Optional legacy OCR+parser strategy from v1 is available:
+  - `mode=pdftotext` (force pdftotext + v1 parser strategy)
+  - `mode=google_vision` (force Google Vision + v1 parser strategy)
+- Data is stored in `${DATA_DIR:-<repo>/storage}/jobs/<job_id>/...`.
 - Scanned PDFs route to OpenAI Vision OCR:
   - `OPENAI_API_KEY`
   - `OPENAI_OCR_USE_STRUCTURED_ROWS=true` (use OpenAI to return row fields + bounds directly)
   - `MAX_OPENAI_PAGES_PER_DOC=50`
   - `OPENAI_TIMEOUT_SECONDS=60`
+- Google Vision mode configuration:
+  - `GOOGLE_VISION_API_KEY` (or `GOOGLE_APPLICATION_CREDENTIALS`)
+  - `GOOGLE_VISION_BATCH_SIZE=5`
+  - `GOOGLE_VISION_PDF_DPI=120`
 - EspoCRM evaluator file table requires:
   - `ESPOCRM_API_KEY`
   - Optional: `ESPOCRM_BASE_URL` (defaults to `https://staging-crm.discoverycsc.com/api/v1`)

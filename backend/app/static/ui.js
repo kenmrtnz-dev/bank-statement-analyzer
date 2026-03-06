@@ -1,13 +1,22 @@
+// Main browser controller for the evaluator UI. It owns route sync, API calls,
+// polling, and DOM rendering for the uploads and processing workspaces.
 (() => {
   const STORAGE_KEY = 'bsa_uploaded_jobs_v1';
+  const MODE_STORAGE_KEY = 'bsa_process_mode_v1';
+  const PROCESSING_GOOGLE_VISION_PARSER_STORAGE_KEY = 'bsa_processing_google_vision_parser_v1';
+  const SUPPORTED_PROCESS_MODES = new Set(['auto']);
+  const SUPPORTED_GOOGLE_VISION_PARSERS = new Set(['auto', 'sterling_bank_of_asia', 'bdo', 'generic']);
   const EDITABLE_ROW_FIELDS = ['date', 'description', 'debit', 'credit', 'balance'];
   const AMOUNT_ROW_FIELDS = new Set(['debit', 'credit', 'balance']);
   const ROW_SAVE_DEBOUNCE_MS = 220;
 
+  // Cache DOM nodes once so render paths and pollers do not keep querying the document.
   const els = {
     form: document.getElementById('uploadForm'),
     file: document.getElementById('pdfFile'),
     mode: document.getElementById('mode'),
+    processingGoogleVisionParserWrap: document.getElementById('processingGoogleVisionParserWrap'),
+    processingGoogleVisionParser: document.getElementById('processingGoogleVisionParser'),
     startBtn: document.getElementById('startBtn'),
     jobId: document.getElementById('jobId'),
     jobStatus: document.getElementById('jobStatus'),
@@ -75,6 +84,7 @@
     userRoleLabel: document.getElementById('userRoleLabel')
   };
 
+  // Shared in-memory state. Render helpers read from here, and async events write back into it.
   const state = {
     jobId: null,
     pages: [],
@@ -123,7 +133,9 @@
     summaryKnownMonthKeys: new Set(),
     summarySelectionInitialized: false,
     bankCodeFlags: [],
-    pageProfileByPage: {}
+    pageProfileByPage: {},
+    parseDiagnostics: null,
+    googleVisionParserInFlight: false
   };
   const ROUTE_TO_VIEW = {
     '/uploads': 'uploads',
@@ -150,6 +162,120 @@
       localStorage.setItem(STORAGE_KEY, JSON.stringify(state.uploadedJobs.slice(0, 100)));
     } catch {
       // no-op
+    }
+  }
+
+  function normalizeRequestedProcessMode(value) {
+    const mode = String(value || '').trim().toLowerCase();
+    return SUPPORTED_PROCESS_MODES.has(mode) ? mode : 'auto';
+  }
+
+  function getRequestedProcessMode() {
+    if (!els.mode) return 'auto';
+    return normalizeRequestedProcessMode(els.mode.value);
+  }
+
+  function normalizeRequestedGoogleVisionParser(value) {
+    const parser = String(value || '').trim().toLowerCase();
+    return SUPPORTED_GOOGLE_VISION_PARSERS.has(parser) ? parser : 'auto';
+  }
+
+  function getProcessingGoogleVisionParser() {
+    if (!els.processingGoogleVisionParser) return 'auto';
+    return normalizeRequestedGoogleVisionParser(els.processingGoogleVisionParser.value);
+  }
+
+  function applyProcessingGoogleVisionParserValue(nextParser) {
+    if (!els.processingGoogleVisionParser) return;
+    const safe = normalizeRequestedGoogleVisionParser(nextParser);
+    els.processingGoogleVisionParser.value = safe;
+    try {
+      localStorage.setItem(PROCESSING_GOOGLE_VISION_PARSER_STORAGE_KEY, safe);
+    } catch {
+      // no-op
+    }
+  }
+
+  function setGoogleVisionReparseVisibility(diagnostics) {
+    const job = diagnostics && typeof diagnostics === 'object' ? diagnostics.job : null;
+    const source = String(job?.ocr_source || '').trim().toLowerCase();
+    const visible = state.view === 'processing' && Boolean(state.jobId) && source === 'google_vision';
+    if (els.processingGoogleVisionParserWrap) {
+      els.processingGoogleVisionParserWrap.classList.toggle('hidden', !visible);
+    }
+    if (els.processingGoogleVisionParser) {
+      els.processingGoogleVisionParser.disabled = !visible || state.googleVisionParserInFlight;
+    }
+    if (!visible) return;
+    const requestedParser = normalizeRequestedGoogleVisionParser(
+      String(job?.parser_profile_requested || '').trim().toLowerCase()
+    );
+    const usedParser = normalizeRequestedGoogleVisionParser(
+      String(job?.parser_profile_used || '').trim().toLowerCase()
+    );
+    const parserFromJob = requestedParser === 'auto' ? usedParser : requestedParser;
+    applyProcessingGoogleVisionParserValue(parserFromJob);
+  }
+
+  function initProcessingGoogleVisionParser() {
+    if (!els.processingGoogleVisionParser) return;
+    let initialParser = 'auto';
+    try {
+      initialParser = normalizeRequestedGoogleVisionParser(
+        localStorage.getItem(PROCESSING_GOOGLE_VISION_PARSER_STORAGE_KEY)
+      );
+    } catch {
+      initialParser = 'auto';
+    }
+    els.processingGoogleVisionParser.value = initialParser;
+  }
+
+  function initRequestedProcessMode() {
+    if (!els.mode) {
+      try {
+        localStorage.setItem(MODE_STORAGE_KEY, 'auto');
+      } catch {
+        // no-op
+      }
+      return;
+    }
+    let initialMode = 'auto';
+    try {
+      initialMode = normalizeRequestedProcessMode(localStorage.getItem(MODE_STORAGE_KEY));
+    } catch {
+      initialMode = 'auto';
+    }
+    els.mode.value = initialMode;
+    els.mode.addEventListener('change', () => {
+      const nextMode = getRequestedProcessMode();
+      els.mode.value = nextMode;
+      try {
+        localStorage.setItem(MODE_STORAGE_KEY, nextMode);
+      } catch {
+        // no-op
+      }
+    });
+  }
+
+  async function reparseGoogleVisionJob(jobId = state.jobId) {
+    const id = String(jobId || '').trim();
+    if (!id) return;
+    const parser = getProcessingGoogleVisionParser();
+    if (state.googleVisionParserInFlight) return;
+    state.googleVisionParserInFlight = true;
+    setGoogleVisionReparseVisibility(state.parseDiagnostics || null);
+    try {
+      const payload = await api(`/jobs/${id}/reparse-google-vision?parser=${encodeURIComponent(parser)}`, {
+        method: 'POST'
+      });
+      setStatus(payload);
+      await loadResultData();
+      showToast(`Reparsed with ${parser}.`, 'success');
+    } catch (err) {
+      alert(`Reparse failed: ${normalizeApiErrorMessage(err?.message)}`);
+    } finally {
+      state.googleVisionParserInFlight = false;
+      setGoogleVisionReparseVisibility(state.parseDiagnostics || null);
     }
   }
 
@@ -885,6 +1011,7 @@
     const canAccessCrmAttachments = state.authRole === 'evaluator' || state.authRole === 'admin';
     if (state.view === 'uploads' && canAccessCrmAttachments) startCrmStatusPolling();
     else stopCrmStatusPolling();
+    setGoogleVisionReparseVisibility(state.parseDiagnostics || null);
   }
 
   function resolveViewFromPath(pathname) {
@@ -916,6 +1043,7 @@
     }
   }
 
+  // Apply the latest backend status payload to both the processing header and cached upload row state.
   function setStatus(payload) {
     const raw = String(payload.status || 'idle').toLowerCase();
     const mapped = raw === 'done' ? 'completed' : raw === 'done_with_warnings' ? 'needs_review' : raw;
@@ -1931,11 +2059,13 @@
     state.boundsByPage = {};
     state.openaiRawByPage = {};
     state.pageProfileByPage = parsePageProfilesFromDiagnostics(diagnostics);
+    state.parseDiagnostics = diagnostics && typeof diagnostics === 'object' ? diagnostics : null;
     state.disbalanceLoading = false;
     state.disbalanceLoadPromise = null;
     state.totalParsedRows = Number(summary?.total_transactions || 0);
 
     renderSummary(state.totalParsedRows > 0 ? (summary || null) : null);
+    setGoogleVisionReparseVisibility(state.parseDiagnostics);
     renderPages();
     await loadCurrentPageData();
     renderDisbalanceTable();
@@ -1977,6 +2107,7 @@
     pollStatus();
   }
 
+  // Load one job into the processing workspace and start polling if it is still running.
   async function setActiveJob(jobId, switchToProcessing = false) {
     await flushPendingPageSaves();
     const id = String(jobId || '').trim();
@@ -2001,6 +2132,7 @@
     if (switchToProcessing) syncRoute('/processing', false, id);
 
     setStatus(status);
+    setGoogleVisionReparseVisibility(null);
     const normalizedStatus = normalizeProcessStatus(status?.status);
     const terminal = new Set(['completed', 'needs_review', 'failed', 'cancelled']);
     if (terminal.has(normalizedStatus)) {
@@ -2022,7 +2154,8 @@
   async function uploadSelectedFile(file) {
     try {
       setUploadProgress(0, true);
-      const payload = await uploadWithProgress(file, els.mode ? els.mode.value : 'auto', true);
+      const mode = getRequestedProcessMode();
+      const payload = await uploadWithProgress(file, mode, true);
       upsertUploadedJob({
         jobId: payload.job_id,
         fileName: file.name,
@@ -2051,7 +2184,10 @@
     if (!id) return;
     try {
       await setActiveJob(id, true);
-      const payload = await api(`/jobs/${id}/start`, { method: 'POST' });
+      const mode = getRequestedProcessMode();
+      const params = new URLSearchParams();
+      params.set('mode', mode);
+      const payload = await api(`/jobs/${id}/start?${params.toString()}`, { method: 'POST' });
       if (payload.started) {
         updateUploadedJobIfExists({ jobId: id, status: 'processing', step: 'initializing', progress: 1 });
         startPolling();
@@ -2111,6 +2247,21 @@
 
   if (els.form) els.form.addEventListener('submit', createJob);
   if (els.startBtn) els.startBtn.addEventListener('click', () => startJob());
+  if (els.processingGoogleVisionParser) {
+    els.processingGoogleVisionParser.addEventListener('change', () => {
+      const selected = getProcessingGoogleVisionParser();
+      applyProcessingGoogleVisionParserValue(selected);
+      if (els.processingGoogleVisionParserWrap?.classList.contains('hidden')) return;
+      const currentRequested = normalizeRequestedGoogleVisionParser(
+        String(state.parseDiagnostics?.job?.parser_profile_requested || '').trim().toLowerCase()
+      );
+      const currentUsed = normalizeRequestedGoogleVisionParser(
+        String(state.parseDiagnostics?.job?.parser_profile_used || '').trim().toLowerCase()
+      );
+      if (selected === currentRequested || (currentRequested === 'auto' && selected === currentUsed)) return;
+      reparseGoogleVisionJob();
+    });
+  }
   if (els.exportCrm) {
     els.exportCrm.addEventListener('click', (e) => {
       e.preventDefault();
@@ -2300,10 +2451,15 @@
       const attachmentId = String(btn.getAttribute('data-process-attachment-id') || '').trim();
       const leadId = String(btn.getAttribute('data-lead-id') || '').trim();
       if (!attachmentId) return;
+      const mode = getRequestedProcessMode();
       const priorLabel = btn.textContent || 'Begin Process';
       btn.disabled = true;
       btn.textContent = 'Starting…';
-      api(`/crm/attachments/${encodeURIComponent(attachmentId)}/begin-process`, { method: 'POST' })
+      (() => {
+        const params = new URLSearchParams();
+        params.set('mode', mode);
+        return api(`/crm/attachments/${encodeURIComponent(attachmentId)}/begin-process?${params.toString()}`, { method: 'POST' });
+      })()
         .then((payload) => {
           const jobId = String(payload?.job_id || '').trim();
           if (!jobId) throw new Error('missing_job_id');
@@ -2409,6 +2565,9 @@
   }
 
   renderUploadedRows();
+  initProcessingGoogleVisionParser();
+  initRequestedProcessMode();
+  setGoogleVisionReparseVisibility(null);
   setCrmRefreshState();
   setCrmLoadMoreState();
   setCrmPaginationState();
@@ -2438,6 +2597,7 @@
     if (els.uploadProgressWrap) els.uploadProgressWrap.classList.toggle('hidden', !visible);
   }
 
+  // Use XHR instead of fetch so upload progress events can drive the live progress bar.
   function uploadWithProgress(file, mode, autoStart) {
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();

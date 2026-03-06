@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from app.paths import get_data_dir
+
 
 @dataclass(frozen=True)
 class BankProfile:
@@ -36,7 +38,7 @@ def _config_path() -> Path:
     configured = os.getenv("BANK_PROFILES_CONFIG", "").strip()
     if configured:
         return Path(configured)
-    data_dir = Path(os.getenv("DATA_DIR", "./data"))
+    data_dir = get_data_dir()
     return data_dir / "config" / "bank_profiles.json"
 
 

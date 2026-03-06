@@ -1,0 +1,10 @@
+{
+  "bank": "bpi",
+  "columns": {
+    "date": [0, 120],
+    "description": [121, 420],
+    "debit": [421, 520],
+    "credit": [521, 620],
+    "balance": [621, 750]
+  }
+}

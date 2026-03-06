@@ -1,6 +1,7 @@
+"""Application entrypoint for the FastAPI API and bundled static UI."""
+
 from __future__ import annotations
 
-import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -8,16 +9,18 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from app.api.routers.ui import router as ui_router
-from app.modules.admin.router import router as admin_router
-from app.modules.auth.router import router as auth_router
-from app.modules.crm.router import router as crm_router
-from app.modules.jobs.repository import ensure_job_transactions_schema
-from app.modules.jobs.router import router as jobs_router
+from app.admin.router import router as admin_router
+from app.auth.router import router as auth_router
+from app.crm.router import router as crm_router
+from app.jobs.repository import ensure_job_transactions_schema
+from app.jobs.router import router as jobs_router
+from app.paths import get_data_dir
 
-DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
+DATA_DIR = get_data_dir()
 
 
 def _bootstrap_dirs():
+    """Create the on-disk folders and DB tables the app expects at runtime."""
     root = Path(DATA_DIR)
     (root / "jobs").mkdir(parents=True, exist_ok=True)
     (root / "exports").mkdir(parents=True, exist_ok=True)
@@ -26,13 +29,16 @@ def _bootstrap_dirs():
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    """Run startup bootstrapping once before the app begins serving requests."""
     _bootstrap_dirs()
     yield
 
 
 def create_app() -> FastAPI:
+    """Assemble the FastAPI app, static assets, and feature routers."""
     app = FastAPI(title="Bank Statement Analyzer API", lifespan=lifespan)
 
+    # The frontend is served from the same process so the app can run as a single deployable unit.
     static_dir = Path(__file__).resolve().parent / "static"
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 

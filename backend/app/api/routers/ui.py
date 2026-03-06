@@ -3,18 +3,18 @@ from pathlib import Path
 from fastapi import APIRouter, Request
 from fastapi.responses import FileResponse, RedirectResponse
 
-from app.modules.auth.service import SESSION_COOKIE, ensure_admin_exists, get_user_by_session
+from app.auth.service import SESSION_COOKIE, ensure_admin_exists, get_user_by_session
 
 router = APIRouter()
 
 
-def _render_app_or_redirect(request: Request):
+def _render_app_or_redirect(request: Request, *, allow_admin: bool = False):
     ensure_admin_exists()
     token = request.cookies.get(SESSION_COOKIE)
     user = get_user_by_session(token)
     if not user:
         return RedirectResponse(url="/login", status_code=303)
-    if str(user.get("role") or "").lower() == "admin":
+    if str(user.get("role") or "").lower() == "admin" and not allow_admin:
         return RedirectResponse(url="/admin", status_code=303)
     static_index = Path(__file__).resolve().parents[2] / "static" / "index.html"
     response = FileResponse(static_index)
@@ -34,7 +34,7 @@ def uploads_page(request: Request):
 
 @router.get("/processing")
 def processing_page(request: Request):
-    return _render_app_or_redirect(request)
+    return _render_app_or_redirect(request, allow_admin=True)
 
 
 @router.get("/evaluator")

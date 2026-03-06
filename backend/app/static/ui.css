@@ -364,9 +364,39 @@ button:active,
   box-shadow: 0 10px 22px rgba(27, 36, 58, 0.1);
 }
 
+.mode-picker-card {
+  padding-top: 12px;
+  padding-bottom: 12px;
+}
+
 .upload-row {
   display: grid;
   gap: 10px;
+}
+
+.mode-row {
+  margin-top: 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.mode-label {
+  font-size: 12px;
+  font-weight: 700;
+  color: #5c637b;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.mode-select {
+  height: 34px;
+  border: 1px solid #d7dbe7;
+  border-radius: 10px;
+  background: #fff;
+  color: #1f2537;
+  padding: 0 10px;
+  font-size: 13px;
 }
 
 .upload-surface {

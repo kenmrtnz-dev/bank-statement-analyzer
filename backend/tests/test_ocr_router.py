@@ -30,7 +30,7 @@ def test_resolve_document_parse_mode_prefers_text_when_avg_chars_high(monkeypatc
     assert router.resolve_document_parse_mode(str(pdf), "auto") == "text"
 
 
-def test_resolve_document_parse_mode_uses_ocr_when_text_is_low(monkeypatch, tmp_path: Path):
+def test_resolve_document_parse_mode_uses_google_vision_when_text_is_low(monkeypatch, tmp_path: Path):
     pdf = tmp_path / "scan.pdf"
     pdf.write_bytes(b"%PDF-1.4\n%%EOF")
 
@@ -38,7 +38,25 @@ def test_resolve_document_parse_mode_uses_ocr_when_text_is_low(monkeypatch, tmp_
         return _FakeReader(_path, [_FakePage("tiny"), _FakePage("")])
 
     monkeypatch.setattr(router, "PdfReader", _reader)
-    assert router.resolve_document_parse_mode(str(pdf), "auto") == "ocr"
+    assert router.resolve_document_parse_mode(str(pdf), "auto") == "google_vision"
+
+
+def test_resolve_document_parse_mode_maps_forced_ocr_to_google_vision(tmp_path: Path):
+    pdf = tmp_path / "scan.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n%%EOF")
+    assert router.resolve_document_parse_mode(str(pdf), "ocr") == "google_vision"
+
+
+def test_resolve_document_parse_mode_respects_forced_google_vision(tmp_path: Path):
+    pdf = tmp_path / "scan.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n%%EOF")
+    assert router.resolve_document_parse_mode(str(pdf), "google_vision") == "google_vision"
+
+
+def test_resolve_document_parse_mode_respects_forced_pdftotext(tmp_path: Path):
+    pdf = tmp_path / "digital.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n%%EOF")
+    assert router.resolve_document_parse_mode(str(pdf), "pdftotext") == "pdftotext"
 
 
 def test_openai_selected_even_when_page_count_exceeds_previous_limit(monkeypatch):

@@ -2,7 +2,7 @@ from fastapi.responses import Response
 
 import importlib
 
-crm_router_module = importlib.import_module("app.modules.crm.router")
+crm_router_module = importlib.import_module("app.crm.router")
 
 
 def test_crm_attachments_list_endpoint(client, monkeypatch):
@@ -62,26 +62,39 @@ def test_crm_attachment_download_endpoint(client, monkeypatch):
 
 
 def test_crm_attachment_begin_process_endpoint(client, monkeypatch):
-    monkeypatch.setattr(
-        crm_router_module,
-        "create_job_from_attachment",
-        lambda attachment_id, requested_mode="auto": {
+    captured = {}
+
+    def _fake_create_job_from_attachment(attachment_id, requested_mode="auto", requested_parser="auto"):
+        captured["attachment_id"] = attachment_id
+        captured["requested_mode"] = requested_mode
+        captured["requested_parser"] = requested_parser
+        return {
             "job_id": "job-123",
             "parse_mode": requested_mode,
             "started": True,
             "attachment_id": attachment_id,
             "source_filename": "statement.pdf",
             "lead_id": "lead-42",
-        },
+        }
+
+    monkeypatch.setattr(
+        crm_router_module,
+        "create_job_from_attachment",
+        _fake_create_job_from_attachment,
     )
 
-    res = client.post("/crm/attachments/att-2/begin-process")
+    res = client.post("/crm/attachments/att-2/begin-process?mode=google_vision&parser=bdo")
     assert res.status_code == 200
     body = res.json()
     assert body["job_id"] == "job-123"
     assert body["attachment_id"] == "att-2"
     assert body["lead_id"] == "lead-42"
     assert body["started"] is True
+    assert captured == {
+        "attachment_id": "att-2",
+        "requested_mode": "google_vision",
+        "requested_parser": "bdo",
+    }
 
 
 def test_crm_export_excel_to_lead_endpoint(client, monkeypatch):

@@ -2,7 +2,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from app.modules.jobs import service as jobs_service
+from app.jobs import service as jobs_service
 
 
 def test_health(client):
@@ -20,6 +20,16 @@ def test_create_job_rejects_non_pdf(client):
     )
     assert res.status_code == 400
     assert res.json().get("detail") == "PDF only"
+
+
+def test_create_job_rejects_unsupported_mode(client):
+    res = client.post(
+        "/jobs",
+        files={"file": ("statement.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
+        data={"mode": "google vision", "auto_start": "false"},
+    )
+    assert res.status_code == 400
+    assert "unsupported_requested_mode" in str(res.json().get("detail") or "")
 
 
 
@@ -168,3 +178,396 @@ def test_job_flow_with_mocked_pipeline(client, monkeypatch):
     assert "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" in export_excel.headers.get(
         "content-type", ""
     )
+
+
+def test_job_flow_with_google_vision_legacy_parser(client, monkeypatch):
+    def _run_inline_enqueue(job_id: str, parse_mode: str):
+        jobs_service.process_job(job_id=job_id, parse_mode=parse_mode, task_id="inline-task-google")
+        return "inline-task-google"
+
+    monkeypatch.setattr(jobs_service, "_enqueue_job", _run_inline_enqueue)
+    monkeypatch.setattr(jobs_service, "resolve_parse_mode", lambda *_args, **_kwargs: "google_vision")
+    monkeypatch.setattr(
+        jobs_service,
+        "run_legacy_parser_document",
+        lambda *_args, **_kwargs: {
+            "bank": "bdo",
+            "ocr_engine_requested": "google_vision",
+            "ocr_source": "google_vision",
+            "ocr_raw": {"provider": "google_vision", "mode": "api_key", "pages": []},
+            "transactions": [
+                {
+                    "row_number": 1,
+                    "date": "2026-03-01",
+                    "description": "Legacy Deposit",
+                    "debit": None,
+                    "credit": "1500.25",
+                    "balance": "1500.25",
+                }
+            ],
+            "summary": {"total_rows": 1},
+            "validation": {"is_valid": True, "mismatch_rows": []},
+        },
+    )
+
+    create = client.post(
+        "/jobs",
+        files={"file": ("statement.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
+        data={"mode": "google_vision", "auto_start": "false"},
+    )
+    assert create.status_code == 200
+    job_id = create.json()["job_id"]
+
+    started = client.post(f"/jobs/{job_id}/start?mode=google_vision")
+    assert started.status_code == 200
+    assert started.json()["parse_mode"] == "google_vision"
+    assert started.json()["started"] is True
+
+    status = client.get(f"/jobs/{job_id}")
+    assert status.status_code == 200
+    status_payload = status.json()
+    assert status_payload["status"] == "done"
+    assert status_payload["parse_mode"] == "google_vision"
+
+    parsed = client.get(f"/jobs/{job_id}/parsed")
+    assert parsed.status_code == 200
+    assert parsed.json()["page_001"][0]["description"] == "Legacy Deposit"
+    assert parsed.json()["page_001"][0]["row_number"] == "1"
+
+    diagnostics = client.get(f"/jobs/{job_id}/parse-diagnostics")
+    assert diagnostics.status_code == 200
+    payload = diagnostics.json()
+    assert payload["job"]["parser_strategy"] == "v1"
+    assert payload["job"]["ocr_source"] == "google_vision"
+    assert payload["pages"]["page_001"]["rows_parsed"] == 1
+
+
+def test_google_vision_mode_rejects_non_google_ocr_source(client, monkeypatch):
+    def _run_inline_enqueue(job_id: str, parse_mode: str):
+        jobs_service.process_job(job_id=job_id, parse_mode=parse_mode, task_id="inline-task-google-mismatch")
+        return "inline-task-google-mismatch"
+
+    monkeypatch.setattr(jobs_service, "_enqueue_job", _run_inline_enqueue)
+    monkeypatch.setattr(jobs_service, "resolve_parse_mode", lambda *_args, **_kwargs: "google_vision")
+    monkeypatch.setattr(
+        jobs_service,
+        "run_legacy_parser_document",
+        lambda *_args, **_kwargs: {
+            "bank": "bdo",
+            "ocr_engine_requested": "google_vision",
+            "ocr_source": "openai_vision",
+            "transactions": [],
+            "summary": {"total_rows": 0},
+            "validation": {"is_valid": True, "mismatch_rows": []},
+        },
+    )
+
+    create = client.post(
+        "/jobs",
+        files={"file": ("statement.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
+        data={"mode": "google_vision", "auto_start": "false"},
+    )
+    assert create.status_code == 200
+    job_id = create.json()["job_id"]
+
+    started = client.post(f"/jobs/{job_id}/start?mode=google_vision")
+    assert started.status_code == 200
+    assert started.json()["parse_mode"] == "google_vision"
+    assert started.json()["started"] is False
+
+    status = client.get(f"/jobs/{job_id}")
+    assert status.status_code == 200
+    payload = status.json()
+    assert payload["status"] == "failed"
+    assert payload["parse_mode"] == "google_vision"
+    assert "google_vision_mode_requires_google_vision_source" in str(payload.get("message") or "")
+
+
+def test_google_vision_uses_requested_parser_profile(client, monkeypatch):
+    captured: dict[str, str] = {}
+
+    def _run_inline_enqueue(job_id: str, parse_mode: str):
+        jobs_service.process_job(job_id=job_id, parse_mode=parse_mode, task_id="inline-task-google-parser")
+        return "inline-task-google-parser"
+
+    def _fake_legacy_parser(*_args, **kwargs):
+        captured["parser_profile"] = str(kwargs.get("parser_profile") or "")
+        return {
+            "bank": "bdo",
+            "ocr_engine_requested": "google_vision",
+            "ocr_source": "google_vision",
+            "parser_profile_requested": kwargs.get("parser_profile", "auto"),
+            "parser_profile_used": kwargs.get("parser_profile", "auto"),
+            "parser_strategy": "google_vision_raw_parser",
+            "transactions": [],
+            "summary": {"total_rows": 0},
+            "validation": {"is_valid": True, "mismatch_rows": []},
+        }
+
+    monkeypatch.setattr(jobs_service, "_enqueue_job", _run_inline_enqueue)
+    monkeypatch.setattr(jobs_service, "resolve_parse_mode", lambda *_args, **_kwargs: "google_vision")
+    monkeypatch.setattr(jobs_service, "run_legacy_parser_document", _fake_legacy_parser)
+
+    create = client.post(
+        "/jobs",
+        files={"file": ("statement.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
+        data={"mode": "google_vision", "parser": "sterling_bank_of_asia", "auto_start": "false"},
+    )
+    assert create.status_code == 200
+    job_id = create.json()["job_id"]
+
+    started = client.post(f"/jobs/{job_id}/start?mode=google_vision&parser=sterling_bank_of_asia")
+    assert started.status_code == 200
+    assert started.json()["started"] is True
+    assert captured.get("parser_profile") == "sterling_bank_of_asia"
+
+    diagnostics = client.get(f"/jobs/{job_id}/parse-diagnostics")
+    assert diagnostics.status_code == 200
+    payload = diagnostics.json()
+    assert payload["job"]["parser_profile_requested"] == "sterling_bank_of_asia"
+    assert payload["job"]["parser_profile_used"] == "sterling_bank_of_asia"
+
+
+def test_google_vision_requested_mode_never_falls_back_to_ocr(client, monkeypatch):
+    def _run_inline_enqueue(job_id: str, parse_mode: str):
+        jobs_service.process_job(job_id=job_id, parse_mode=parse_mode, task_id="inline-task-google-strict")
+        return "inline-task-google-strict"
+
+    monkeypatch.setattr(jobs_service, "_enqueue_job", _run_inline_enqueue)
+    monkeypatch.setattr(jobs_service, "resolve_parse_mode", lambda *_args, **_kwargs: "ocr")
+
+    create = client.post(
+        "/jobs",
+        files={"file": ("statement.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
+        data={"mode": "google_vision", "auto_start": "false"},
+    )
+    assert create.status_code == 200
+    job_id = create.json()["job_id"]
+
+    started = client.post(f"/jobs/{job_id}/start")
+    assert started.status_code == 200
+    assert started.json()["parse_mode"] == "ocr"
+    assert started.json()["started"] is False
+
+    status = client.get(f"/jobs/{job_id}")
+    assert status.status_code == 200
+    payload = status.json()
+    assert payload["status"] == "failed"
+    assert payload["parse_mode"] == "ocr"
+    assert "google_vision_requested_but_parse_mode_is:ocr" in str(payload.get("message") or "")
+
+
+def test_reparse_google_vision_endpoint_uses_processing_parser_choice(client, monkeypatch):
+    monkeypatch.setattr(jobs_service, "resolve_parse_mode", lambda *_args, **_kwargs: "google_vision")
+    monkeypatch.setattr(
+        jobs_service,
+        "parse_google_vision_raw_payload",
+        lambda raw_payload, parser_profile="auto", detected_bank="generic": (
+            [
+                {
+                    "row_number": 1,
+                    "page_number": 1,
+                    "date": "2026-03-01",
+                    "description": f"parsed-with-{parser_profile}",
+                    "debit": None,
+                    "credit": "100.00",
+                    "balance": "100.00",
+                }
+            ],
+            parser_profile,
+        ),
+    )
+
+    create = client.post(
+        "/jobs",
+        files={"file": ("statement.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
+        data={"mode": "google_vision", "auto_start": "false"},
+    )
+    assert create.status_code == 200
+    job_id = create.json()["job_id"]
+
+    repo = jobs_service.JobsRepository(jobs_service.DATA_DIR)
+    repo.write_json(
+        repo.path(job_id, "ocr", "page_001.google_vision_raw.json"),
+        {"provider": "google_vision", "page_count": 1, "pages": []},
+    )
+    repo.write_json(
+        repo.path(job_id, "result", "parse_diagnostics.json"),
+        {"job": {"bank": "bdo", "ocr_source": "google_vision"}, "pages": {}},
+    )
+
+    res = client.post(f"/jobs/{job_id}/reparse-google-vision?parser=sterling_bank_of_asia")
+    assert res.status_code == 200
+    payload = res.json()
+    assert payload["status"] == "done"
+    assert payload["parse_mode"] == "google_vision"
+    assert payload["parser_profile_used"] == "sterling_bank_of_asia"
+
+    parsed = client.get(f"/jobs/{job_id}/parsed")
+    assert parsed.status_code == 200
+    assert parsed.json()["page_001"][0]["description"] == "parsed-with-sterling_bank_of_asia"
+
+
+def test_reparse_google_vision_keeps_rows_split_per_page(client, monkeypatch):
+    monkeypatch.setattr(jobs_service, "resolve_parse_mode", lambda *_args, **_kwargs: "google_vision")
+    monkeypatch.setattr(
+        jobs_service,
+        "parse_google_vision_raw_payload",
+        lambda raw_payload, parser_profile="auto", detected_bank="generic": (
+            [
+                {
+                    "row_number": 1,
+                    "page_number": 1,
+                    "date": "2026-03-01",
+                    "description": "page-1-row",
+                    "debit": None,
+                    "credit": "100.00",
+                    "balance": "100.00",
+                },
+                {
+                    "row_number": 2,
+                    "page_number": 2,
+                    "date": "2026-03-02",
+                    "description": "page-2-row",
+                    "debit": "20.00",
+                    "credit": None,
+                    "balance": "80.00",
+                },
+            ],
+            parser_profile,
+        ),
+    )
+
+    create = client.post(
+        "/jobs",
+        files={"file": ("statement.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
+        data={"mode": "google_vision", "auto_start": "false"},
+    )
+    assert create.status_code == 200
+    job_id = create.json()["job_id"]
+
+    repo = jobs_service.JobsRepository(jobs_service.DATA_DIR)
+    repo.write_json(
+        repo.path(job_id, "ocr", "page_001.google_vision_raw.json"),
+        {"provider": "google_vision", "page_count": 2, "pages": []},
+    )
+    repo.write_json(
+        repo.path(job_id, "result", "parse_diagnostics.json"),
+        {"job": {"bank": "generic", "ocr_source": "google_vision"}, "pages": {}},
+    )
+
+    res = client.post(f"/jobs/{job_id}/reparse-google-vision?parser=generic")
+    assert res.status_code == 200
+    assert res.json()["pages"] == 2
+
+    parsed = client.get(f"/jobs/{job_id}/parsed")
+    assert parsed.status_code == 200
+    payload = parsed.json()
+    assert payload["page_001"][0]["description"] == "page-1-row"
+    assert payload["page_002"][0]["description"] == "page-2-row"
+
+    cleaned = client.get(f"/jobs/{job_id}/cleaned")
+    assert cleaned.status_code == 200
+    assert cleaned.json()["pages"] == ["page_001.png", "page_002.png"]
+
+
+def test_cancel_job_endpoint_marks_draft_cancelled(client, monkeypatch):
+    monkeypatch.setattr(jobs_service, "resolve_parse_mode", lambda *_args, **_kwargs: "text")
+
+    create = client.post(
+        "/jobs",
+        files={"file": ("statement.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
+        data={"mode": "auto", "auto_start": "false"},
+    )
+    assert create.status_code == 200
+
+    job_id = create.json()["job_id"]
+
+    cancel = client.post(f"/jobs/{job_id}/cancel")
+    assert cancel.status_code == 200
+    assert cancel.json() == {
+        "job_id": job_id,
+        "cancelled": True,
+        "status": "cancelled",
+        "revoked_task_ids": [],
+    }
+
+    status = client.get(f"/jobs/{job_id}")
+    assert status.status_code == 200
+    payload = status.json()
+    assert payload["status"] == "cancelled"
+    assert payload["step"] == "cancelled"
+    assert payload["message"] == "job_cancelled"
+
+
+def test_delete_job_endpoint_revokes_active_tasks(client, monkeypatch):
+    monkeypatch.setattr(jobs_service, "resolve_parse_mode", lambda *_args, **_kwargs: "ocr")
+
+    create = client.post(
+        "/jobs",
+        files={"file": ("statement.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
+        data={"mode": "ocr", "auto_start": "false"},
+    )
+    assert create.status_code == 200
+
+    job_id = create.json()["job_id"]
+    repo = jobs_service.JobsRepository(jobs_service.DATA_DIR)
+    repo.write_status(
+        job_id,
+        {
+            "status": "processing",
+            "step": "ocr_parsing",
+            "progress": 42,
+            "parse_mode": "ocr",
+            "task_id": "root-task",
+            "active_task_ids": ["page-task-1", "page-task-2"],
+            "pages_total": 3,
+            "pages_done": 1,
+            "pages_failed": 0,
+            "pages_inflight": 2,
+        },
+    )
+    repo.write_json(
+        repo.path(job_id, "result", "page_status.json"),
+        {
+            "page_001": {"status": "done", "task_id": "done-task", "page_index": 1, "page_count": 3},
+            "page_002": {"status": "processing", "task_id": "page-task-1", "page_index": 2, "page_count": 3},
+            "page_003": {"status": "queued", "task_id": "page-task-2", "page_index": 3, "page_count": 3},
+        },
+    )
+
+    revoked: list[str] = []
+
+    def _fake_revoke(task_id: str) -> None:
+        revoked.append(task_id)
+
+    monkeypatch.setattr(jobs_service, "_revoke_celery_task", _fake_revoke)
+
+    cancel = client.delete(f"/jobs/{job_id}")
+    assert cancel.status_code == 200
+    assert cancel.json() == {
+        "job_id": job_id,
+        "cancelled": True,
+        "status": "cancelled",
+        "revoked_task_ids": ["root-task", "page-task-1", "page-task-2"],
+    }
+    assert revoked == ["root-task", "page-task-1", "page-task-2"]
+
+    status = client.get(f"/jobs/{job_id}")
+    assert status.status_code == 200
+    payload = status.json()
+    assert payload["status"] == "cancelled"
+    assert payload["step"] == "cancelled"
+    assert payload["pages_total"] == 3
+    assert payload["pages_done"] == 1
+    assert payload["pages_failed"] == 0
+    assert payload["pages_cancelled"] == 2
+    assert payload["pages_inflight"] == 0
+    assert payload["active_task_ids"] == []
+
+    pages_status = client.get(f"/jobs/{job_id}/pages/status")
+    assert pages_status.status_code == 200
+    pages_payload = pages_status.json()
+    assert pages_payload["page_001"]["status"] == "done"
+    assert pages_payload["page_002"]["status"] == "cancelled"
+    assert pages_payload["page_003"]["status"] == "cancelled"

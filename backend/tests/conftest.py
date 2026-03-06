@@ -2,8 +2,8 @@ from pathlib import Path
 
 import pytest
 from app import main
-from app.modules.auth import service as auth_service
-from app.modules.jobs import service as jobs_service
+from app.auth import service as auth_service
+from app.jobs import service as jobs_service
 from fastapi.testclient import TestClient
 
 

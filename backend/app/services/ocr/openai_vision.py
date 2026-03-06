@@ -16,6 +16,8 @@ import httpx
 from PIL import Image
 from redis import Redis
 
+from app.paths import get_data_dir
+
 SYSTEM_PROMPT = (
     "You are a high-accuracy OCR engine. Extract text exactly as written. "
     "Do not summarize. Preserve numbers, dates, spacing, and formatting."
@@ -146,7 +148,7 @@ class OpenAIVisionOCR:
 
         model = str(os.getenv("OPENAI_OCR_MODEL", "gpt-4o-mini")).strip() or "gpt-4o-mini"
         timeout_seconds = _env_int("OPENAI_TIMEOUT_SECONDS", 60)
-        data_dir = Path(os.getenv("DATA_DIR", "./data"))
+        data_dir = get_data_dir()
         cache_dir = Path(os.getenv("OPENAI_OCR_CACHE_DIR", str(data_dir / "ocr_cache")))
         base_url = str(os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")).strip()
         if not base_url:

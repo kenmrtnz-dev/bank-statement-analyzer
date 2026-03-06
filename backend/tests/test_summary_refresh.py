@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from app.modules.jobs.service import get_summary
+from app.jobs.service import get_summary
 
 
 def test_get_summary_recomputes_when_cached_summary_is_missing_new_fields(monkeypatch, tmp_path: Path):
@@ -42,7 +42,7 @@ def test_get_summary_recomputes_when_cached_summary_is_missing_new_fields(monkey
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{(tmp_path / 'ocr.db').resolve()}")
     monkeypatch.setenv("DB_AUTO_CREATE_SCHEMA", "true")
-    from app.modules.jobs import service as jobs_service
+    from app.jobs import service as jobs_service
 
     monkeypatch.setattr(jobs_service, "DATA_DIR", str(tmp_path))
 

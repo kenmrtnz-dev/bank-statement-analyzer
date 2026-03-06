@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Bank Statement Analyzer</title>
-    <link rel="stylesheet" href="/static/ui.css?v=20260304a" />
+    <link rel="stylesheet" href="/static/ui.css?v=20260306i" />
   </head>
   <body>
     <main class="app-shell">
@@ -61,7 +61,6 @@
                 </div>
               </div>
             </form>
-
             <div class="row-between files-head">
               <h3>Uploaded Files</h3>
               <div class="actions">
@@ -227,6 +226,14 @@
               <div class="row-between">
                 <h2>Parsed Rows</h2>
                 <div class="parsed-header-controls">
+                  <div id="processingGoogleVisionParserWrap" class="hidden">
+                    <select id="processingGoogleVisionParser" class="mode-select" aria-label="Auto-selected parser">
+                      <option value="auto">Auto (Detected)</option>
+                      <option value="sterling_bank_of_asia">Sterling Bank of Asia</option>
+                      <option value="bdo">BDO</option>
+                      <option value="generic">Generic Parser</option>
+                    </select>
+                  </div>
                   <button id="parsedDebugToggleBtn" type="button" class="parsed-header-action ghost">Debug JSON</button>
                   <button id="reverseRowsBtn" type="button" class="parsed-header-action" disabled>Reverse Order</button>
                   <span id="rowCount">0 rows</span>
@@ -265,6 +272,6 @@
       </section>
     </main>
 
-    <script src="/static/ui.js?v=20260304a"></script>
+    <script src="/static/ui.js?v=20260306i"></script>
   </body>
 </html>

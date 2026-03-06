@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Admin Console · Bank Statement Analyzer</title>
-    <link rel="stylesheet" href="/static/admin.css?v=20260302d" />
+    <link rel="stylesheet" href="/static/admin.css?v=20260305a" />
   </head>
   <body>
     <main class="admin-shell">
@@ -23,6 +23,13 @@
             <span class="nav-copy">
               <strong>Accounts</strong>
               <small>Create evaluator access</small>
+            </span>
+          </button>
+          <button class="admin-nav-btn" type="button" data-tab-target="jobs">
+            <span class="nav-icon" aria-hidden="true">JB</span>
+            <span class="nav-copy">
+              <strong>Jobs</strong>
+              <small>Track all user runs</small>
             </span>
           </button>
           <button class="admin-nav-btn" type="button" data-tab-target="transactions">
@@ -135,6 +142,138 @@
                 </div>
               </article>
             </div>
+          </div>
+        </section>
+
+        <section class="admin-panel" data-tab-panel="jobs">
+          <div class="panel-stack">
+            <article class="admin-card">
+              <div class="card-head">
+                <div class="card-title-group">
+                  <h2>All Jobs</h2>
+                  <p>Inspect job progress across all users and open parsed results from one place.</p>
+                </div>
+                <span id="jobsResultCount" class="card-tag">Loading…</span>
+              </div>
+
+              <form id="jobsFilterForm" class="stack">
+                <div class="transactions-filters jobs-filters">
+                  <label>
+                    Job ID
+                    <input id="jobsFilterJobId" type="text" placeholder="Filter by job id" />
+                  </label>
+                  <label>
+                    Owner
+                    <input id="jobsFilterOwner" type="text" placeholder="e.g. eval_test" />
+                  </label>
+                  <label>
+                    Status
+                    <select id="jobsFilterStatus">
+                      <option value="">All statuses</option>
+                      <option value="queued">Queued</option>
+                      <option value="processing">Processing</option>
+                      <option value="done">Done</option>
+                      <option value="done_with_warnings">Done with warnings</option>
+                      <option value="failed">Failed</option>
+                      <option value="cancelled">Cancelled</option>
+                    </select>
+                  </label>
+                  <label>
+                    Search
+                    <input id="jobsFilterQuery" type="text" placeholder="job id, file, user, mode" />
+                  </label>
+                </div>
+                <div class="transactions-filter-actions">
+                  <button type="submit">Apply Filters</button>
+                  <button id="resetJobsFiltersBtn" type="button" class="ghost-button">Reset</button>
+                </div>
+              </form>
+
+              <div class="transactions-admin-table-wrap jobs-admin-table-wrap">
+                <table class="transactions-admin-table jobs-admin-table">
+                  <thead>
+                    <tr>
+                      <th>Job ID</th>
+                      <th>Owner</th>
+                      <th>Source File</th>
+                      <th>Status</th>
+                      <th>Progress</th>
+                      <th>Mode</th>
+                      <th>Updated</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody id="jobsRowsBody">
+                    <tr>
+                      <td colspan="8">Loading jobs…</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+
+              <div class="transactions-pagination">
+                <span id="jobsPageInfo">Page 1 of 1</span>
+                <div class="transactions-pagination-actions">
+                  <button id="jobsPrevBtn" type="button" class="ghost-button">Previous</button>
+                  <button id="jobsNextBtn" type="button" class="ghost-button">Next</button>
+                </div>
+              </div>
+              <p id="jobsFeedback" class="inline-feedback hidden"></p>
+            </article>
+
+            <article class="admin-card jobs-result-card">
+              <div class="card-head">
+                <div class="card-title-group">
+                  <h2>Job Results</h2>
+                  <p id="jobsResultMeta">Select a job above to view parsed results.</p>
+                </div>
+                <span id="jobsResultReadyTag" class="card-tag">Not selected</span>
+              </div>
+              <div id="jobsResultSummaryGrid" class="detail-grid jobs-result-summary-grid">
+                <div class="detail-item">
+                  <span>Total Transactions</span>
+                  <strong id="jobsResultSummaryTotalTx">-</strong>
+                </div>
+                <div class="detail-item">
+                  <span>Total Debit</span>
+                  <strong id="jobsResultSummaryTotalDebit">-</strong>
+                </div>
+                <div class="detail-item">
+                  <span>Total Credit</span>
+                  <strong id="jobsResultSummaryTotalCredit">-</strong>
+                </div>
+                <div class="detail-item">
+                  <span>Ending Balance</span>
+                  <strong id="jobsResultSummaryEndingBalance">-</strong>
+                </div>
+              </div>
+
+              <div class="transactions-admin-table-wrap jobs-result-table-wrap">
+                <table class="transactions-admin-table jobs-result-table">
+                  <thead>
+                    <tr>
+                      <th>Page</th>
+                      <th>Row</th>
+                      <th>Date</th>
+                      <th>Description</th>
+                      <th>Debit</th>
+                      <th>Credit</th>
+                      <th>Balance</th>
+                    </tr>
+                  </thead>
+                  <tbody id="jobsResultRowsBody">
+                    <tr>
+                      <td colspan="7">Select a job to view results.</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+              <div class="jobs-result-actions">
+                <a id="jobsResultPdfLink" class="ghost-link hidden" href="#" download>Download PDF</a>
+                <a id="jobsResultExcelLink" class="ghost-link hidden" href="#" download>Download Excel</a>
+              </div>
+              <p id="jobsResultRowsMeta" class="jobs-result-rows-meta">No job selected.</p>
+            </article>
           </div>
         </section>
 
@@ -309,6 +448,6 @@
         </div>
       </div>
     </div>
-    <script src="/static/admin.js?v=20260302d"></script>
+    <script src="/static/admin.js?v=20260305d"></script>
   </body>
 </html>
