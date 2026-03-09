@@ -5,6 +5,7 @@ import math
 import os
 import datetime as dt
 import shutil
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Callable, Dict, List
 
@@ -20,7 +21,12 @@ from app.services.ocr.router import (
     resolve_document_parse_mode,
     scanned_render_dpi,
 )
-from app.statement_parser import is_transaction_row, normalize_date, parse_page_with_profile_fallback
+from app.statement_parser import (
+    is_non_transaction_balance_line,
+    is_transaction_row,
+    normalize_date,
+    parse_page_with_profile_fallback,
+)
 
 OCR_BACKEND = "openai_vision"
 PREVIEW_MAX_PIXELS = int(os.getenv("PREVIEW_MAX_PIXELS", "6000000"))
@@ -195,6 +201,11 @@ def _run_text_pipeline(input_pdf: Path, ocr_dir: Path, report: ProgressReporter)
     bounds_output: Dict[str, List[Dict]] = {}
     diagnostics: Dict[str, Dict] = {"job": {"source_type": "text"}, "pages": {}}
     header_hints_by_profile: Dict[str, Dict] = {}
+    last_header_hint: Dict | None = None
+    last_date_hint: str = ""
+    last_balance_hint = None
+    previous_page_rows: List[Dict] = []
+    seen_row_signatures: set[tuple] = set()
 
     total = len(layout_pages)
     for idx, layout in enumerate(layout_pages, start=1):
@@ -210,17 +221,37 @@ def _run_text_pipeline(input_pdf: Path, ocr_dir: Path, report: ProgressReporter)
             page_w,
             page_h,
             profile,
-            header_hint=header_hints_by_profile.get(profile.name),
+            header_hint=header_hints_by_profile.get(profile.name) or last_header_hint,
+            last_date_hint=last_date_hint or None,
         )
         filtered_rows, filtered_bounds = _filter_rows_and_bounds(page_rows, page_bounds, profile)
+        filtered_rows, filtered_bounds = _dedupe_page_overlap(
+            previous_rows=previous_page_rows,
+            current_rows=filtered_rows,
+            current_bounds=filtered_bounds,
+        )
+        filtered_rows, filtered_bounds = _dedupe_document_rows(
+            seen_signatures=seen_row_signatures,
+            current_rows=filtered_rows,
+            current_bounds=filtered_bounds,
+        )
+        filtered_rows = _repair_page_flow_columns(filtered_rows, previous_balance_hint=last_balance_hint)
 
         selected_profile = str(parser_diag.get("profile_selected") or profile.name)
         header_anchors = parser_diag.get("header_anchors")
         if isinstance(header_anchors, dict) and header_anchors:
             header_hints_by_profile[selected_profile] = dict(header_anchors)
+            last_header_hint = dict(header_anchors)
 
         parsed_output[page_name] = filtered_rows
         bounds_output[page_name] = filtered_bounds
+        previous_page_rows = filtered_rows
+        page_last_date = _last_row_date(filtered_rows)
+        if page_last_date:
+            last_date_hint = page_last_date
+        page_last_balance = _last_row_balance(filtered_rows)
+        if page_last_balance is not None:
+            last_balance_hint = page_last_balance
         diagnostics["pages"][page_name] = {
             "source_type": "text",
             "bank_profile": profile.name,
@@ -258,6 +289,9 @@ def _run_ocr_pipeline(
     parsed_output: Dict[str, List[Dict]] = {}
     bounds_output: Dict[str, List[Dict]] = {}
     diagnostics: Dict[str, Dict] = {"job": {"source_type": "ocr", "ocr_backend": ocr_router.engine_name}, "pages": {}}
+    header_hints_by_profile: Dict[str, Dict] = {}
+    last_date_hint: str = ""
+    last_balance_hint = None
 
     for batch_start in range(0, len(page_files), OPENAI_OCR_PAGE_BATCH_SIZE):
         batch = page_files[batch_start:batch_start + OPENAI_OCR_PAGE_BATCH_SIZE]
@@ -268,10 +302,22 @@ def _run_ocr_pipeline(
                 cleaned_dir=cleaned_dir,
                 ocr_dir=ocr_dir,
                 ocr_router=ocr_router,
+                header_hint=header_hints_by_profile.get("last"),
+                last_date_hint=last_date_hint or None,
             )
+            page_rows = _repair_page_flow_columns(page_rows, previous_balance_hint=last_balance_hint)
             parsed_output[page_name] = page_rows
             bounds_output[page_name] = page_bounds
             diagnostics["pages"][page_name] = page_diag
+            header_anchors = page_diag.get("header_anchors")
+            if isinstance(header_anchors, dict) and header_anchors:
+                header_hints_by_profile["last"] = dict(header_anchors)
+            page_last_date = _last_row_date(page_rows)
+            if page_last_date:
+                last_date_hint = page_last_date
+            page_last_balance = _last_row_balance(page_rows)
+            if page_last_balance is not None:
+                last_balance_hint = page_last_balance
 
             progress = 45 + int((idx / max(len(page_files), 1)) * 45)
             report("processing", "ocr_parsing", progress)
@@ -311,6 +357,8 @@ def process_ocr_page(
     *,
     ocr_router=None,
     rate_limit_heartbeat=None,
+    header_hint: Dict | None = None,
+    last_date_hint: str | None = None,
 ) -> tuple[str, List[Dict], List[Dict], Dict]:
     page_name = page_file.replace(".png", "")
     page_path = cleaned_dir / page_file
@@ -329,6 +377,7 @@ def process_ocr_page(
                 structured_rows=structured.get("rows") or [],
                 page_width=page_w,
                 page_height=page_h,
+                last_date_hint=last_date_hint or "",
             )
             if ai_rows:
                 _write_json_atomic(ocr_dir / f"{page_name}.json", [])
@@ -360,6 +409,8 @@ def process_ocr_page(
         page_w,
         page_h,
         profile,
+        header_hint=header_hint,
+        last_date_hint=last_date_hint,
     )
     filtered_rows, filtered_bounds = _filter_rows_and_bounds(page_rows, page_bounds, profile)
     diag = {
@@ -370,13 +421,15 @@ def process_ocr_page(
         "profile_detected": parser_diag.get("profile_detected", profile.name),
         "profile_selected": parser_diag.get("profile_selected", profile.name),
         "fallback_applied": bool(parser_diag.get("fallback_applied", False)),
+        "header_detected": bool(parser_diag.get("header_detected", False)),
+        "header_hint_used": bool(parser_diag.get("header_hint_used", False)),
     }
+    if isinstance(parser_diag.get("header_anchors"), dict):
+        diag["header_anchors"] = parser_diag["header_anchors"]
     return page_name, filtered_rows, filtered_bounds, diag
 
 
 def _filter_rows_and_bounds(page_rows: List[Dict], page_bounds: List[Dict], profile) -> tuple[List[Dict], List[Dict]]:
-    id_map: Dict[str, str] = {}
-    normalized_rows: List[Dict] = []
     filtered_rows: List[Dict] = []
     for row in page_rows:
         row_type = _classify_row_type(row, profile)
@@ -386,7 +439,13 @@ def _filter_rows_and_bounds(page_rows: List[Dict], page_bounds: List[Dict], prof
         row_copy["row_type"] = row_type
         filtered_rows.append(row_copy)
 
-    for idx, row in enumerate(filtered_rows, start=1):
+    return _renumber_rows_and_bounds(filtered_rows, page_bounds)
+
+
+def _renumber_rows_and_bounds(page_rows: List[Dict], page_bounds: List[Dict]) -> tuple[List[Dict], List[Dict]]:
+    id_map: Dict[str, str] = {}
+    normalized_rows: List[Dict] = []
+    for idx, row in enumerate(page_rows, start=1):
         old_id = str(row.get("row_id") or idx)
         new_id = f"{idx:03}"
         id_map[old_id] = new_id
@@ -420,11 +479,82 @@ def _filter_rows_and_bounds(page_rows: List[Dict], page_bounds: List[Dict], prof
     return normalized_rows, normalized_bounds
 
 
-def _normalize_structured_ai_rows(structured_rows: List[Dict], page_width: int, page_height: int) -> tuple[List[Dict], List[Dict]]:
+def _dedupe_page_overlap(
+    previous_rows: List[Dict],
+    current_rows: List[Dict],
+    current_bounds: List[Dict],
+    *,
+    max_overlap: int = 5,
+) -> tuple[List[Dict], List[Dict]]:
+    if not previous_rows or not current_rows:
+        return current_rows, current_bounds
+
+    overlap_limit = min(max_overlap, len(previous_rows), len(current_rows))
+    overlap = 0
+    for size in range(overlap_limit, 0, -1):
+        prev_slice = previous_rows[-size:]
+        curr_slice = current_rows[:size]
+        if all(_row_signature(prev_row) == _row_signature(curr_row) for prev_row, curr_row in zip(prev_slice, curr_slice)):
+            overlap = size
+            break
+
+    if overlap <= 0:
+        return current_rows, current_bounds
+
+    kept_rows = current_rows[overlap:]
+    kept_ids = {str(row.get("row_id") or "") for row in kept_rows}
+    kept_bounds = [bound for bound in current_bounds if str(bound.get("row_id") or "") in kept_ids]
+    return _renumber_rows_and_bounds(kept_rows, kept_bounds)
+
+
+def _dedupe_document_rows(
+    seen_signatures: set[tuple],
+    current_rows: List[Dict],
+    current_bounds: List[Dict],
+) -> tuple[List[Dict], List[Dict]]:
+    if not current_rows:
+        return current_rows, current_bounds
+
+    kept_rows: List[Dict] = []
+    kept_ids: set[str] = set()
+    for row in current_rows:
+        signature = _row_signature(row)
+        if signature in seen_signatures:
+            continue
+        seen_signatures.add(signature)
+        kept_rows.append(row)
+        kept_ids.add(str(row.get("row_id") or ""))
+
+    if len(kept_rows) == len(current_rows):
+        return current_rows, current_bounds
+
+    kept_bounds = [bound for bound in current_bounds if str(bound.get("row_id") or "") in kept_ids]
+    return _renumber_rows_and_bounds(kept_rows, kept_bounds)
+
+
+def _row_signature(row: Dict) -> tuple:
+    return (
+        str(row.get("date") or "").strip(),
+        str(row.get("description") or "").strip(),
+        str(row.get("debit") or "").strip(),
+        str(row.get("credit") or "").strip(),
+        str(row.get("balance") or "").strip(),
+        str(row.get("row_type") or "transaction").strip().lower(),
+    )
+
+
+def _normalize_structured_ai_rows(
+    structured_rows: List[Dict],
+    page_width: int,
+    page_height: int,
+    *,
+    last_date_hint: str = "",
+) -> tuple[List[Dict], List[Dict]]:
     rows: List[Dict] = []
     bounds: List[Dict] = []
     max_w = float(max(page_width, 1))
     max_h = float(max(page_height, 1))
+    last_date: str = str(last_date_hint or "").strip()
 
     for idx, row in enumerate(structured_rows, start=1):
         if not isinstance(row, dict):
@@ -450,6 +580,22 @@ def _normalize_structured_ai_rows(structured_rows: List[Dict], page_width: int, 
 
         row_id = f"{len(rows) + 1:03}"
         normalized_date = _normalize_structured_row_date(str(row.get("date") or "").strip())
+        description = str(row.get("description") or "").strip()
+        debit = _normalize_amount_value(row.get("debit"))
+        credit = _normalize_amount_value(row.get("credit"))
+        balance = _normalize_amount_value(row.get("balance"))
+        row_type = str(row.get("row_type") or "transaction").strip().lower() or "transaction"
+        if not normalized_date and _should_carry_forward_structured_row_date(
+            last_date=last_date,
+            description=description,
+            debit=debit,
+            credit=credit,
+            balance=balance,
+            row_type=row_type,
+        ):
+            normalized_date = last_date
+        if normalized_date:
+            last_date = normalized_date
         rownumber_value = _infer_row_number_from_row(row)
         rows.append(
             {
@@ -457,11 +603,11 @@ def _normalize_structured_ai_rows(structured_rows: List[Dict], page_width: int, 
                 "rownumber": _normalize_row_number_value(rownumber_value),
                 "row_number": str(_normalize_row_number_value(rownumber_value) or ""),
                 "date": normalized_date,
-                "description": str(row.get("description") or "").strip(),
-                "debit": _normalize_amount_value(row.get("debit")),
-                "credit": _normalize_amount_value(row.get("credit")),
-                "balance": _normalize_amount_value(row.get("balance")),
-                "row_type": str(row.get("row_type") or "transaction").strip().lower() or "transaction",
+                "description": description,
+                "debit": debit,
+                "credit": credit,
+                "balance": balance,
+                "row_type": row_type,
             }
         )
         bounds.append(
@@ -501,6 +647,186 @@ def _infer_row_number_from_row(row: Dict) -> int | None:
     if direct is not None:
         return direct
     return None
+
+
+def _should_carry_forward_structured_row_date(
+    *,
+    last_date: str,
+    description: str,
+    debit,
+    credit,
+    balance,
+    row_type: str,
+) -> bool:
+    if not last_date:
+        return False
+    if row_type not in {"transaction", "balance_only", "opening_balance", "closing_balance"}:
+        return False
+    if balance is None:
+        return False
+    if debit is None and credit is None:
+        return False
+    if not str(description or "").strip():
+        return False
+    return True
+
+
+def _last_row_date(rows: List[Dict]) -> str:
+    for row in reversed(rows):
+        value = str(row.get("date") or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _last_row_balance(rows: List[Dict]):
+    for row in reversed(rows):
+        value = _amount_to_decimal(row.get("balance"))
+        if value is not None:
+            return value
+    return None
+
+
+def _amounts_match(left: Decimal | None, right: Decimal | None, tolerance: Decimal = Decimal("0.01")) -> bool:
+    if left is None or right is None:
+        return False
+    return abs(left - right) <= tolerance
+
+
+def _flow_description_bias(description: str | None) -> str | None:
+    lowered = str(description or "").strip().lower()
+    if not lowered:
+        return None
+
+    debit_markers = (
+        "withdrawal",
+        "withdraw",
+        "service fee",
+        "fee",
+        "bills payment",
+        "bill payment",
+        "instapay-send",
+        "instapay send",
+        "payment",
+        "send",
+    )
+    credit_markers = (
+        "reversal",
+        "refund",
+        "deposit",
+        "interest",
+        "incoming",
+        "received",
+        "transfer in",
+        "cash in",
+    )
+
+    has_debit = any(marker in lowered for marker in debit_markers)
+    has_credit = any(marker in lowered for marker in credit_markers)
+    if has_debit and not has_credit:
+        return "debit"
+    if has_credit and not has_debit:
+        return "credit"
+    return None
+
+
+def _infer_balance_flow_direction(page_rows: List[Dict], previous_balance_hint=None) -> str | None:
+    prev_balance = _amount_to_decimal(previous_balance_hint)
+    ascending_hits = 0
+    descending_hits = 0
+
+    for row in page_rows:
+        curr_balance = _amount_to_decimal(row.get("balance"))
+        debit = _amount_to_decimal(row.get("debit"))
+        credit = _amount_to_decimal(row.get("credit"))
+
+        if prev_balance is not None and curr_balance is not None:
+            if debit is not None and credit is None:
+                if _amounts_match(prev_balance - debit, curr_balance):
+                    ascending_hits += 1
+                if _amounts_match(prev_balance + debit, curr_balance):
+                    descending_hits += 1
+            elif credit is not None and debit is None:
+                if _amounts_match(prev_balance + credit, curr_balance):
+                    ascending_hits += 1
+                if _amounts_match(prev_balance - credit, curr_balance):
+                    descending_hits += 1
+
+        if curr_balance is not None:
+            prev_balance = curr_balance
+
+    if ascending_hits > descending_hits:
+        return "ascending"
+    if descending_hits > ascending_hits:
+        return "descending"
+    return None
+
+
+def _repair_page_flow_columns(page_rows: List[Dict], previous_balance_hint=None) -> List[Dict]:
+    if not page_rows:
+        return page_rows
+
+    fixed_rows: List[Dict] = []
+    prev_balance = _amount_to_decimal(previous_balance_hint)
+    flow_direction = _infer_balance_flow_direction(page_rows, previous_balance_hint=previous_balance_hint)
+    for row in page_rows:
+        row_copy = dict(row)
+        curr_balance = _amount_to_decimal(row_copy.get("balance"))
+        debit = _amount_to_decimal(row_copy.get("debit"))
+        credit = _amount_to_decimal(row_copy.get("credit"))
+        description_bias = _flow_description_bias(row_copy.get("description"))
+
+        if prev_balance is not None and curr_balance is not None and flow_direction:
+            if debit is not None and credit is None:
+                if flow_direction == "ascending":
+                    expected_current = prev_balance - debit
+                    expected_swapped = prev_balance + debit
+                else:
+                    expected_current = prev_balance + debit
+                    expected_swapped = prev_balance - debit
+                if (
+                    description_bias != "debit"
+                    and not _amounts_match(expected_current, curr_balance)
+                    and _amounts_match(expected_swapped, curr_balance)
+                ):
+                    row_copy["credit"] = row_copy.get("debit")
+                    row_copy["debit"] = None
+                    credit = debit
+                    debit = None
+            elif credit is not None and debit is None:
+                if flow_direction == "ascending":
+                    expected_current = prev_balance + credit
+                    expected_swapped = prev_balance - credit
+                else:
+                    expected_current = prev_balance - credit
+                    expected_swapped = prev_balance + credit
+                if (
+                    description_bias != "credit"
+                    and not _amounts_match(expected_current, curr_balance)
+                    and _amounts_match(expected_swapped, curr_balance)
+                ):
+                    row_copy["debit"] = row_copy.get("credit")
+                    row_copy["credit"] = None
+                    debit = credit
+                    credit = None
+
+        fixed_rows.append(row_copy)
+        if curr_balance is not None:
+            prev_balance = curr_balance
+
+    return fixed_rows
+
+
+def _amount_to_decimal(value):
+    if value is None:
+        return None
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return None
+    try:
+        return Decimal(text)
+    except (InvalidOperation, ValueError):
+        return None
 
 
 def _normalize_amount_value(value):
@@ -582,8 +908,8 @@ def _classify_row_type(row: Dict, profile) -> str | None:
     if not date:
         return None
 
-    if description and "opening balance" in lower_desc:
-        return "opening_balance" if has_balance else None
+    if description and is_non_transaction_balance_line(description):
+        return None
     if description and ("closing balance" in lower_desc or "ending balance" in lower_desc):
         return "closing_balance" if has_balance else None
 
