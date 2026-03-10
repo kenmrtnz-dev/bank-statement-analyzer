@@ -73,14 +73,14 @@ def detect_document_text_profile(
 
 def resolve_document_parse_mode(input_pdf: str | Path, requested_mode: str | None) -> str:
     mode = str(requested_mode or "").strip().lower()
-    if mode == "ocr":
+    if mode in {"ocr", "google_vision"}:
         return "google_vision"
-    if mode in {"text", "google_vision", "pdftotext"}:
-        return mode
+    if mode in {"text", "pdftotext"}:
+        return "pdftotext"
 
     profile = detect_document_text_profile(input_pdf, chars_threshold=DEFAULT_DIGITAL_TEXT_THRESHOLD)
     if profile.is_digital:
-        return "text"
+        return "pdftotext"
     return "google_vision"
 
 

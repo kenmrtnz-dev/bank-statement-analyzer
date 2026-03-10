@@ -14,7 +14,6 @@ from pdf2image import convert_from_path, pdfinfo_from_path
 from PIL import Image
 
 from app.bank_profiles import detect_bank_profile
-from app.parser.pipeline import process_document as run_legacy_parser_document
 from app.pdf_text_extract import extract_pdf_layout_pages
 from app.services.ocr.router import (
     build_scanned_ocr_router,
@@ -76,7 +75,9 @@ def run_pipeline(job_dir: str | Path, parse_mode: str, report: ProgressReporter)
     if selected_mode == "auto":
         selected_mode = resolve_parse_mode(str(input_pdf), "auto")
 
-    if selected_mode == "text":
+    effective_mode = "text" if selected_mode in {"text", "pdftotext"} else "ocr"
+
+    if effective_mode == "text":
         try:
             parsed_output, bounds_output, diagnostics = _run_text_pipeline(
                 input_pdf=input_pdf,
@@ -85,12 +86,14 @@ def run_pipeline(job_dir: str | Path, parse_mode: str, report: ProgressReporter)
             )
         except Exception as exc:
             selected_mode = "google_vision"
-            parsed_output, bounds_output, diagnostics = _run_google_vision_legacy_pipeline(
+            parsed_output, bounds_output, diagnostics = _run_ocr_pipeline(
                 input_pdf=input_pdf,
+                pages_dir=pages_dir,
+                cleaned_dir=cleaned_dir,
                 ocr_dir=ocr_dir,
                 report=report,
-                text_fallback_error=str(exc or ""),
             )
+            diagnostics.setdefault("job", {})["text_fallback_error"] = str(exc or "")[:500]
     else:
         parsed_output, bounds_output, diagnostics = _run_ocr_pipeline(
             input_pdf=input_pdf,
@@ -116,80 +119,6 @@ def run_pipeline(job_dir: str | Path, parse_mode: str, report: ProgressReporter)
         "bounds": bounds_output,
         "diagnostics": diagnostics,
     }
-
-
-def _run_google_vision_legacy_pipeline(
-    input_pdf: Path,
-    ocr_dir: Path,
-    report: ProgressReporter,
-    text_fallback_error: str = "",
-) -> tuple[Dict, Dict, Dict]:
-    report("processing", "google_vision_fallback", 30)
-    result = run_legacy_parser_document(
-        file_path=input_pdf,
-        ocr_engine="google_vision",
-        parser_profile="generic",
-    )
-    transactions = result.get("transactions") if isinstance(result, dict) else None
-    if not isinstance(transactions, list):
-        transactions = []
-
-    parsed_output: Dict[str, List[Dict]] = {}
-    bounds_output: Dict[str, List[Dict]] = {}
-    row_counters: Dict[str, int] = {}
-    for tx in transactions:
-        if not isinstance(tx, dict):
-            continue
-        page_number = tx.get("page") if tx.get("page") is not None else tx.get("page_number")
-        try:
-            page_value = int(str(page_number or "").strip())
-        except Exception:
-            page_value = 1
-        if page_value <= 0:
-            page_value = 1
-        page_name = f"page_{page_value:03}"
-        row_counters[page_name] = row_counters.get(page_name, 0) + 1
-        parsed_output.setdefault(page_name, []).append(
-            {
-                "row_id": f"{row_counters[page_name]:03}",
-                "row_number": str(tx.get("row_number") or ""),
-                "date": str(tx.get("date") or ""),
-                "description": str(tx.get("description") or "").strip(),
-                "debit": tx.get("debit"),
-                "credit": tx.get("credit"),
-                "balance": tx.get("balance"),
-                "row_type": "transaction",
-            }
-        )
-        bounds_output.setdefault(page_name, [])
-
-    if not parsed_output:
-        parsed_output = {"page_001": []}
-        bounds_output = {"page_001": []}
-
-    raw_payload = result.get("ocr_raw")
-    if raw_payload is not None:
-        _write_json_atomic(ocr_dir / "page_001.google_vision_raw.json", raw_payload)
-
-    diagnostics: Dict[str, Dict] = {
-        "job": {
-            "source_type": "legacy_parser",
-            "ocr_backend": "google_vision",
-            "ocr_source": "google_vision",
-            "parser_strategy": result.get("parser_strategy"),
-            "parser_profile_used": result.get("parser_profile_used"),
-        },
-        "pages": {},
-    }
-    if text_fallback_error:
-        diagnostics["job"]["text_fallback_error"] = text_fallback_error[:500]
-    for page_name, rows in parsed_output.items():
-        diagnostics["pages"][page_name] = {
-            "source_type": "google_vision",
-            "rows_parsed": len(rows),
-        }
-    report("processing", "google_vision_fallback", 90)
-    return parsed_output, bounds_output, diagnostics
 
 
 def _run_text_pipeline(input_pdf: Path, ocr_dir: Path, report: ProgressReporter) -> tuple[Dict, Dict, Dict]:

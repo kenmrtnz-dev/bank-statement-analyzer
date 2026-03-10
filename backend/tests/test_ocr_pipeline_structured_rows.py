@@ -140,7 +140,7 @@ def test_normalize_structured_ai_rows_preserves_zero_and_credit_values():
     assert rows[0]["credit"] == 500.0
 
 
-def test_run_pipeline_text_fallback_uses_google_vision(monkeypatch, tmp_path: Path):
+def test_run_pipeline_text_fallback_uses_modern_ocr_pipeline(monkeypatch, tmp_path: Path):
     job_dir = tmp_path / "job"
     (job_dir / "input").mkdir(parents=True, exist_ok=True)
     (job_dir / "input" / "document.pdf").write_bytes(b"%PDF-1.4\n%%EOF")
@@ -152,17 +152,18 @@ def test_run_pipeline_text_fallback_uses_google_vision(monkeypatch, tmp_path: Pa
     )
     monkeypatch.setattr(
         ocr_pipeline,
-        "_run_google_vision_legacy_pipeline",
+        "_run_ocr_pipeline",
         lambda **_kwargs: (
             {"page_001": [{"row_id": "001", "date": "01/01/2026", "description": "x", "debit": 0, "credit": 1, "balance": 1}]},
             {"page_001": []},
-            {"job": {"ocr_backend": "google_vision"}, "pages": {"page_001": {"rows_parsed": 1}}},
+            {"job": {"ocr_backend": "openai_vision"}, "pages": {"page_001": {"rows_parsed": 1}}},
         ),
     )
 
     result = ocr_pipeline.run_pipeline(job_dir, "text", report=lambda *_args, **_kwargs: None)
     assert result["parse_mode"] == "google_vision"
     assert "page_001" in result["parsed_rows"]
+    assert result["diagnostics"]["job"]["ocr_backend"] == "openai_vision"
 
 
 def _ocr_item(text: str, x1: int, y1: int, x2: int, y2: int) -> dict:

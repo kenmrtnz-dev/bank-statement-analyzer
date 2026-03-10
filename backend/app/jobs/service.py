@@ -21,7 +21,7 @@ from PIL import Image
 from pypdf import PdfReader
 
 from app.jobs.repository import JobResultsRawRepository, JobStateRepository, JobsRepository, JobTransactionsRepository
-from app.parser.pipeline import parse_google_vision_raw_payload, process_document as run_legacy_parser_document
+from app.parser.pipeline import parse_google_vision_raw_payload
 from app.ocr import prepare_ocr_pages, process_ocr_page, resolve_parse_mode, run_pipeline
 from app.paths import get_data_dir
 from app.pdf_text_extract import extract_pdf_layout_xml
@@ -781,90 +781,7 @@ def process_job(job_id: str, parse_mode: str, task_id: Optional[str] = None) -> 
     meta = repo.read_json(repo.path(job_id, "meta.json"), default={})
     if not isinstance(meta, dict):
         meta = {}
-    requested_mode = str(meta.get("requested_mode") or "").strip().lower()
-    if requested_mode == "google_vision" and selected_mode != "google_vision":
-        raise RuntimeError(f"google_vision_requested_but_parse_mode_is:{selected_mode or 'unknown'}")
-    if selected_mode in {"google_vision", "pdftotext"}:
-        input_pdf = repo.path(job_id, "input", "document.pdf")
-        report("processing", "legacy_parser_pipeline", 10)
-        requested_parser = str(meta.get("requested_parser") or "auto").strip().lower()
-        result = run_legacy_parser_document(
-            input_pdf,
-            ocr_engine=selected_mode,
-            parser_profile=requested_parser,
-        )
-        if not isinstance(result, dict):
-            raise RuntimeError("legacy_parser_invalid_result")
-
-        ocr_source = str(result.get("ocr_source") or "").strip().lower()
-        if selected_mode == "google_vision" and ocr_source != "google_vision":
-            raise RuntimeError(f"google_vision_mode_requires_google_vision_source:{ocr_source or 'unknown'}")
-
-        transactions = result.get("transactions") if isinstance(result, dict) else None
-        if not isinstance(transactions, list):
-            transactions = []
-
-        parsed_output = _normalize_rows_by_page_for_output(_legacy_transactions_to_rows_by_page(transactions))
-        if not parsed_output:
-            parsed_output = {"page_001": []}
-        bounds_output: Dict[str, List[Dict[str, Any]]] = {page_name: [] for page_name in parsed_output.keys()}
-        diagnostics: Dict[str, Any] = {
-            "job": {
-                "parse_mode": selected_mode,
-                "source_type": "legacy_parser",
-                "parser_strategy": "v1",
-                "parser_profile_requested": result.get("parser_profile_requested", requested_parser),
-                "parser_profile_used": result.get("parser_profile_used"),
-                "legacy_parser_strategy": result.get("parser_strategy"),
-                "ocr_backend": ocr_source or selected_mode,
-                "ocr_engine_requested": result.get("ocr_engine_requested", selected_mode),
-                "ocr_source": result.get("ocr_source", "unknown"),
-                "bank": result.get("bank", "generic"),
-            },
-            "pages": {
-                page_name: {
-                    "rows_parsed": len(page_rows),
-                    "source_type": result.get("ocr_source", "unknown"),
-                }
-                for page_name, page_rows in parsed_output.items()
-            },
-        }
-        if isinstance(result.get("validation"), dict):
-            diagnostics["job"]["validation"] = result.get("validation")
-        if isinstance(result.get("summary"), dict):
-            diagnostics["job"]["legacy_summary"] = result.get("summary")
-        raw_payload = result.get("ocr_raw")
-        if raw_payload is not None:
-            diagnostics["job"]["ocr_raw_available"] = True
-            if isinstance(raw_payload, dict):
-                diagnostics["job"]["ocr_raw_page_count"] = int(raw_payload.get("page_count") or 0)
-            repo.write_json(repo.path(job_id, "ocr", "page_001.google_vision_raw.json"), raw_payload)
-            _persist_job_raw_result(repo, job_id, is_ocr=True, raw_json=raw_payload)
-        elif selected_mode == "pdftotext":
-            _persist_job_raw_result(repo, job_id, is_ocr=False, raw_xml=_read_job_text_layer_xml(repo, job_id))
-
-        _persist_parsed_rows(repo, job_id, parsed_output, bounds_by_page=bounds_output, is_manual_edit=False)
-        repo.write_json(repo.path(job_id, "result", "parsed_rows.json"), parsed_output)
-        repo.write_json(repo.path(job_id, "result", "bounds.json"), bounds_output)
-        repo.write_json(repo.path(job_id, "result", "parse_diagnostics.json"), diagnostics)
-
-        rows_flat = _flatten_rows(_load_parsed_rows(repo, job_id, required=True))
-        summary = compute_summary(rows_flat)
-        repo.write_json(repo.path(job_id, "result", "summary.json"), summary)
-
-        done_payload = {
-            "status": "done",
-            "step": "completed",
-            "progress": 100,
-            "parse_mode": selected_mode,
-            "pages": len(parsed_output),
-        }
-        if task_id:
-            done_payload["task_id"] = task_id
-        repo.write_status(job_id, done_payload)
-        return done_payload
-
-    if selected_mode != "ocr":
+    if selected_mode not in {"ocr", "google_vision"}:
         # Text-layer PDFs can be processed in a single worker run from start to finish.
         result = run_pipeline(root, parse_mode, report=report)
         parsed_output = _normalize_rows_by_page_for_output(result.get("parsed_rows") or {})

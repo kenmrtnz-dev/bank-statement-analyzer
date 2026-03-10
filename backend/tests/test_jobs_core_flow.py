@@ -203,34 +203,71 @@ def test_job_flow_with_mocked_pipeline(client, monkeypatch):
     )
 
 
-def test_job_flow_with_google_vision_legacy_parser(client, monkeypatch):
+def test_job_flow_with_google_vision_uses_modern_pipeline(client, monkeypatch):
     def _run_inline_enqueue(job_id: str, parse_mode: str):
         jobs_service.process_job(job_id=job_id, parse_mode=parse_mode, task_id="inline-task-google")
         return "inline-task-google"
+
+    def _prepare_pages(*, input_pdf, pages_dir, cleaned_dir, report):
+        pages_dir.mkdir(parents=True, exist_ok=True)
+        cleaned_dir.mkdir(parents=True, exist_ok=True)
+        (pages_dir / "page_001.png").write_bytes(b"png")
+        (cleaned_dir / "page_001.png").write_bytes(b"png")
+        return ["page_001.png"]
+
+    def _enqueue_page_job(job_id: str, parse_mode: str, page_name: str, page_index: int, page_count: int) -> str:
+        task_id = f"task-{page_name}"
+        jobs_service.process_job_page(
+            job_id=job_id,
+            parse_mode=parse_mode,
+            page_name=page_name,
+            page_index=page_index,
+            page_count=page_count,
+            task_id=task_id,
+        )
+        return task_id
+
+    def _enqueue_finalize_job(job_id: str, parse_mode: str) -> str:
+        jobs_service.finalize_job_processing(job_id=job_id, parse_mode=parse_mode, task_id="finalize-task")
+        return "finalize-task"
 
     monkeypatch.setattr(jobs_service, "_enqueue_job", _run_inline_enqueue)
     monkeypatch.setattr(jobs_service, "resolve_parse_mode", lambda *_args, **_kwargs: "google_vision")
     monkeypatch.setattr(
         jobs_service,
-        "run_legacy_parser_document",
-        lambda *_args, **_kwargs: {
-            "bank": "bdo",
-            "ocr_engine_requested": "google_vision",
-            "ocr_source": "google_vision",
-            "ocr_raw": {"provider": "google_vision", "mode": "api_key", "pages": []},
-            "transactions": [
+        "prepare_ocr_pages",
+        _prepare_pages,
+    )
+    monkeypatch.setattr(
+        jobs_service,
+        "process_ocr_page",
+        lambda **_kwargs: (
+            "page_001",
+            [
                 {
-                    "row_number": 1,
-                    "date": "2026-03-01",
-                    "description": "Legacy Deposit",
+                    "row_id": "001",
+                    "row_number": "1",
+                    "date": "03/01/2026",
+                    "description": "Modern Deposit",
                     "debit": None,
                     "credit": "1500.25",
                     "balance": "1500.25",
+                    "row_type": "transaction",
                 }
             ],
-            "summary": {"total_rows": 1},
-            "validation": {"is_valid": True, "mismatch_rows": []},
-        },
+            [],
+            {"source_type": "ocr", "rows_parsed": 1, "ocr_backend": "google_vision"},
+        ),
+    )
+    monkeypatch.setattr(
+        jobs_service,
+        "_enqueue_page_job",
+        _enqueue_page_job,
+    )
+    monkeypatch.setattr(
+        jobs_service,
+        "_enqueue_finalize_job",
+        _enqueue_finalize_job,
     )
 
     create = client.post(
@@ -245,6 +282,8 @@ def test_job_flow_with_google_vision_legacy_parser(client, monkeypatch):
     assert started.status_code == 200
     assert started.json()["parse_mode"] == "google_vision"
     assert started.json()["started"] is True
+
+    jobs_service.finalize_job_processing(job_id=job_id, parse_mode="google_vision", task_id="finalize-task-manual")
 
     status = client.get(f"/jobs/{job_id}")
     assert status.status_code == 200
@@ -254,130 +293,13 @@ def test_job_flow_with_google_vision_legacy_parser(client, monkeypatch):
 
     parsed = client.get(f"/jobs/{job_id}/parsed")
     assert parsed.status_code == 200
-    assert parsed.json()["page_001"][0]["description"] == "Legacy Deposit"
-    assert parsed.json()["page_001"][0]["row_number"] == "1"
+    assert parsed.json()["page_001"][0]["description"] == "Modern Deposit"
 
     diagnostics = client.get(f"/jobs/{job_id}/parse-diagnostics")
     assert diagnostics.status_code == 200
     payload = diagnostics.json()
-    assert payload["job"]["parser_strategy"] == "v1"
-    assert payload["job"]["ocr_source"] == "google_vision"
+    assert payload["job"]["source_type"] == "ocr"
     assert payload["pages"]["page_001"]["rows_parsed"] == 1
-
-
-def test_google_vision_mode_rejects_non_google_ocr_source(client, monkeypatch):
-    def _run_inline_enqueue(job_id: str, parse_mode: str):
-        jobs_service.process_job(job_id=job_id, parse_mode=parse_mode, task_id="inline-task-google-mismatch")
-        return "inline-task-google-mismatch"
-
-    monkeypatch.setattr(jobs_service, "_enqueue_job", _run_inline_enqueue)
-    monkeypatch.setattr(jobs_service, "resolve_parse_mode", lambda *_args, **_kwargs: "google_vision")
-    monkeypatch.setattr(
-        jobs_service,
-        "run_legacy_parser_document",
-        lambda *_args, **_kwargs: {
-            "bank": "bdo",
-            "ocr_engine_requested": "google_vision",
-            "ocr_source": "openai_vision",
-            "transactions": [],
-            "summary": {"total_rows": 0},
-            "validation": {"is_valid": True, "mismatch_rows": []},
-        },
-    )
-
-    create = client.post(
-        "/jobs",
-        files={"file": ("statement.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
-        data={"mode": "google_vision", "auto_start": "false"},
-    )
-    assert create.status_code == 200
-    job_id = create.json()["job_id"]
-
-    started = client.post(f"/jobs/{job_id}/start?mode=google_vision")
-    assert started.status_code == 200
-    assert started.json()["parse_mode"] == "google_vision"
-    assert started.json()["started"] is False
-
-    status = client.get(f"/jobs/{job_id}")
-    assert status.status_code == 200
-    payload = status.json()
-    assert payload["status"] == "failed"
-    assert payload["parse_mode"] == "google_vision"
-    assert "google_vision_mode_requires_google_vision_source" in str(payload.get("message") or "")
-
-
-def test_google_vision_uses_requested_parser_profile(client, monkeypatch):
-    captured: dict[str, str] = {}
-
-    def _run_inline_enqueue(job_id: str, parse_mode: str):
-        jobs_service.process_job(job_id=job_id, parse_mode=parse_mode, task_id="inline-task-google-parser")
-        return "inline-task-google-parser"
-
-    def _fake_legacy_parser(*_args, **kwargs):
-        captured["parser_profile"] = str(kwargs.get("parser_profile") or "")
-        return {
-            "bank": "bdo",
-            "ocr_engine_requested": "google_vision",
-            "ocr_source": "google_vision",
-            "parser_profile_requested": kwargs.get("parser_profile", "auto"),
-            "parser_profile_used": kwargs.get("parser_profile", "auto"),
-            "parser_strategy": "google_vision_raw_parser",
-            "transactions": [],
-            "summary": {"total_rows": 0},
-            "validation": {"is_valid": True, "mismatch_rows": []},
-        }
-
-    monkeypatch.setattr(jobs_service, "_enqueue_job", _run_inline_enqueue)
-    monkeypatch.setattr(jobs_service, "resolve_parse_mode", lambda *_args, **_kwargs: "google_vision")
-    monkeypatch.setattr(jobs_service, "run_legacy_parser_document", _fake_legacy_parser)
-
-    create = client.post(
-        "/jobs",
-        files={"file": ("statement.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
-        data={"mode": "google_vision", "parser": "sterling_bank_of_asia", "auto_start": "false"},
-    )
-    assert create.status_code == 200
-    job_id = create.json()["job_id"]
-
-    started = client.post(f"/jobs/{job_id}/start?mode=google_vision&parser=sterling_bank_of_asia")
-    assert started.status_code == 200
-    assert started.json()["started"] is True
-    assert captured.get("parser_profile") == "sterling_bank_of_asia"
-
-    diagnostics = client.get(f"/jobs/{job_id}/parse-diagnostics")
-    assert diagnostics.status_code == 200
-    payload = diagnostics.json()
-    assert payload["job"]["parser_profile_requested"] == "sterling_bank_of_asia"
-    assert payload["job"]["parser_profile_used"] == "sterling_bank_of_asia"
-
-
-def test_google_vision_requested_mode_never_falls_back_to_ocr(client, monkeypatch):
-    def _run_inline_enqueue(job_id: str, parse_mode: str):
-        jobs_service.process_job(job_id=job_id, parse_mode=parse_mode, task_id="inline-task-google-strict")
-        return "inline-task-google-strict"
-
-    monkeypatch.setattr(jobs_service, "_enqueue_job", _run_inline_enqueue)
-    monkeypatch.setattr(jobs_service, "resolve_parse_mode", lambda *_args, **_kwargs: "ocr")
-
-    create = client.post(
-        "/jobs",
-        files={"file": ("statement.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
-        data={"mode": "google_vision", "auto_start": "false"},
-    )
-    assert create.status_code == 200
-    job_id = create.json()["job_id"]
-
-    started = client.post(f"/jobs/{job_id}/start")
-    assert started.status_code == 200
-    assert started.json()["parse_mode"] == "ocr"
-    assert started.json()["started"] is False
-
-    status = client.get(f"/jobs/{job_id}")
-    assert status.status_code == 200
-    payload = status.json()
-    assert payload["status"] == "failed"
-    assert payload["parse_mode"] == "ocr"
-    assert "google_vision_requested_but_parse_mode_is:ocr" in str(payload.get("message") or "")
 
 
 def test_reparse_google_vision_endpoint_uses_processing_parser_choice(client, monkeypatch):

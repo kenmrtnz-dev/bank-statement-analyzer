@@ -152,10 +152,8 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 - `DATABASE_URL` is required for the API, worker, and Alembic.
 - In production, set `APP_ENV=prod`, `DB_AUTO_CREATE_SCHEMA=false`, `SEED_DEFAULT_USERS=false`, and a real `JWT_SECRET`.
 - Retry/backoff knobs are configurable via `CELERY_TASK_MAX_RETRIES`, `CELERY_TASK_RETRY_BACKOFF_SECONDS`, and related `CELERY_TASK_*` env vars.
-- OCR backend for scanned documents is OpenAI Vision OCR.
-- Optional legacy OCR+parser strategy from v1 is available:
-  - `mode=pdftotext` (force pdftotext + v1 parser strategy)
-  - `mode=google_vision` (force Google Vision + v1 parser strategy)
+- `mode=pdftotext` forces the modern text-layer pipeline.
+- `mode=google_vision` forces the modern OCR pipeline.
 - Data is stored in `${DATA_DIR:-<repo>/storage}/jobs/<job_id>/...`.
 - Scanned PDFs route to OpenAI Vision OCR:
   - `OPENAI_API_KEY`
