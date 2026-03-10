@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Bank Statement Analyzer</title>
-    <link rel="stylesheet" href="/static/ui.css?v=20260306i" />
+    <link rel="stylesheet" href="/static/ui.css?v=20260309b" />
   </head>
   <body>
     <main class="app-shell">
@@ -183,10 +183,15 @@
               <div class="row-between">
                 <h2>Preview</h2>
                 <div class="page-nav">
+                  <button id="pageFirstBtn" type="button" class="page-nav-btn" aria-label="First page">&lt;&lt;</button>
                   <button id="pagePrevBtn" type="button" class="page-nav-btn" aria-label="Previous page">&lt;</button>
-                  <span id="pageIndicator" class="page-indicator">0/0</span>
+                  <label class="page-indicator" for="pageNumberInput">
+                    <input id="pageNumberInput" class="page-number-input" type="text" inputmode="numeric" autocomplete="off" value="0" aria-label="Current page number" />
+                    <span>of</span>
+                    <span id="pageCount" class="page-count">0</span>
+                  </label>
                   <button id="pageNextBtn" type="button" class="page-nav-btn" aria-label="Next page">&gt;</button>
-                  <select id="pageSelect" class="hidden"></select>
+                  <button id="pageLastBtn" type="button" class="page-nav-btn" aria-label="Last page">&gt;&gt;</button>
                 </div>
               </div>
               <div class="preview-panel-tabs" role="tablist" aria-label="Preview panel tabs">
@@ -236,7 +241,23 @@
                   </div>
                   <button id="parsedDebugToggleBtn" type="button" class="parsed-header-action ghost">Debug JSON</button>
                   <button id="reverseRowsBtn" type="button" class="parsed-header-action" disabled>Reverse Order</button>
-                  <span id="rowCount">0 rows</span>
+                  <div class="parsed-header-meta">
+                    <div class="parsed-row-legend" aria-label="Parsed row colors">
+                      <span class="parsed-row-legend-item">
+                        <span class="parsed-row-legend-swatch is-error" aria-hidden="true"></span>
+                        Errors
+                      </span>
+                      <span class="parsed-row-legend-item">
+                        <span class="parsed-row-legend-swatch is-modified" aria-hidden="true"></span>
+                        Modified
+                      </span>
+                      <span class="parsed-row-legend-item">
+                        <span class="parsed-row-legend-swatch is-added" aria-hidden="true"></span>
+                        Added
+                      </span>
+                    </div>
+                    <span id="rowCount">0 rows</span>
+                  </div>
                 </div>
               </div>
               <div id="parsedTableWrap" class="table-wrap parsed-side-wrap">
@@ -272,6 +293,6 @@
       </section>
     </main>
 
-    <script src="/static/ui.js?v=20260306i"></script>
+    <script src="/static/ui.js?v=20260310j"></script>
   </body>
 </html>

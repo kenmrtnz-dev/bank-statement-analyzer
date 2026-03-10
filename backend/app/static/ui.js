@@ -25,10 +25,12 @@
     jobProgressFill: document.getElementById('jobProgressFill'),
     summary: document.getElementById('summary'),
     summaryEmpty: document.getElementById('summaryEmpty'),
-    pageSelect: document.getElementById('pageSelect'),
+    pageFirstBtn: document.getElementById('pageFirstBtn'),
     pagePrevBtn: document.getElementById('pagePrevBtn'),
+    pageNumberInput: document.getElementById('pageNumberInput'),
+    pageCount: document.getElementById('pageCount'),
     pageNextBtn: document.getElementById('pageNextBtn'),
-    pageIndicator: document.getElementById('pageIndicator'),
+    pageLastBtn: document.getElementById('pageLastBtn'),
     previewTabButtons: Array.from(document.querySelectorAll('[data-preview-tab]')),
     previewTabPreviewBtn: document.getElementById('previewTabPreviewBtn'),
     previewTabDisbalanceBtn: document.getElementById('previewTabDisbalanceBtn'),
@@ -89,6 +91,7 @@
     jobId: null,
     pages: [],
     parsedByPage: {},
+    baselineParsedByPage: {},
     boundsByPage: {},
     openaiRawByPage: {},
     currentPage: null,
@@ -121,9 +124,13 @@
     currentCrmLeadId: '',
     pageSaveTimers: {},
     pageSaveTokenByPage: {},
+    pendingRowFocus: null,
+    pendingParsedScrollTop: null,
+    pendingWindowScrollY: null,
     parsedPanelMode: 'table',
     currentParseMode: '',
     reverseRowsBusy: false,
+    reversePageOrder: false,
     previewPanelTab: 'preview',
     previewPanelHeightRef: 0,
     disbalanceLoading: false,
@@ -1182,7 +1189,7 @@
       els.reverseRowsBtn.disabled = true;
       return;
     }
-    const canReverse = Object.values(state.parsedByPage).some((rows) => Array.isArray(rows) && rows.length > 1);
+    const canReverse = state.pages.length > 1 || Object.values(state.parsedByPage).some((rows) => Array.isArray(rows) && rows.length > 1);
     els.reverseRowsBtn.disabled = !canReverse;
   }
 
@@ -1203,15 +1210,47 @@
     return m ? Number(m[1]) : Number.MAX_SAFE_INTEGER;
   }
 
-  function collectDisbalanceEntries() {
-    const pages = Array.isArray(state.pages) && state.pages.length
-      ? state.pages.slice().sort((a, b) => pageSortValue(a) - pageSortValue(b))
-      : Object.keys(state.parsedByPage || {}).sort((a, b) => pageSortValue(a) - pageSortValue(b));
+  function getCurrentPageNumber() {
+    const value = pageSortValue(state.currentPage);
+    return Number.isFinite(value) && value !== Number.MAX_SAFE_INTEGER ? value : 0;
+  }
 
+  function getTotalPageCount() {
+    return state.pages.length;
+  }
+
+  function clampPageNumber(value) {
+    const total = getTotalPageCount();
+    if (total <= 0) return 0;
+    const numeric = Number.parseInt(String(value || '').trim(), 10);
+    if (!Number.isFinite(numeric)) return getCurrentPageNumber() || 1;
+    return Math.min(total, Math.max(1, numeric));
+  }
+
+  function findPageKeyByNumber(pageNumber) {
+    const target = clampPageNumber(pageNumber);
+    if (target <= 0) return null;
+    return state.pages.find((page) => pageSortValue(page) === target) || null;
+  }
+
+  function getOrderedRows(page) {
+    const rows = Array.isArray(state.parsedByPage[page]) ? state.parsedByPage[page] : [];
+    return state.reversePageOrder ? rows.slice().reverse() : rows;
+  }
+
+  function getOrderedPages() {
+    const pages = Array.isArray(state.pages) && state.pages.length
+      ? state.pages.slice()
+      : Object.keys(state.parsedByPage || {}).sort((a, b) => pageSortValue(a) - pageSortValue(b));
+    return state.reversePageOrder ? pages.slice().sort((a, b) => pageSortValue(b) - pageSortValue(a)) : pages;
+  }
+
+  function collectDisbalanceEntries() {
     const entries = [];
-    for (const page of pages) {
-      const rows = Array.isArray(state.parsedByPage[page]) ? state.parsedByPage[page] : [];
+    for (const page of getOrderedPages()) {
+      const rows = getOrderedRows(page);
       if (rows.length < 2) continue;
+      const flowDirection = inferBalanceFlowDirection(rows) || 'ascending';
       const mismatchIds = computeBalanceMismatchRowIds(rows);
       if (!mismatchIds.size) continue;
 
@@ -1227,7 +1266,7 @@
         const credit = parseAmountForFormatting(current.credit);
         if (!Number.isFinite(prevBal) || !Number.isFinite(currBal)) continue;
 
-        const expected = prevBal - (Number.isFinite(debit) ? debit : 0) + (Number.isFinite(credit) ? credit : 0);
+        const expected = expectedBalanceForFlow(prevBal, debit, credit, flowDirection);
         const delta = currBal - expected;
         entries.push({
           page,
@@ -1248,6 +1287,13 @@
     const rowsBody = els.disbalanceRowsBody;
     rowsBody.innerHTML = '';
 
+    if (els.previewTabDisbalanceBtn) {
+      const loadedCount = collectDisbalanceEntries().length;
+      els.previewTabDisbalanceBtn.textContent = state.disbalanceLoading
+        ? `Disbalance (${loadedCount}+)`
+        : `Disbalance (${loadedCount})`;
+    }
+
     if (state.disbalanceLoading) {
       const tr = document.createElement('tr');
       tr.innerHTML = '<td colspan="8" class="table-empty-cell">Loading disbalance rows…</td>';
@@ -1256,9 +1302,6 @@
     }
 
     const entries = collectDisbalanceEntries();
-    if (els.previewTabDisbalanceBtn) {
-      els.previewTabDisbalanceBtn.textContent = `Disbalance (${entries.length})`;
-    }
 
     if (!entries.length) {
       const tr = document.createElement('tr');
@@ -1293,12 +1336,20 @@
     renderDisbalanceTable();
 
     state.disbalanceLoadPromise = (async () => {
+      let payload = null;
+      try {
+        payload = await api(`/jobs/${state.jobId}/parsed`);
+      } catch {
+        payload = null;
+      }
+
+      const rowsByPage = payload && typeof payload === 'object' ? payload : {};
       for (const page of missingPages) {
-        try {
-          state.parsedByPage[page] = await api(`/jobs/${state.jobId}/parsed/${page}`);
-        } catch {
-          state.parsedByPage[page] = [];
-        }
+        if (Array.isArray(state.parsedByPage[page])) continue;
+        const rows = rowsByPage && Object.prototype.hasOwnProperty.call(rowsByPage, page)
+          ? rowsByPage[page]
+          : [];
+        state.parsedByPage[page] = Array.isArray(rows) ? rows : [];
       }
     })();
 
@@ -1313,6 +1364,7 @@
 
   function setPreviewPanelTab(tab) {
     const next = normalizePreviewPanelTab(tab);
+    const wasDisbalance = state.previewPanelTab === 'disbalance';
     if (next === 'disbalance' && state.previewPanelTab !== 'disbalance' && els.previewSectionCard) {
       const currentHeight = Math.round(els.previewSectionCard.getBoundingClientRect().height || 0);
       if (Number.isFinite(currentHeight) && currentHeight > 0) {
@@ -1347,6 +1399,14 @@
     } else if (els.previewTabDisbalanceBtn) {
       const count = collectDisbalanceEntries().length;
       els.previewTabDisbalanceBtn.textContent = `Disbalance (${count})`;
+      if (wasDisbalance) {
+        window.requestAnimationFrame(() => {
+          loadPreview({ preserveSelectedRow: true, forceReload: true });
+          drawSelectedBound();
+          syncParsedSectionHeightToPreview();
+          updatePreviewEmptyState();
+        });
+      }
     }
     syncParsedSectionHeightToPreview();
     updatePreviewEmptyState();
@@ -1363,7 +1423,7 @@
 
     if (state.currentPage !== targetPage) {
       state.currentPage = targetPage;
-      if (els.pageSelect) els.pageSelect.value = state.currentPage;
+      state.selectedRowId = null;
       updatePageNav();
       await loadCurrentPageData();
     } else {
@@ -1371,10 +1431,53 @@
     }
 
     selectRow(targetRowId);
-    const targetTr = Array.from(els.rowsBody?.querySelectorAll('tr') || []).find(
-      (rowEl) => String(rowEl.dataset.rowId || '').trim() === targetRowId,
-    );
-    targetTr?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    setPreviewPanelTab('preview');
+    focusParsedRow(targetRowId, { block: 'center', behavior: 'smooth', focusInput: false });
+  }
+
+  function isDisbalancedRow(page, rowId) {
+    const rows = getOrderedRows(page);
+    const targetRowId = String(rowId || '').trim();
+    if (!targetRowId || rows.length < 2) return false;
+    return computeBalanceMismatchRowIds(rows).has(targetRowId);
+  }
+
+  function buildMissingTransactionRow(page, rowId, rows) {
+    const context = findOrderedRowContext(page, rowId);
+    if (!context || !context.row || !context.prevRow) return null;
+
+    const { row, prevRow } = context;
+    const prevBal = parseAmountForFormatting(prevRow.balance);
+    const currBal = parseAmountForFormatting(row.balance);
+    const debit = parseAmountForFormatting(row.debit);
+    const credit = parseAmountForFormatting(row.credit);
+    if (!Number.isFinite(prevBal) || !Number.isFinite(currBal)) return null;
+
+    const expected = prevBal - (Number.isFinite(debit) ? debit : 0) + (Number.isFinite(credit) ? credit : 0);
+    const delta = currBal - expected;
+    if (!Number.isFinite(delta) || Math.abs(delta) <= 0.01) return null;
+
+    const nextDebit = delta < 0 ? Math.abs(delta) : null;
+    const nextCredit = delta > 0 ? delta : null;
+
+    return {
+      row_id: buildNextRowId(rows),
+      date: formatParsedRowDate(normalizeEditableCellValue(row.date)),
+      description: 'Missing Transaction',
+      debit: Number.isFinite(nextDebit) && Math.abs(nextDebit) > 0.005 ? formatAmountCellValue(nextDebit) : '',
+      credit: Number.isFinite(nextCredit) && Math.abs(nextCredit) > 0.005 ? formatAmountCellValue(nextCredit) : '',
+      balance: formatAmountCellValue(prevBal + delta),
+    };
+  }
+
+  function resolveInsertIndex(page, rowId, { beforeCurrent = false } = {}) {
+    const rows = Array.isArray(state.parsedByPage[page]) ? state.parsedByPage[page] : [];
+    const idx = rows.findIndex((row) => String(row?.row_id || '') === String(rowId || ''));
+    if (idx < 0) return -1;
+    if (beforeCurrent) {
+      return state.reversePageOrder ? idx + 1 : idx;
+    }
+    return state.reversePageOrder ? idx : idx + 1;
   }
 
   async function ensureCurrentPageOpenaiRawLoaded() {
@@ -1392,7 +1495,7 @@
     if (!els.parsedJsonBody) return;
     const page = String(state.currentPage || '').trim();
     const rawOpenai = page ? state.openaiRawByPage[page] : null;
-    const parsedRows = page ? (state.parsedByPage[page] || []) : [];
+    const parsedRows = page ? getOrderedRows(page) : [];
     if (els.rowCount) els.rowCount.textContent = `${Array.isArray(parsedRows) ? parsedRows.length : 0} rows`;
     const payload = {
       job_id: state.jobId || null,
@@ -1557,9 +1660,297 @@
     });
   }
 
+  function normalizeCommittedFieldValue(field, value) {
+    const raw = normalizeEditableCellValue(value).trim();
+    if (!raw) return '';
+    if (AMOUNT_ROW_FIELDS.has(field)) return formatAmountCellValue(raw);
+    return raw;
+  }
+
+  function getRenderedFieldValue(field, value) {
+    if (field === 'date') return formatParsedRowDate(normalizeEditableCellValue(value));
+    if (AMOUNT_ROW_FIELDS.has(field)) return formatAmountCellValue(value);
+    return normalizeEditableCellValue(value);
+  }
+
+  function findOrderedRowContext(page, rowId) {
+    const rows = getOrderedRows(page);
+    const index = rows.findIndex((row, idx) => {
+      const currentRowId = String(row?.row_id || '').trim() || String(idx + 1).padStart(3, '0');
+      return currentRowId === String(rowId || '').trim();
+    });
+    if (index < 0) return null;
+    return {
+      rows,
+      index,
+      row: rows[index],
+      prevRow: index > 0 ? rows[index - 1] : null,
+    };
+  }
+
+  function hasUsableAmountValue(raw, parsed) {
+    return raw === '' || Number.isFinite(parsed);
+  }
+
+  function amountsRoughlyEqual(left, right, tolerance = 0.01) {
+    return Number.isFinite(left) && Number.isFinite(right) && Math.abs(left - right) <= tolerance;
+  }
+
+  function inferBalanceFlowDirection(rows) {
+    if (!Array.isArray(rows) || rows.length < 2) return null;
+
+    let ascendingHits = 0;
+    let descendingHits = 0;
+    for (let idx = 1; idx < rows.length; idx += 1) {
+      const prev = rows[idx - 1] || {};
+      const current = rows[idx] || {};
+      const prevBal = parseAmountForFormatting(prev.balance);
+      const currBal = parseAmountForFormatting(current.balance);
+      const debit = parseAmountForFormatting(current.debit);
+      const credit = parseAmountForFormatting(current.credit);
+      if (!Number.isFinite(prevBal) || !Number.isFinite(currBal)) continue;
+
+      if (Number.isFinite(debit) && !Number.isFinite(credit)) {
+        if (amountsRoughlyEqual(prevBal - debit, currBal)) ascendingHits += 1;
+        if (amountsRoughlyEqual(prevBal + debit, currBal)) descendingHits += 1;
+      } else if (Number.isFinite(credit) && !Number.isFinite(debit)) {
+        if (amountsRoughlyEqual(prevBal + credit, currBal)) ascendingHits += 1;
+        if (amountsRoughlyEqual(prevBal - credit, currBal)) descendingHits += 1;
+      }
+    }
+
+    if (ascendingHits > descendingHits) return 'ascending';
+    if (descendingHits > ascendingHits) return 'descending';
+    return null;
+  }
+
+  function expectedBalanceForFlow(prevBalance, debit, credit, flowDirection) {
+    if (!Number.isFinite(prevBalance)) return null;
+    const debitValue = Number.isFinite(debit) ? debit : 0;
+    const creditValue = Number.isFinite(credit) ? credit : 0;
+    if (flowDirection === 'descending') {
+      return prevBalance + debitValue - creditValue;
+    }
+    return prevBalance - debitValue + creditValue;
+  }
+
+  function getFlowDirectionForPage(page) {
+    return inferBalanceFlowDirection(getOrderedRows(page)) || 'ascending';
+  }
+
+  function computeAmountForBalanceTarget(prevBalance, currentBalance, flowDirection, targetField) {
+    if (!Number.isFinite(prevBalance) || !Number.isFinite(currentBalance)) return null;
+
+    let amount = null;
+    if (targetField === 'debit') {
+      amount = flowDirection === 'descending'
+        ? currentBalance - prevBalance
+        : prevBalance - currentBalance;
+    } else if (targetField === 'credit') {
+      amount = flowDirection === 'descending'
+        ? prevBalance - currentBalance
+        : currentBalance - prevBalance;
+    }
+
+    if (!Number.isFinite(amount)) return null;
+    if (Math.abs(amount) <= 0.005) return 0;
+    if (amount < 0) return null;
+    return amount;
+  }
+
+  function setRowAmountColumns(row, debit, credit) {
+    if (!row) return;
+    row.debit = Number.isFinite(debit) && Math.abs(debit) > 0.005 ? formatAmountCellValue(debit) : '';
+    row.credit = Number.isFinite(credit) && Math.abs(credit) > 0.005 ? formatAmountCellValue(credit) : '';
+  }
+
+  function recalculateBalanceFromAmounts(page, rowId) {
+    const context = findOrderedRowContext(page, rowId);
+    if (!context || !context.row) return false;
+
+    const { row, prevRow } = context;
+    const prevBalance = parseAmountForFormatting(prevRow?.balance);
+    if (!Number.isFinite(prevBalance)) return false;
+
+    const debitRaw = normalizeEditableCellValue(row.debit).trim();
+    const creditRaw = normalizeEditableCellValue(row.credit).trim();
+    const debit = parseAmountForFormatting(row.debit);
+    const credit = parseAmountForFormatting(row.credit);
+    if (!hasUsableAmountValue(debitRaw, debit) || !hasUsableAmountValue(creditRaw, credit)) return false;
+
+    const nextBalance = expectedBalanceForFlow(prevBalance, debit, credit, getFlowDirectionForPage(page));
+    if (!Number.isFinite(nextBalance)) return false;
+    row.balance = formatAmountCellValue(nextBalance);
+    return true;
+  }
+
+  function recalculateAmountsFromBalance(page, rowId, preferredField = null) {
+    const context = findOrderedRowContext(page, rowId);
+    if (!context || !context.row) return false;
+
+    const { row, prevRow } = context;
+    const prevBalance = parseAmountForFormatting(prevRow?.balance);
+    const balanceRaw = normalizeEditableCellValue(row.balance).trim();
+    const balance = parseAmountForFormatting(row.balance);
+    if (!Number.isFinite(prevBalance) || !hasUsableAmountValue(balanceRaw, balance) || !Number.isFinite(balance)) {
+      return false;
+    }
+
+    const flowDirection = getFlowDirectionForPage(page);
+    if (preferredField === 'debit' || preferredField === 'credit') {
+      const nextAmount = computeAmountForBalanceTarget(prevBalance, balance, flowDirection, preferredField);
+      if (nextAmount === null) return false;
+      if (preferredField === 'debit') {
+        setRowAmountColumns(row, nextAmount, null);
+      } else {
+        setRowAmountColumns(row, null, nextAmount);
+      }
+      return true;
+    }
+
+    const nextDebit = computeAmountForBalanceTarget(prevBalance, balance, flowDirection, 'debit');
+    const nextCredit = computeAmountForBalanceTarget(prevBalance, balance, flowDirection, 'credit');
+    if (nextDebit === null && nextCredit === null && !amountsRoughlyEqual(prevBalance, balance)) return false;
+    setRowAmountColumns(row, nextDebit, nextCredit);
+    return true;
+  }
+
+  function syncRowFromRenderedInputs(rowEl, row) {
+    if (!(rowEl instanceof HTMLTableRowElement) || !row) return;
+    for (const field of EDITABLE_ROW_FIELDS) {
+      const input = rowEl.querySelector(`.table-row-input-${field}`);
+      if (!(input instanceof HTMLInputElement)) continue;
+      row[field] = normalizeCommittedFieldValue(field, input.value);
+    }
+  }
+
+  function finalizeParsedRowMutation(page, rowId, rowEl, row, before) {
+    syncRenderedRowInputs(rowEl, row);
+    const after = buildComparableParsedRow(row, rowId);
+
+    if (!areComparableRowsEqual(after, before)) {
+      queuePageRowsSave(page);
+    }
+
+    applyBalanceMismatchStyles(page);
+    applyDescriptionFlagStyles(page);
+    applyParsedRowStateStyles(page);
+  }
+
+  function runParsedRowContextAction(page, rowId, field, rowEl) {
+    if (!AMOUNT_ROW_FIELDS.has(field)) return;
+
+    const context = findOrderedRowContext(page, rowId);
+    if (!context || !context.row) return;
+
+    const before = buildComparableParsedRow(context.row, rowId);
+    syncRowFromRenderedInputs(rowEl, context.row);
+
+    let applied = false;
+    if (field === 'balance') {
+      applied = recalculateBalanceFromAmounts(page, rowId);
+      if (!applied) {
+        alert('Unable to auto calculate balance from the current debit/credit values.');
+      }
+    } else {
+      applied = recalculateAmountsFromBalance(page, rowId, field);
+      if (!applied) {
+        alert(`Unable to auto calculate ${field} from the current balance.`);
+      }
+    }
+
+    finalizeParsedRowMutation(page, rowId, rowEl, context.row, before);
+  }
+
+  function reconcileRowAmountsWithRunningBalance(page, rowId, editedField) {
+    if (!AMOUNT_ROW_FIELDS.has(editedField)) return;
+    const context = findOrderedRowContext(page, rowId);
+    if (!context || !context.row) return;
+
+    const { row, prevRow } = context;
+    const prevBalance = parseAmountForFormatting(prevRow?.balance);
+    if (!Number.isFinite(prevBalance)) return;
+
+    const debitRaw = normalizeEditableCellValue(row.debit).trim();
+    const creditRaw = normalizeEditableCellValue(row.credit).trim();
+    const balanceRaw = normalizeEditableCellValue(row.balance).trim();
+    const debit = parseAmountForFormatting(row.debit);
+    const credit = parseAmountForFormatting(row.credit);
+    const balance = parseAmountForFormatting(row.balance);
+
+    if (editedField === 'debit' || editedField === 'credit') {
+      if (!hasUsableAmountValue(debitRaw, debit) || !hasUsableAmountValue(creditRaw, credit)) return;
+      const nextBalance = expectedBalanceForFlow(prevBalance, debit, credit, getFlowDirectionForPage(page));
+      if (Number.isFinite(nextBalance)) {
+        row.balance = formatAmountCellValue(nextBalance);
+      }
+      return;
+    }
+
+    if (!hasUsableAmountValue(balanceRaw, balance) || !Number.isFinite(balance)) return;
+    recalculateAmountsFromBalance(page, rowId);
+  }
+
+  function syncRenderedRowInputs(rowEl, row) {
+    if (!(rowEl instanceof HTMLTableRowElement) || !row) return;
+    for (const field of EDITABLE_ROW_FIELDS) {
+      const input = rowEl.querySelector(`.table-row-input-${field}`);
+      if (!(input instanceof HTMLInputElement)) continue;
+      input.value = getRenderedFieldValue(field, row[field]);
+    }
+  }
+
+  function commitParsedRowFieldEdit(page, rowId, field, input, rowEl) {
+    const context = findOrderedRowContext(page, rowId);
+    if (!context || !context.row) return;
+
+    const before = buildComparableParsedRow(context.row, rowId);
+    const previousFieldValue = normalizeCommittedFieldValue(field, context.row[field]);
+    const nextFieldValue = normalizeCommittedFieldValue(field, input.value);
+    context.row[field] = nextFieldValue;
+
+    if (AMOUNT_ROW_FIELDS.has(field) && previousFieldValue !== nextFieldValue) {
+      reconcileRowAmountsWithRunningBalance(page, rowId, field);
+    }
+
+    finalizeParsedRowMutation(page, rowId, rowEl, context.row, before);
+  }
+
+  function buildComparableParsedRow(row, rowId, index = 0) {
+    return {
+      row_id: String(rowId || row?.row_id || '').trim() || String(index + 1).padStart(3, '0'),
+      date: formatParsedRowDate(normalizeEditableCellValue(row?.date)),
+      description: normalizeEditableCellValue(row?.description).trim(),
+      debit: formatAmountCellValue(row?.debit),
+      credit: formatAmountCellValue(row?.credit),
+      balance: formatAmountCellValue(row?.balance),
+    };
+  }
+
+  function snapshotParsedRows(rows) {
+    return (Array.isArray(rows) ? rows : []).map((row, idx) => buildComparableParsedRow(row, row?.row_id, idx));
+  }
+
+  function ensureBaselineRows(page, rows) {
+    const pageName = String(page || '').trim();
+    if (!pageName) return;
+    if (Object.prototype.hasOwnProperty.call(state.baselineParsedByPage, pageName)) return;
+    state.baselineParsedByPage[pageName] = snapshotParsedRows(rows);
+  }
+
+  function areComparableRowsEqual(currentRow, baselineRow) {
+    if (!currentRow || !baselineRow) return false;
+    return currentRow.date === baselineRow.date
+      && currentRow.description === baselineRow.description
+      && currentRow.debit === baselineRow.debit
+      && currentRow.credit === baselineRow.credit
+      && currentRow.balance === baselineRow.balance;
+  }
+
   function computeBalanceMismatchRowIds(rows) {
     const mismatches = new Set();
     if (!Array.isArray(rows) || rows.length < 2) return mismatches;
+    const flowDirection = inferBalanceFlowDirection(rows) || 'ascending';
 
     for (let idx = 1; idx < rows.length; idx += 1) {
       const prev = rows[idx - 1] || {};
@@ -1575,7 +1966,7 @@
 
       if (!Number.isFinite(prevBal) || !Number.isFinite(currBal) || !hasFlow) continue;
 
-      const expected = prevBal - (Number.isFinite(debit) ? debit : 0) + (Number.isFinite(credit) ? credit : 0);
+      const expected = expectedBalanceForFlow(prevBal, debit, credit, flowDirection);
       if (Math.abs(currBal - expected) > 0.01) {
         mismatches.add(rowId);
       }
@@ -1585,7 +1976,7 @@
 
   function applyBalanceMismatchStyles(page) {
     if (!els.rowsBody) return;
-    const rows = Array.isArray(state.parsedByPage[page]) ? state.parsedByPage[page] : [];
+    const rows = getOrderedRows(page);
     const mismatches = computeBalanceMismatchRowIds(rows);
 
     for (const tr of els.rowsBody.querySelectorAll('tr')) {
@@ -1602,7 +1993,7 @@
 
   function applyDescriptionFlagStyles(page) {
     if (!els.rowsBody) return;
-    const rows = Array.isArray(state.parsedByPage[page]) ? state.parsedByPage[page] : [];
+    const rows = getOrderedRows(page);
     const rowById = new Map(
       rows.map((row, idx) => [String(row?.row_id || '').trim() || String(idx + 1).padStart(3, '0'), row])
     );
@@ -1616,6 +2007,41 @@
       input.classList.toggle('bank-code-flagged', Boolean(match));
       tr.classList.toggle('bank-code-flag-row', Boolean(match));
       input.title = match ? `Flagged transaction code ${match.code} (${match.bank})` : '';
+    }
+  }
+
+  function getParsedRowVisualState(page, row, rowId, mismatchIds, baselineRowsById) {
+    if (mismatchIds.has(rowId)) return 'error';
+    if (getDescriptionFlagMatch(normalizeEditableCellValue(row?.description), page)) return 'error';
+
+    const baselineRow = baselineRowsById.get(rowId);
+    if (!baselineRow) return 'added';
+
+    const comparableRow = buildComparableParsedRow(row, rowId);
+    return areComparableRowsEqual(comparableRow, baselineRow) ? '' : 'modified';
+  }
+
+  function applyParsedRowStateStyles(page) {
+    if (!els.rowsBody) return;
+    const rows = getOrderedRows(page);
+    ensureBaselineRows(page, rows);
+    const mismatchIds = computeBalanceMismatchRowIds(rows);
+    const baselineRowsById = new Map(
+      (Array.isArray(state.baselineParsedByPage[page]) ? state.baselineParsedByPage[page] : [])
+        .map((row, idx) => [String(row?.row_id || '').trim() || String(idx + 1).padStart(3, '0'), row])
+    );
+    const rowById = new Map(
+      rows.map((row, idx) => [String(row?.row_id || '').trim() || String(idx + 1).padStart(3, '0'), row])
+    );
+
+    for (const tr of els.rowsBody.querySelectorAll('tr')) {
+      const rowId = String(tr.dataset.rowId || '').trim();
+      const row = rowById.get(rowId);
+      const rowState = row ? getParsedRowVisualState(page, row, rowId, mismatchIds, baselineRowsById) : '';
+      tr.classList.remove('row-state-error', 'row-state-modified', 'row-state-added');
+      if (rowState) {
+        tr.classList.add(`row-state-${rowState}`);
+      }
     }
   }
 
@@ -1649,6 +2075,116 @@
     syncParsedSectionHeightToPreview();
   }
 
+  function getParsedRowsScrollContainer() {
+    if (els.parsedTableWrap instanceof HTMLElement) return els.parsedTableWrap;
+    return els.rowsBody?.closest('.table-wrap') || null;
+  }
+
+  function snapshotParsedScrollPosition() {
+    const container = getParsedRowsScrollContainer();
+    state.pendingParsedScrollTop = container instanceof HTMLElement ? container.scrollTop : null;
+    state.pendingWindowScrollY = typeof window.scrollY === 'number' ? window.scrollY : null;
+  }
+
+  function restoreParsedScrollPosition() {
+    const container = getParsedRowsScrollContainer();
+    if (container instanceof HTMLElement && Number.isFinite(state.pendingParsedScrollTop)) {
+      container.scrollTop = Math.max(0, Number(state.pendingParsedScrollTop));
+    }
+    if (Number.isFinite(state.pendingWindowScrollY)) {
+      window.scrollTo({ top: Math.max(0, Number(state.pendingWindowScrollY)), behavior: 'auto' });
+    }
+  }
+
+  function scrollParsedRowIntoView(targetTr, { behavior = 'auto', block = 'center' } = {}) {
+    if (!(targetTr instanceof HTMLTableRowElement)) return;
+    const container = getParsedRowsScrollContainer();
+    if (!(container instanceof HTMLElement)) {
+      targetTr.scrollIntoView({ block, behavior });
+      return;
+    }
+
+    const containerRect = container.getBoundingClientRect();
+    const targetRect = targetTr.getBoundingClientRect();
+    let nextTop = container.scrollTop;
+
+    if (block === 'center') {
+      nextTop += (targetRect.top - containerRect.top) - ((container.clientHeight - targetRect.height) / 2);
+    } else if (block === 'start') {
+      nextTop += targetRect.top - containerRect.top;
+    } else if (block === 'end') {
+      nextTop += targetRect.bottom - containerRect.bottom;
+    } else if (block === 'nearest') {
+      if (targetRect.top < containerRect.top) nextTop += targetRect.top - containerRect.top;
+      else if (targetRect.bottom > containerRect.bottom) nextTop += targetRect.bottom - containerRect.bottom;
+      else return;
+    }
+
+    container.scrollTo({ top: Math.max(0, nextTop), behavior });
+  }
+
+  function buildPendingRowFocus(page, rowId, overrides = {}) {
+    const targetPage = String(page || '').trim();
+    const targetRowId = String(rowId || '').trim();
+    const normalizedIndex = Number.isFinite(Number(overrides.rowIndex))
+      ? Math.max(0, Number.parseInt(overrides.rowIndex, 10))
+      : null;
+    if (!targetPage || (!targetRowId && normalizedIndex === null)) return null;
+    return {
+      page: targetPage,
+      rowId: targetRowId,
+      rowIndex: normalizedIndex,
+      focusInput: false,
+      behavior: 'auto',
+      block: 'center',
+      ...overrides,
+    };
+  }
+
+  function findRenderedRowElement({ rowId = '', rowIndex = null } = {}) {
+    if (!els.rowsBody) return null;
+    const rows = Array.from(els.rowsBody.querySelectorAll('tr'));
+    const targetRowId = String(rowId || '').trim();
+    if (targetRowId) {
+      const matched = rows.find((rowEl) => String(rowEl.dataset.rowId || '').trim() === targetRowId);
+      if (matched instanceof HTMLTableRowElement) return matched;
+    }
+    if (Number.isInteger(rowIndex) && rowIndex >= 0 && rowIndex < rows.length) {
+      const indexed = rows[rowIndex];
+      if (indexed instanceof HTMLTableRowElement) return indexed;
+    }
+    return null;
+  }
+
+  function focusParsedRow(
+    rowId,
+    { behavior = 'auto', block = 'center', focusInput = false, rowIndex = null } = {},
+  ) {
+    const targetRowId = String(rowId || '').trim();
+    const targetRowIndex = Number.isFinite(Number(rowIndex))
+      ? Math.max(0, Number.parseInt(rowIndex, 10))
+      : null;
+    if ((!targetRowId && targetRowIndex === null) || !els.rowsBody) return false;
+
+    const targetTr = findRenderedRowElement({ rowId: targetRowId, rowIndex: targetRowIndex });
+    if (!(targetTr instanceof HTMLTableRowElement)) return false;
+    selectRow(String(targetTr.dataset.rowId || '').trim());
+
+    scrollParsedRowIntoView(targetTr, { block, behavior });
+    if (!focusInput) return true;
+
+    const preferredInput = targetTr.querySelector('.table-row-input-description')
+      || targetTr.querySelector('.table-row-input-date')
+      || targetTr.querySelector('.table-row-input-debit')
+      || targetTr.querySelector('.table-row-input-credit')
+      || targetTr.querySelector('.table-row-input-balance');
+    if (!(preferredInput instanceof HTMLInputElement)) return true;
+
+    preferredInput.focus({ preventScroll: true });
+    preferredInput.select();
+    return true;
+  }
+
   async function persistPageRows(page) {
     const pageName = String(page || '').trim();
     if (!state.jobId || !pageName) return;
@@ -1678,6 +2214,33 @@
     if (state.pageSaveTokenByPage[pageName] !== token) return;
 
     if (payload && Array.isArray(payload.rows)) {
+      const activeElement = document.activeElement;
+      const activeInput = activeElement instanceof HTMLInputElement ? activeElement : null;
+      const activeRow = activeInput?.closest('tr[data-row-id]');
+      const activeRowId = String(activeRow?.dataset.rowId || '').trim();
+      const activeRowIndex = activeRow instanceof HTMLTableRowElement
+        ? Array.from(els.rowsBody?.querySelectorAll('tr') || []).indexOf(activeRow)
+        : null;
+      const shouldPreserveFocusedInput = Boolean(
+        activeInput
+        && activeRowId
+        && pageName === state.currentPage
+      );
+      const preservedFocus = pageName === state.currentPage
+        ? (
+          state.pendingRowFocus
+          || buildPendingRowFocus(
+            pageName,
+            activeRowId || state.selectedRowId,
+            {
+              rowIndex: activeRowIndex,
+              focusInput: shouldPreserveFocusedInput,
+              behavior: 'auto',
+              block: 'nearest'
+            },
+          )
+        )
+        : null;
       const existingRows = Array.isArray(state.parsedByPage[pageName]) ? state.parsedByPage[pageName] : [];
       const sameShape = existingRows.length === payload.rows.length
         && existingRows.every((row, idx) => {
@@ -1696,9 +2259,16 @@
           existingRows[idx].credit = formatAmountCellValue(src.credit);
           existingRows[idx].balance = formatAmountCellValue(src.balance);
         }
+        if (pageName === state.currentPage) {
+          if (preservedFocus) state.pendingRowFocus = preservedFocus;
+          snapshotParsedScrollPosition();
+          renderRows();
+        }
       } else {
         state.parsedByPage[pageName] = payload.rows;
         if (pageName === state.currentPage) {
+          if (preservedFocus) state.pendingRowFocus = preservedFocus;
+          snapshotParsedScrollPosition();
           renderRows();
         }
       }
@@ -1745,20 +2315,36 @@
 
   function insertRowAfter(page, rowId) {
     const rows = Array.isArray(state.parsedByPage[page]) ? state.parsedByPage[page] : [];
-    const idx = rows.findIndex((row) => String(row?.row_id || '') === String(rowId || ''));
-    if (idx < 0) return;
-    const nextRow = {
-      row_id: buildNextRowId(rows),
-      date: '',
-      description: '',
-      debit: '',
-      credit: '',
-      balance: '',
-    };
-    rows.splice(idx + 1, 0, nextRow);
+    if (!rows.length) return;
+
+    const disbalancedRow = isDisbalancedRow(page, rowId);
+    const nextRow = disbalancedRow
+      ? buildMissingTransactionRow(page, rowId, rows)
+      : {
+        row_id: buildNextRowId(rows),
+        date: '',
+        description: '',
+        debit: '',
+        credit: '',
+        balance: '',
+      };
+    if (disbalancedRow && !nextRow) {
+      alert('Unable to auto-fill missing transaction for this disbalanced row.');
+      return;
+    }
+
+    const insertIndex = resolveInsertIndex(page, rowId, { beforeCurrent: disbalancedRow });
+    if (insertIndex < 0) return;
+    rows.splice(insertIndex, 0, nextRow);
     state.parsedByPage[page] = rows;
+    state.pendingRowFocus = buildPendingRowFocus(page, nextRow.row_id, {
+      rowIndex: insertIndex,
+      focusInput: true,
+      behavior: 'auto',
+      block: 'center',
+    });
+    snapshotParsedScrollPosition();
     renderRows();
-    selectRow(nextRow.row_id);
     queuePageRowsSave(page);
   }
 
@@ -1782,31 +2368,21 @@
 
   async function reverseAllPagesRows() {
     if (state.reverseRowsBusy) return;
+    if (!state.jobId) return;
     state.reverseRowsBusy = true;
     updateReverseRowsActionState();
     try {
-      let changed = false;
-      const pagesToProcess = Array.isArray(state.pages) && state.pages.length
-        ? state.pages.slice()
-        : Object.keys(state.parsedByPage || {});
-      for (const page of pagesToProcess) {
-        if (!Array.isArray(state.parsedByPage[page]) && state.jobId) {
-          try {
-            state.parsedByPage[page] = await api(`/jobs/${state.jobId}/parsed/${page}`);
-          } catch {
-            continue;
-          }
-        }
-        const rows = Array.isArray(state.parsedByPage[page]) ? state.parsedByPage[page] : [];
-        if (!Array.isArray(rows) || rows.length < 2) continue;
-        state.parsedByPage[page] = rows.slice().reverse();
-        queuePageRowsSave(page);
-        changed = true;
-      }
-      if (changed) {
-        renderRows();
-        await flushPendingPageSaves();
-      }
+      state.reversePageOrder = !state.reversePageOrder;
+      state.pages = state.pages.slice().reverse();
+      state.currentPage = state.pages[0] || null;
+      state.selectedRowId = null;
+      await api(`/jobs/${state.jobId}/reverse-order`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ is_reversed: state.reversePageOrder })
+      });
+      renderPages();
+      await loadCurrentPageData();
     } finally {
       state.reverseRowsBusy = false;
       updateReverseRowsActionState();
@@ -1859,7 +2435,13 @@
     if (!state.currentPage || !els.rowsBody) return;
 
     const page = state.currentPage;
-    const rows = state.parsedByPage[page] || [];
+    const rows = getOrderedRows(page);
+    ensureBaselineRows(page, rows);
+    const mismatchIds = computeBalanceMismatchRowIds(rows);
+    const baselineRowsById = new Map(
+      (Array.isArray(state.baselineParsedByPage[page]) ? state.baselineParsedByPage[page] : [])
+        .map((row, idx) => [String(row?.row_id || '').trim() || String(idx + 1).padStart(3, '0'), row])
+    );
     recomputeTotalParsedRows();
     updateExportAvailability();
     if (els.rowCount) els.rowCount.textContent = `${rows.length} rows`;
@@ -1869,6 +2451,10 @@
       const rowId = String(row?.row_id || '').trim() || String(idx + 1).padStart(3, '0');
       row.row_id = rowId;
       tr.dataset.rowId = rowId;
+      const rowState = getParsedRowVisualState(page, row, rowId, mismatchIds, baselineRowsById);
+      if (rowState) {
+        tr.classList.add(`row-state-${rowState}`);
+      }
 
       const rowIdCell = document.createElement('td');
       rowIdCell.textContent = getRowDisplayValue(row, rowId, idx);
@@ -1893,31 +2479,16 @@
         input.addEventListener('focus', () => {
           selectRow(rowId);
         });
-        input.addEventListener('input', () => {
-          row[field] = input.value;
-          queuePageRowsSave(page);
-          applyBalanceMismatchStyles(page);
-          applyDescriptionFlagStyles(page);
-        });
-        input.addEventListener('change', () => {
-          const normalized = AMOUNT_ROW_FIELDS.has(field)
-            ? formatAmountCellValue(input.value)
-            : input.value.trim();
-          row[field] = normalized;
-          input.value = normalized;
-          queuePageRowsSave(page);
-          applyBalanceMismatchStyles(page);
-          applyDescriptionFlagStyles(page);
-        });
+        if (AMOUNT_ROW_FIELDS.has(field)) {
+          input.addEventListener('contextmenu', (evt) => {
+            evt.preventDefault();
+            evt.stopPropagation();
+            selectRow(rowId);
+            runParsedRowContextAction(page, rowId, field, tr);
+          });
+        }
         input.addEventListener('blur', () => {
-          const normalized = AMOUNT_ROW_FIELDS.has(field)
-            ? formatAmountCellValue(input.value)
-            : input.value.trim();
-          row[field] = normalized;
-          input.value = normalized;
-          queuePageRowsSave(page);
-          applyBalanceMismatchStyles(page);
-          applyDescriptionFlagStyles(page);
+          commitParsedRowFieldEdit(page, rowId, field, input, tr);
         });
 
         td.appendChild(input);
@@ -1965,34 +2536,58 @@
     updateReverseRowsActionState();
     applyBalanceMismatchStyles(page);
     applyDescriptionFlagStyles(page);
+    applyParsedRowStateStyles(page);
     drawSelectedBound();
+    restoreParsedScrollPosition();
+    if (
+      state.pendingRowFocus
+      && state.pendingRowFocus.page === String(page || '').trim()
+      && state.pendingRowFocus.rowId
+    ) {
+      const pendingFocus = { ...state.pendingRowFocus };
+      window.requestAnimationFrame(() => {
+        const focused = focusParsedRow(pendingFocus.rowId, {
+          block: pendingFocus.block || 'center',
+          behavior: pendingFocus.behavior || 'auto',
+          focusInput: Boolean(pendingFocus.focusInput),
+        });
+        if (focused !== false) {
+          state.pendingRowFocus = null;
+          state.pendingParsedScrollTop = null;
+          state.pendingWindowScrollY = null;
+        }
+      });
+    } else {
+      state.pendingParsedScrollTop = null;
+      state.pendingWindowScrollY = null;
+    }
   }
 
   function renderPages() {
-    if (!els.pageSelect) return;
-    els.pageSelect.innerHTML = '';
-    for (const page of state.pages) {
-      const option = document.createElement('option');
-      option.value = page;
-      option.textContent = page;
-      els.pageSelect.appendChild(option);
-    }
     if (state.pages.length && (!state.currentPage || !state.pages.includes(state.currentPage))) {
       state.currentPage = state.pages[0];
     }
-    if (state.currentPage) els.pageSelect.value = state.currentPage;
     updatePageNav();
   }
 
-  function loadPreview() {
+  function loadPreview(options = {}) {
+    const preserveSelectedRow = Boolean(options && options.preserveSelectedRow);
+    const forceReload = options && Object.prototype.hasOwnProperty.call(options, 'forceReload')
+      ? Boolean(options.forceReload)
+      : true;
     if (!state.jobId || !state.currentPage || !els.previewImage) {
       if (els.previewImage) els.previewImage.removeAttribute('src');
       updatePreviewEmptyState();
       return;
     }
     const url = `/jobs/${state.jobId}/preview/${state.currentPage}?v=${Date.now()}`;
-    els.previewImage.src = url;
-    state.selectedRowId = null;
+    const currentSrc = String(els.previewImage.getAttribute('src') || '').trim();
+    if (forceReload || currentSrc !== url) {
+      els.previewImage.src = url;
+    }
+    if (!preserveSelectedRow) {
+      state.selectedRowId = null;
+    }
     drawSelectedBound();
     updatePreviewEmptyState();
   }
@@ -2000,12 +2595,43 @@
   function updatePageNav() {
     const total = state.pages.length;
     const idx = total ? state.pages.indexOf(state.currentPage) : -1;
-    if (els.pageIndicator) {
-      els.pageIndicator.textContent = total ? `${idx >= 0 ? idx + 1 : 0}/${total}` : '0/0';
-    }
+    if (els.pageCount) els.pageCount.textContent = String(total);
+    if (els.pageNumberInput) els.pageNumberInput.value = String(total ? getCurrentPageNumber() : 0);
+    if (els.pageFirstBtn) els.pageFirstBtn.disabled = !(idx > 0);
     if (els.pagePrevBtn) els.pagePrevBtn.disabled = !(idx > 0);
     if (els.pageNextBtn) els.pageNextBtn.disabled = !(idx >= 0 && idx < total - 1);
+    if (els.pageLastBtn) els.pageLastBtn.disabled = !(idx >= 0 && idx < total - 1);
     if (els.parsedDebugToggleBtn) els.parsedDebugToggleBtn.disabled = !state.jobId || !state.currentPage;
+  }
+
+  function sanitizePageNumberInput() {
+    if (!els.pageNumberInput) return '';
+    const digits = els.pageNumberInput.value.replace(/\D+/g, '');
+    els.pageNumberInput.value = digits;
+    return digits;
+  }
+
+  function commitPageNumberInput() {
+    if (!els.pageNumberInput) return;
+    const total = getTotalPageCount();
+    if (total <= 0) {
+      els.pageNumberInput.value = '0';
+      return;
+    }
+    const digits = sanitizePageNumberInput();
+    const nextPage = findPageKeyByNumber(digits);
+    if (!nextPage) {
+      updatePageNav();
+      return;
+    }
+    if (state.currentPage === nextPage) {
+      updatePageNav();
+      return;
+    }
+    state.currentPage = nextPage;
+    state.selectedRowId = null;
+    updatePageNav();
+    loadCurrentPageData().catch((err) => alert(`Page load failed: ${err.message}`));
   }
 
   async function loadCurrentPageData() {
@@ -2051,11 +2677,12 @@
     const pages = (cleaned.pages || [])
       .map((name) => String(name || '').replace(/\.png$/i, ''))
       .filter(Boolean)
-      .sort();
+      .sort((a, b) => pageSortValue(a) - pageSortValue(b));
 
-    state.pages = pages;
-    state.currentPage = pages[0] || null;
+    state.pages = state.reversePageOrder ? pages.slice().reverse() : pages;
+    state.currentPage = state.pages[0] || null;
     state.parsedByPage = {};
+    state.baselineParsedByPage = {};
     state.boundsByPage = {};
     state.openaiRawByPage = {};
     state.pageProfileByPage = parsePageProfilesFromDiagnostics(diagnostics);
@@ -2069,6 +2696,9 @@
     renderPages();
     await loadCurrentPageData();
     renderDisbalanceTable();
+    ensureAllPagesParsedLoaded().catch(() => {
+      renderDisbalanceTable();
+    });
     updateExportAvailability();
     updatePreviewEmptyState();
   }
@@ -2121,6 +2751,8 @@
     if (els.startBtn) els.startBtn.disabled = false;
     state.isCompleted = false;
     state.totalParsedRows = 0;
+    state.reversePageOrder = Boolean(status?.is_reversed);
+    state.baselineParsedByPage = {};
     state.openaiRawByPage = {};
     state.pageProfileByPage = {};
     state.disbalanceLoading = false;
@@ -2218,7 +2850,8 @@
         status: resolvedStatus,
         step: resolvedStep,
         progress: resolvedProgress,
-        parseMode: latestStatus?.parse_mode || existing?.parseMode
+        parseMode: latestStatus?.parse_mode || existing?.parseMode,
+        isReversed: Boolean(latestStatus?.is_reversed)
       });
 
       if (state.jobId === id) {
@@ -2299,12 +2932,23 @@
     });
   }
 
-  if (els.pageSelect) {
-    els.pageSelect.addEventListener('change', () => {
-      state.currentPage = els.pageSelect.value;
+  if (els.pageNumberInput) {
+    els.pageNumberInput.addEventListener('input', sanitizePageNumberInput);
+    els.pageNumberInput.addEventListener('change', commitPageNumberInput);
+    els.pageNumberInput.addEventListener('blur', commitPageNumberInput);
+    els.pageNumberInput.addEventListener('keydown', (evt) => {
+      if (evt.key !== 'Enter') return;
+      evt.preventDefault();
+      commitPageNumberInput();
+    });
+  }
+  if (els.pageFirstBtn) {
+    els.pageFirstBtn.addEventListener('click', () => {
+      if (!state.pages.length) return;
+      state.currentPage = state.pages[0];
       state.selectedRowId = null;
-      updatePageNav();
       loadCurrentPageData().catch((err) => alert(`Page load failed: ${err.message}`));
+      updatePageNav();
     });
   }
   if (els.pagePrevBtn) {
@@ -2312,7 +2956,6 @@
       const idx = state.pages.indexOf(state.currentPage);
       if (idx <= 0) return;
       state.currentPage = state.pages[idx - 1];
-      if (els.pageSelect) els.pageSelect.value = state.currentPage;
       state.selectedRowId = null;
       loadCurrentPageData().catch((err) => alert(`Page load failed: ${err.message}`));
       updatePageNav();
@@ -2323,7 +2966,15 @@
       const idx = state.pages.indexOf(state.currentPage);
       if (idx < 0 || idx >= state.pages.length - 1) return;
       state.currentPage = state.pages[idx + 1];
-      if (els.pageSelect) els.pageSelect.value = state.currentPage;
+      state.selectedRowId = null;
+      loadCurrentPageData().catch((err) => alert(`Page load failed: ${err.message}`));
+      updatePageNav();
+    });
+  }
+  if (els.pageLastBtn) {
+    els.pageLastBtn.addEventListener('click', () => {
+      if (!state.pages.length) return;
+      state.currentPage = state.pages[state.pages.length - 1];
       state.selectedRowId = null;
       loadCurrentPageData().catch((err) => alert(`Page load failed: ${err.message}`));
       updatePageNav();
