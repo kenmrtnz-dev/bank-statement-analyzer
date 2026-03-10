@@ -3,9 +3,7 @@
 (() => {
   const STORAGE_KEY = 'bsa_uploaded_jobs_v1';
   const MODE_STORAGE_KEY = 'bsa_process_mode_v1';
-  const PROCESSING_GOOGLE_VISION_PARSER_STORAGE_KEY = 'bsa_processing_google_vision_parser_v1';
   const SUPPORTED_PROCESS_MODES = new Set(['auto']);
-  const SUPPORTED_GOOGLE_VISION_PARSERS = new Set(['auto', 'sterling_bank_of_asia', 'bdo', 'generic']);
   const EDITABLE_ROW_FIELDS = ['date', 'description', 'debit', 'credit', 'balance'];
   const AMOUNT_ROW_FIELDS = new Set(['debit', 'credit', 'balance']);
   const ROW_SAVE_DEBOUNCE_MS = 220;
@@ -182,59 +180,17 @@
     return normalizeRequestedProcessMode(els.mode.value);
   }
 
-  function normalizeRequestedGoogleVisionParser(value) {
-    const parser = String(value || '').trim().toLowerCase();
-    return SUPPORTED_GOOGLE_VISION_PARSERS.has(parser) ? parser : 'auto';
-  }
-
-  function getProcessingGoogleVisionParser() {
-    if (!els.processingGoogleVisionParser) return 'auto';
-    return normalizeRequestedGoogleVisionParser(els.processingGoogleVisionParser.value);
-  }
-
-  function applyProcessingGoogleVisionParserValue(nextParser) {
-    if (!els.processingGoogleVisionParser) return;
-    const safe = normalizeRequestedGoogleVisionParser(nextParser);
-    els.processingGoogleVisionParser.value = safe;
-    try {
-      localStorage.setItem(PROCESSING_GOOGLE_VISION_PARSER_STORAGE_KEY, safe);
-    } catch {
-      // no-op
-    }
-  }
-
   function setGoogleVisionReparseVisibility(diagnostics) {
-    const job = diagnostics && typeof diagnostics === 'object' ? diagnostics.job : null;
-    const source = String(job?.ocr_source || '').trim().toLowerCase();
-    const visible = state.view === 'processing' && Boolean(state.jobId) && source === 'google_vision';
     if (els.processingGoogleVisionParserWrap) {
-      els.processingGoogleVisionParserWrap.classList.toggle('hidden', !visible);
+      els.processingGoogleVisionParserWrap.classList.add('hidden');
     }
     if (els.processingGoogleVisionParser) {
-      els.processingGoogleVisionParser.disabled = !visible || state.googleVisionParserInFlight;
+      els.processingGoogleVisionParser.disabled = true;
     }
-    if (!visible) return;
-    const requestedParser = normalizeRequestedGoogleVisionParser(
-      String(job?.parser_profile_requested || '').trim().toLowerCase()
-    );
-    const usedParser = normalizeRequestedGoogleVisionParser(
-      String(job?.parser_profile_used || '').trim().toLowerCase()
-    );
-    const parserFromJob = requestedParser === 'auto' ? usedParser : requestedParser;
-    applyProcessingGoogleVisionParserValue(parserFromJob);
   }
 
   function initProcessingGoogleVisionParser() {
-    if (!els.processingGoogleVisionParser) return;
-    let initialParser = 'auto';
-    try {
-      initialParser = normalizeRequestedGoogleVisionParser(
-        localStorage.getItem(PROCESSING_GOOGLE_VISION_PARSER_STORAGE_KEY)
-      );
-    } catch {
-      initialParser = 'auto';
-    }
-    els.processingGoogleVisionParser.value = initialParser;
+    if (els.processingGoogleVisionParser) els.processingGoogleVisionParser.disabled = true;
   }
 
   function initRequestedProcessMode() {
@@ -262,28 +218,6 @@
         // no-op
       }
     });
-  }
-
-  async function reparseGoogleVisionJob(jobId = state.jobId) {
-    const id = String(jobId || '').trim();
-    if (!id) return;
-    const parser = getProcessingGoogleVisionParser();
-    if (state.googleVisionParserInFlight) return;
-    state.googleVisionParserInFlight = true;
-    setGoogleVisionReparseVisibility(state.parseDiagnostics || null);
-    try {
-      const payload = await api(`/jobs/${id}/reparse-google-vision?parser=${encodeURIComponent(parser)}`, {
-        method: 'POST'
-      });
-      setStatus(payload);
-      await loadResultData();
-      showToast(`Reparsed with ${parser}.`, 'success');
-    } catch (err) {
-      alert(`Reparse failed: ${normalizeApiErrorMessage(err?.message)}`);
-    } finally {
-      state.googleVisionParserInFlight = false;
-      setGoogleVisionReparseVisibility(state.parseDiagnostics || null);
-    }
   }
 
   async function reconcileStoredJobsStatuses() {
@@ -2880,21 +2814,6 @@
 
   if (els.form) els.form.addEventListener('submit', createJob);
   if (els.startBtn) els.startBtn.addEventListener('click', () => startJob());
-  if (els.processingGoogleVisionParser) {
-    els.processingGoogleVisionParser.addEventListener('change', () => {
-      const selected = getProcessingGoogleVisionParser();
-      applyProcessingGoogleVisionParserValue(selected);
-      if (els.processingGoogleVisionParserWrap?.classList.contains('hidden')) return;
-      const currentRequested = normalizeRequestedGoogleVisionParser(
-        String(state.parseDiagnostics?.job?.parser_profile_requested || '').trim().toLowerCase()
-      );
-      const currentUsed = normalizeRequestedGoogleVisionParser(
-        String(state.parseDiagnostics?.job?.parser_profile_used || '').trim().toLowerCase()
-      );
-      if (selected === currentRequested || (currentRequested === 'auto' && selected === currentUsed)) return;
-      reparseGoogleVisionJob();
-    });
-  }
   if (els.exportCrm) {
     els.exportCrm.addEventListener('click', (e) => {
       e.preventDefault();

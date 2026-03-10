@@ -302,27 +302,7 @@ def test_job_flow_with_google_vision_uses_modern_pipeline(client, monkeypatch):
     assert payload["pages"]["page_001"]["rows_parsed"] == 1
 
 
-def test_reparse_google_vision_endpoint_uses_processing_parser_choice(client, monkeypatch):
-    monkeypatch.setattr(jobs_service, "resolve_parse_mode", lambda *_args, **_kwargs: "google_vision")
-    monkeypatch.setattr(
-        jobs_service,
-        "parse_google_vision_raw_payload",
-        lambda raw_payload, parser_profile="auto", detected_bank="generic": (
-            [
-                {
-                    "row_number": 1,
-                    "page_number": 1,
-                    "date": "2026-03-01",
-                    "description": f"parsed-with-{parser_profile}",
-                    "debit": None,
-                    "credit": "100.00",
-                    "balance": "100.00",
-                }
-            ],
-            parser_profile,
-        ),
-    )
-
+def test_reparse_google_vision_endpoint_removed(client):
     create = client.post(
         "/jobs",
         files={"file": ("statement.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
@@ -330,90 +310,9 @@ def test_reparse_google_vision_endpoint_uses_processing_parser_choice(client, mo
     )
     assert create.status_code == 200
     job_id = create.json()["job_id"]
-
-    repo = jobs_service.JobsRepository(jobs_service.DATA_DIR)
-    repo.write_json(
-        repo.path(job_id, "ocr", "page_001.google_vision_raw.json"),
-        {"provider": "google_vision", "page_count": 1, "pages": []},
-    )
-    repo.write_json(
-        repo.path(job_id, "result", "parse_diagnostics.json"),
-        {"job": {"bank": "bdo", "ocr_source": "google_vision"}, "pages": {}},
-    )
-
-    res = client.post(f"/jobs/{job_id}/reparse-google-vision?parser=sterling_bank_of_asia")
-    assert res.status_code == 200
-    payload = res.json()
-    assert payload["status"] == "done"
-    assert payload["parse_mode"] == "google_vision"
-    assert payload["parser_profile_used"] == "sterling_bank_of_asia"
-
-    parsed = client.get(f"/jobs/{job_id}/parsed")
-    assert parsed.status_code == 200
-    assert parsed.json()["page_001"][0]["description"] == "parsed-with-sterling_bank_of_asia"
-
-
-def test_reparse_google_vision_keeps_rows_split_per_page(client, monkeypatch):
-    monkeypatch.setattr(jobs_service, "resolve_parse_mode", lambda *_args, **_kwargs: "google_vision")
-    monkeypatch.setattr(
-        jobs_service,
-        "parse_google_vision_raw_payload",
-        lambda raw_payload, parser_profile="auto", detected_bank="generic": (
-            [
-                {
-                    "row_number": 1,
-                    "page_number": 1,
-                    "date": "2026-03-01",
-                    "description": "page-1-row",
-                    "debit": None,
-                    "credit": "100.00",
-                    "balance": "100.00",
-                },
-                {
-                    "row_number": 2,
-                    "page_number": 2,
-                    "date": "2026-03-02",
-                    "description": "page-2-row",
-                    "debit": "20.00",
-                    "credit": None,
-                    "balance": "80.00",
-                },
-            ],
-            parser_profile,
-        ),
-    )
-
-    create = client.post(
-        "/jobs",
-        files={"file": ("statement.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
-        data={"mode": "google_vision", "auto_start": "false"},
-    )
-    assert create.status_code == 200
-    job_id = create.json()["job_id"]
-
-    repo = jobs_service.JobsRepository(jobs_service.DATA_DIR)
-    repo.write_json(
-        repo.path(job_id, "ocr", "page_001.google_vision_raw.json"),
-        {"provider": "google_vision", "page_count": 2, "pages": []},
-    )
-    repo.write_json(
-        repo.path(job_id, "result", "parse_diagnostics.json"),
-        {"job": {"bank": "generic", "ocr_source": "google_vision"}, "pages": {}},
-    )
 
     res = client.post(f"/jobs/{job_id}/reparse-google-vision?parser=generic")
-    assert res.status_code == 200
-    assert res.json()["pages"] == 2
-
-    parsed = client.get(f"/jobs/{job_id}/parsed")
-    assert parsed.status_code == 200
-    payload = parsed.json()
-    assert payload["page_001"][0]["description"] == "page-1-row"
-    assert payload["page_002"][0]["description"] == "page-2-row"
-
-    cleaned = client.get(f"/jobs/{job_id}/cleaned")
-    assert cleaned.status_code == 200
-    assert cleaned.json()["pages"] == ["page_001.png", "page_002.png"]
+    assert res.status_code == 404
 
 
 def test_cancel_job_endpoint_marks_draft_cancelled(client, monkeypatch):

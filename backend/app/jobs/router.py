@@ -28,7 +28,6 @@ from app.jobs.service import (
     get_status,
     get_summary,
     list_cleaned_pages,
-    reparse_google_vision_job,
     set_job_reversed,
     start_job,
     update_page_rows,
@@ -85,11 +84,6 @@ def start_job_endpoint(
 ):
     payload = start_job(str(job_id), requested_mode=mode, requested_parser=parser)
     return JobStartResponse(**payload)
-
-
-@router.post("/jobs/{job_id}/reparse-google-vision")
-def reparse_google_vision_endpoint(job_id: uuid.UUID, parser: str = Query(default="auto")):
-    return reparse_google_vision_job(str(job_id), requested_parser=parser)
 
 
 @router.post("/jobs/{job_id}/reverse-order")

@@ -21,7 +21,6 @@ from PIL import Image
 from pypdf import PdfReader
 
 from app.jobs.repository import JobResultsRawRepository, JobStateRepository, JobsRepository, JobTransactionsRepository
-from app.parser.pipeline import parse_google_vision_raw_payload
 from app.ocr import prepare_ocr_pages, process_ocr_page, resolve_parse_mode, run_pipeline
 from app.paths import get_data_dir
 from app.pdf_text_extract import extract_pdf_layout_xml
@@ -580,100 +579,6 @@ def get_parse_diagnostics(job_id: str) -> Dict:
         raise HTTPException(status_code=404, detail="parse_diagnostics_not_ready")
     payload = repo.read_json(path, default={})
     return payload if isinstance(payload, dict) else {}
-
-
-def reparse_google_vision_job(job_id: str, requested_parser: str | None = None) -> Dict[str, Any]:
-    """Re-run parser extraction from stored Google Vision OCR raw payload without new OCR calls."""
-    repo = JobsRepository(DATA_DIR)
-    _require_job(repo, job_id)
-
-    parser_profile = _normalize_requested_parser(requested_parser, field_name="requested_parser")
-    raw_path = repo.path(job_id, "ocr", "page_001.google_vision_raw.json")
-    if not raw_path.exists():
-        raise HTTPException(status_code=404, detail="google_vision_ocr_raw_not_ready")
-
-    raw_payload = repo.read_json(raw_path, default={})
-    if not isinstance(raw_payload, dict):
-        raise HTTPException(status_code=422, detail="google_vision_ocr_raw_invalid")
-
-    diagnostics_path = repo.path(job_id, "result", "parse_diagnostics.json")
-    existing_diag = repo.read_json(diagnostics_path, default={})
-    if not isinstance(existing_diag, dict):
-        existing_diag = {}
-    existing_job_diag = existing_diag.get("job") if isinstance(existing_diag.get("job"), dict) else {}
-    detected_bank = str(existing_job_diag.get("bank") or "generic").strip().lower() or "generic"
-
-    transactions, parser_used = parse_google_vision_raw_payload(
-        raw_payload,
-        parser_profile=parser_profile,
-        detected_bank=detected_bank,
-    )
-
-    parsed_output = _normalize_rows_by_page_for_output(_legacy_transactions_to_rows_by_page(transactions))
-    if not parsed_output:
-        parsed_output = {"page_001": []}
-    bounds_output: Dict[str, List[Dict[str, Any]]] = {page_name: [] for page_name in parsed_output.keys()}
-    _persist_parsed_rows(repo, job_id, parsed_output, bounds_by_page=bounds_output, is_manual_edit=False)
-    repo.write_json(repo.path(job_id, "result", "parsed_rows.json"), parsed_output)
-    repo.write_json(repo.path(job_id, "result", "bounds.json"), bounds_output)
-
-    diag_job = dict(existing_job_diag)
-    diag_job.update(
-        {
-            "parse_mode": "google_vision",
-            "source_type": "legacy_parser",
-            "parser_strategy": "v1",
-            "legacy_parser_strategy": "google_vision_raw_parser",
-            "parser_profile_requested": parser_profile,
-            "parser_profile_used": parser_used,
-            "ocr_backend": "google_vision",
-            "ocr_engine_requested": "google_vision",
-            "ocr_source": "google_vision",
-            "bank": detected_bank,
-            "ocr_raw_available": True,
-            "ocr_raw_page_count": int(raw_payload.get("page_count") or 0),
-            "reparsed_at": dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
-        }
-    )
-    diag_pages = {
-        page_name: {"rows_parsed": len(rows), "source_type": "google_vision"}
-        for page_name, rows in parsed_output.items()
-    }
-    repo.write_json(diagnostics_path, {"job": diag_job, "pages": diag_pages})
-
-    rows_flat = _flatten_rows(_load_parsed_rows(repo, job_id, required=True))
-    summary = compute_summary(rows_flat)
-    repo.write_json(repo.path(job_id, "result", "summary.json"), summary)
-
-    done_payload = {
-        "job_id": job_id,
-        "status": "done",
-        "step": "completed",
-        "progress": 100,
-        "parse_mode": "google_vision",
-        "pages": len(parsed_output),
-        "reparsed": True,
-        "parser_profile_used": parser_used,
-        "rows_parsed": sum(len(rows) for rows in parsed_output.values()),
-    }
-    repo.write_status(
-        job_id,
-        {
-            "status": "done",
-            "step": "completed",
-            "progress": 100,
-            "parse_mode": "google_vision",
-            "pages": len(parsed_output),
-        },
-    )
-
-    meta = repo.read_json(repo.path(job_id, "meta.json"), default={})
-    if not isinstance(meta, dict):
-        meta = {}
-    meta["requested_mode"] = "google_vision"
-    meta["requested_parser"] = parser_profile
-    repo.write_json(repo.path(job_id, "meta.json"), meta)
-    return done_payload
 
 
 def export_pdf(job_id: str) -> tuple[bytes, str]:
