@@ -1,4 +1,20 @@
 services:
+  migrate:
+    platform: linux/amd64
+    build:
+      context: .
+    container_name: ocr_migrate
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-ocr}:${POSTGRES_PASSWORD:-ocrpass}@db:${POSTGRES_PORT:-5433}/${POSTGRES_DB:-ocr}
+      DATA_DIR: /data
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["./scripts/migrate.sh"]
+    restart: "no"
+
   api:
     platform: linux/amd64
     build:
@@ -18,6 +34,8 @@ services:
         condition: service_started
       db:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     command: ["./scripts/run-api.sh"]
 
   worker:
@@ -37,6 +55,8 @@ services:
         condition: service_started
       db:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     command: ["./scripts/run-worker.sh"]
 
   redis:

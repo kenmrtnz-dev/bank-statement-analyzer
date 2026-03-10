@@ -137,6 +137,8 @@ For containerized single-machine runs:
 docker compose up --build
 ```
 
+The compose stack now runs a one-shot `migrate` service before `api` and `worker` start, so schema upgrades happen as part of deploy startup instead of during image build.
+
 For local hot reload on top of the production-like compose file:
 
 ```bash
