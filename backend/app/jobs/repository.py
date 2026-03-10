@@ -193,7 +193,31 @@ def ensure_job_transactions_schema(data_dir: str | Path) -> None:
         with _DB_ENGINE_CACHE_GUARD:
             if key in _DB_SCHEMA_READY:
                 return
-        Base.metadata.create_all(engine, tables=[JobTransactionRecord.__table__])
+        inspector = inspect(engine)
+        expected_columns = set(JobTransactionRecord.__table__.c.keys())
+        legacy_columns = {
+            "row_id",
+            "rownumber",
+            "x1",
+            "y1",
+            "x2",
+            "y2",
+            "is_manual_edit",
+        }
+        if "job_transactions" not in inspector.get_table_names():
+            Base.metadata.create_all(engine, tables=[JobTransactionRecord.__table__])
+        else:
+            existing_columns = {column.get("name") for column in inspector.get_columns("job_transactions")}
+            missing_columns = expected_columns - existing_columns
+            if missing_columns:
+                if legacy_columns.issubset(existing_columns):
+                    _rebuild_legacy_job_transactions_schema(engine)
+                else:
+                    missing = ", ".join(sorted(missing_columns))
+                    raise RuntimeError(
+                        "job_transactions schema is incompatible with the current app. "
+                        f"Missing columns: {missing}. Run ./scripts/migrate.sh."
+                    )
         with _DB_ENGINE_CACHE_GUARD:
             _DB_SCHEMA_READY.add(key)
 
@@ -278,6 +302,148 @@ def ensure_jobs_schema(data_dir: str | Path) -> None:
             _DB_SCHEMA_READY.add(key)
 
     _run_schema_bootstrap(data_dir, _apply)
+
+
+def _rebuild_legacy_job_transactions_schema(engine: Engine) -> None:
+    """Rewrite the legacy job_transactions table into the current runtime shape."""
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE IF EXISTS job_transactions_v2"))
+        conn.execute(
+            text(
+                """
+                CREATE TABLE job_transactions_v2 (
+                    id VARCHAR(36) NOT NULL PRIMARY KEY,
+                    job_id VARCHAR(36) NOT NULL,
+                    page_key VARCHAR(32) NOT NULL,
+                    page_number INTEGER NOT NULL,
+                    row_index INTEGER NOT NULL,
+                    row_number INTEGER NULL,
+                    date VARCHAR(32) NULL,
+                    description TEXT NULL,
+                    debit NUMERIC(18, 2) NULL,
+                    credit NUMERIC(18, 2) NULL,
+                    balance NUMERIC(18, 2) NULL,
+                    row_number_bounds JSONB NULL,
+                    date_bounds JSONB NULL,
+                    debit_bounds JSONB NULL,
+                    credit_bounds JSONB NULL,
+                    balance_bounds JSONB NULL,
+                    row_type VARCHAR(32) NOT NULL,
+                    is_new_row BOOLEAN NOT NULL DEFAULT FALSE,
+                    is_modified BOOLEAN NOT NULL DEFAULT FALSE,
+                    is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at TIMESTAMPTZ NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO job_transactions_v2 (
+                    id,
+                    job_id,
+                    page_key,
+                    page_number,
+                    row_index,
+                    row_number,
+                    date,
+                    description,
+                    debit,
+                    credit,
+                    balance,
+                    row_number_bounds,
+                    date_bounds,
+                    debit_bounds,
+                    credit_bounds,
+                    balance_bounds,
+                    row_type,
+                    is_new_row,
+                    is_modified,
+                    is_deleted,
+                    created_at,
+                    updated_at
+                )
+                SELECT
+                    legacy.id,
+                    legacy.job_id,
+                    CASE
+                        WHEN legacy.page_key ~ '^page_[0-9]+$' THEN 'page_' || LPAD(SPLIT_PART(legacy.page_key, '_', 2), 3, '0')
+                        WHEN legacy.page_key ~ '^[0-9]+$' THEN 'page_' || LPAD(legacy.page_key, 3, '0')
+                        ELSE legacy.page_key
+                    END AS page_key,
+                    CASE
+                        WHEN legacy.page_key ~ '^page_[0-9]+$' THEN CAST(SPLIT_PART(legacy.page_key, '_', 2) AS INTEGER)
+                        WHEN legacy.page_key ~ '^[0-9]+$' THEN CAST(legacy.page_key AS INTEGER)
+                        ELSE 0
+                    END AS page_number,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY legacy.job_id
+                        ORDER BY
+                            CASE
+                                WHEN legacy.page_key ~ '^page_[0-9]+$' THEN CAST(SPLIT_PART(legacy.page_key, '_', 2) AS INTEGER)
+                                WHEN legacy.page_key ~ '^[0-9]+$' THEN CAST(legacy.page_key AS INTEGER)
+                                ELSE 0
+                            END,
+                            legacy.row_index,
+                            legacy.id
+                    ) AS row_index,
+                    CASE
+                        WHEN legacy.rownumber IS NOT NULL THEN legacy.rownumber
+                        WHEN REGEXP_REPLACE(COALESCE(legacy.row_number, ''), '[^0-9]', '', 'g') <> '' THEN
+                            CAST(REGEXP_REPLACE(legacy.row_number, '[^0-9]', '', 'g') AS INTEGER)
+                        ELSE NULL
+                    END AS row_number,
+                    legacy.date,
+                    legacy.description,
+                    legacy.debit,
+                    legacy.credit,
+                    legacy.balance,
+                    CASE
+                        WHEN legacy.x1 IS NULL OR legacy.y1 IS NULL OR legacy.x2 IS NULL OR legacy.y2 IS NULL THEN NULL
+                        ELSE JSONB_BUILD_OBJECT('x1', legacy.x1, 'y1', legacy.y1, 'x2', legacy.x2, 'y2', legacy.y2)
+                    END AS row_number_bounds,
+                    CASE
+                        WHEN legacy.x1 IS NULL OR legacy.y1 IS NULL OR legacy.x2 IS NULL OR legacy.y2 IS NULL THEN NULL
+                        ELSE JSONB_BUILD_OBJECT('x1', legacy.x1, 'y1', legacy.y1, 'x2', legacy.x2, 'y2', legacy.y2)
+                    END AS date_bounds,
+                    CASE
+                        WHEN legacy.x1 IS NULL OR legacy.y1 IS NULL OR legacy.x2 IS NULL OR legacy.y2 IS NULL THEN NULL
+                        ELSE JSONB_BUILD_OBJECT('x1', legacy.x1, 'y1', legacy.y1, 'x2', legacy.x2, 'y2', legacy.y2)
+                    END AS debit_bounds,
+                    CASE
+                        WHEN legacy.x1 IS NULL OR legacy.y1 IS NULL OR legacy.x2 IS NULL OR legacy.y2 IS NULL THEN NULL
+                        ELSE JSONB_BUILD_OBJECT('x1', legacy.x1, 'y1', legacy.y1, 'x2', legacy.x2, 'y2', legacy.y2)
+                    END AS credit_bounds,
+                    CASE
+                        WHEN legacy.x1 IS NULL OR legacy.y1 IS NULL OR legacy.x2 IS NULL OR legacy.y2 IS NULL THEN NULL
+                        ELSE JSONB_BUILD_OBJECT('x1', legacy.x1, 'y1', legacy.y1, 'x2', legacy.x2, 'y2', legacy.y2)
+                    END AS balance_bounds,
+                    legacy.row_type,
+                    FALSE AS is_new_row,
+                    COALESCE(legacy.is_manual_edit, FALSE) AS is_modified,
+                    FALSE AS is_deleted,
+                    legacy.created_at,
+                    legacy.updated_at
+                FROM job_transactions AS legacy
+                """
+            )
+        )
+        conn.execute(text("DROP INDEX IF EXISTS ix_job_transactions_job_page"))
+        conn.execute(text("DROP INDEX IF EXISTS ix_job_transactions_job_id"))
+        conn.execute(text("DROP TABLE job_transactions"))
+        conn.execute(text("ALTER TABLE job_transactions_v2 RENAME TO job_transactions"))
+        conn.execute(text("CREATE INDEX ix_job_transactions_job_id ON job_transactions (job_id)"))
+        conn.execute(text("CREATE INDEX ix_job_transactions_job_page ON job_transactions (job_id, page_key)"))
+        conn.execute(
+            text(
+                """
+                ALTER TABLE job_transactions
+                ADD CONSTRAINT uq_job_transactions_job_row_index UNIQUE (job_id, row_index)
+                """
+            )
+        )
 
 
 def _to_decimal(value: Any) -> Decimal | None:
