@@ -18,11 +18,13 @@ from xml.sax.saxutils import escape as xml_escape
 from fastapi import HTTPException
 from pdf2image import convert_from_path
 from PIL import Image
+from pypdf import PdfReader
 
-from app.jobs.repository import JobsRepository, JobTransactionsRepository
+from app.jobs.repository import JobResultsRawRepository, JobStateRepository, JobsRepository, JobTransactionsRepository
 from app.parser.pipeline import parse_google_vision_raw_payload, process_document as run_legacy_parser_document
 from app.ocr import prepare_ocr_pages, process_ocr_page, resolve_parse_mode, run_pipeline
 from app.paths import get_data_dir
+from app.pdf_text_extract import extract_pdf_layout_xml
 from app.statement_parser import normalize_date
 
 DATA_DIR = get_data_dir()
@@ -125,8 +127,10 @@ def create_job(
     normalized_requested_parser = _normalize_requested_parser(requested_parser, field_name="requested_parser")
     meta_payload: Dict[str, Any] = {
         "original_filename": filename,
+        "file_size": len(file_bytes),
         "requested_mode": normalized_requested_mode,
         "requested_parser": normalized_requested_parser,
+        "is_reversed": False,
         "created_at": dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
     }
     owner_username = str(created_by or "").strip()
@@ -286,8 +290,15 @@ def get_status(job_id: str) -> Dict:
     repo = JobsRepository(DATA_DIR)
     _require_job(repo, job_id)
     status = repo.read_status(job_id)
+    job_state_repo = JobStateRepository(DATA_DIR)
+    job_state = job_state_repo.get_job(job_id) or {}
+    if not job_state:
+        meta = repo.read_json(repo.path(job_id, "meta.json"), default={})
+        if isinstance(meta, dict):
+            job_state_repo.sync_job(job_id=job_id, meta=meta, status=status if isinstance(status, dict) else {})
+            job_state = job_state_repo.get_job(job_id) or {}
     if not status:
-        return {"status": "queued", "step": "queued", "progress": 0}
+        return {"status": "queued", "step": "queued", "progress": 0, **job_state}
 
     payload = dict(status)
     parse_mode = str(payload.get("parse_mode") or "auto")
@@ -319,6 +330,7 @@ def get_status(job_id: str) -> Dict:
             if int(payload.get("pages_total") or 0) > 0 and int(payload.get("pages_inflight") or 0) == 0:
                 payload = finalize_job_processing(job_id=job_id, parse_mode=parse_mode)
         payload["progress"] = _coerce_progress(payload.get("progress"), 0)
+        payload["is_reversed"] = bool(job_state.get("is_reversed", False))
         return payload
 
     task_id = str(payload.get("task_id") or "").strip()
@@ -335,7 +347,23 @@ def get_status(job_id: str) -> Dict:
             payload = repo.read_status(job_id)
 
     payload["progress"] = _coerce_progress(payload.get("progress"), 0)
+    payload["is_reversed"] = bool(job_state.get("is_reversed", False))
     return payload
+
+
+def set_job_reversed(job_id: str, is_reversed: bool) -> Dict[str, Any]:
+    repo = JobsRepository(DATA_DIR)
+    _require_job(repo, job_id)
+    meta = repo.read_json(repo.path(job_id, "meta.json"), default={})
+    if not isinstance(meta, dict):
+        meta = {}
+    meta["is_reversed"] = bool(is_reversed)
+    repo.write_json(repo.path(job_id, "meta.json"), meta)
+    try:
+        JobStateRepository(DATA_DIR).set_reversed(job_id=job_id, is_reversed=bool(is_reversed))
+    except KeyError:
+        JobStateRepository(DATA_DIR).sync_job(job_id=job_id, meta=meta, status=repo.read_status(job_id))
+    return {"job_id": job_id, "is_reversed": bool(is_reversed)}
 
 
 def list_cleaned_pages(job_id: str) -> List[str]:
@@ -343,13 +371,33 @@ def list_cleaned_pages(job_id: str) -> List[str]:
     _require_job(repo, job_id)
 
     files = repo.list_png(job_id, "cleaned")
+    pdf_pages = _list_input_pdf_pages(repo, job_id)
     if files:
+        if pdf_pages and set(files) != set(pdf_pages):
+            return pdf_pages
         return files
+
+    if pdf_pages:
+        return pdf_pages
 
     parsed = _load_parsed_rows(repo, job_id)
     if parsed:
         return [f"{key}.png" for key in sorted(parsed.keys())]
     return []
+
+
+def _list_input_pdf_pages(repo: JobsRepository, job_id: str) -> List[str]:
+    input_pdf = repo.path(job_id, "input", "document.pdf")
+    if not input_pdf.exists():
+        return []
+    try:
+        reader = PdfReader(str(input_pdf))
+        total = len(reader.pages or [])
+    except Exception:
+        return []
+    if total <= 0:
+        return []
+    return [f"page_{idx:03}.png" for idx in range(1, total + 1)]
 
 
 def get_cleaned_path(job_id: str, filename: str) -> Path:
@@ -791,6 +839,9 @@ def process_job(job_id: str, parse_mode: str, task_id: Optional[str] = None) -> 
             if isinstance(raw_payload, dict):
                 diagnostics["job"]["ocr_raw_page_count"] = int(raw_payload.get("page_count") or 0)
             repo.write_json(repo.path(job_id, "ocr", "page_001.google_vision_raw.json"), raw_payload)
+            _persist_job_raw_result(repo, job_id, is_ocr=True, raw_json=raw_payload)
+        elif selected_mode == "pdftotext":
+            _persist_job_raw_result(repo, job_id, is_ocr=False, raw_xml=_read_job_text_layer_xml(repo, job_id))
 
         _persist_parsed_rows(repo, job_id, parsed_output, bounds_by_page=bounds_output, is_manual_edit=False)
         repo.write_json(repo.path(job_id, "result", "parsed_rows.json"), parsed_output)
@@ -818,6 +869,7 @@ def process_job(job_id: str, parse_mode: str, task_id: Optional[str] = None) -> 
         result = run_pipeline(root, parse_mode, report=report)
         parsed_output = _normalize_rows_by_page_for_output(result.get("parsed_rows") or {})
         bounds_output = result.get("bounds") if isinstance(result.get("bounds"), dict) else {}
+        _persist_job_raw_result(repo, job_id, is_ocr=False, raw_xml=_read_job_text_layer_xml(repo, job_id))
         _persist_parsed_rows(repo, job_id, parsed_output, bounds_by_page=bounds_output, is_manual_edit=False)
         rows = _flatten_rows(_load_parsed_rows(repo, job_id, required=True))
         summary = compute_summary(rows)
@@ -1092,6 +1144,7 @@ def finalize_job_processing(job_id: str, parse_mode: str, task_id: Optional[str]
 
     result_dir = repo.path(job_id, "result")
     parsed_output = _normalize_rows_by_page_for_output(parsed_output)
+    _persist_job_raw_result(repo, job_id, is_ocr=True, raw_json=_collect_ocr_raw_payload(repo, job_id, page_files))
     _persist_parsed_rows(repo, job_id, parsed_output, bounds_by_page=bounds_output, is_manual_edit=False)
     repo.write_json(result_dir / "parsed_rows.json", parsed_output)
     repo.write_json(result_dir / "bounds.json", bounds_output)
@@ -1127,6 +1180,62 @@ def finalize_job_processing(job_id: str, parse_mode: str, task_id: Optional[str]
         final_payload["task_id"] = task_id
     repo.write_status(job_id, final_payload)
     return final_payload
+
+
+def _read_job_text_layer_xml(repo: JobsRepository, job_id: str) -> str | None:
+    input_pdf = repo.path(job_id, "input", "document.pdf")
+    if not input_pdf.exists():
+        return None
+    try:
+        return extract_pdf_layout_xml(str(input_pdf))
+    except Exception:
+        return None
+
+
+def _collect_ocr_raw_payload(repo: JobsRepository, job_id: str, page_files: list[str]) -> dict[str, Any]:
+    payload: dict[str, Any] = {"pages": {}}
+    for page_file in page_files:
+        page_name = normalize_page_name(str(page_file).replace(".png", ""))
+        page_payload: dict[str, Any] = {}
+
+        ocr_path = repo.path(job_id, "ocr", f"{page_name}.json")
+        if ocr_path.exists():
+            page_payload["ocr_items"] = repo.read_json(ocr_path, default=[])
+
+        openai_path = repo.path(job_id, "ocr", f"{page_name}.openai_raw.json")
+        if openai_path.exists():
+            page_payload["openai_raw"] = repo.read_json(openai_path, default={})
+
+        google_path = repo.path(job_id, "ocr", f"{page_name}.google_vision_raw.json")
+        if google_path.exists():
+            page_payload["google_vision_raw"] = repo.read_json(google_path, default={})
+
+        if page_payload:
+            payload["pages"][page_name] = page_payload
+
+    return payload
+
+
+def _persist_job_raw_result(
+    repo: JobsRepository,
+    job_id: str,
+    *,
+    is_ocr: bool,
+    raw_xml: str | None = None,
+    raw_json: dict[str, Any] | list[Any] | None = None,
+) -> None:
+    if raw_xml is None and raw_json is None:
+        return
+    try:
+        JobResultsRawRepository(DATA_DIR).upsert(
+            job_id=str(job_id),
+            is_ocr=bool(is_ocr),
+            raw_xml=raw_xml,
+            raw_json=raw_json,
+        )
+    except Exception:
+        # Raw-source persistence is non-critical and should not fail the parsing job.
+        pass
 
 
 def mark_job_retrying(
@@ -1619,6 +1728,177 @@ def _normalize_row_amount_output(value) -> float | None:
         return float(cleaned)
     except Exception:
         return None
+
+
+def _normalize_flow_amount_output(value) -> float | None:
+    amount = _normalize_row_amount_output(value)
+    if amount is None:
+        return None
+    if abs(amount) <= 0.005:
+        return None
+    return amount
+
+
+def _output_amounts_match(left: float | None, right: float | None, tolerance: float = 0.01) -> bool:
+    if left is None or right is None:
+        return False
+    return abs(left - right) <= tolerance
+
+
+def _output_flow_description_bias(description: str | None) -> str | None:
+    lowered = str(description or "").strip().lower()
+    if not lowered:
+        return None
+
+    debit_markers = (
+        "withdrawal",
+        "withdraw",
+        "service fee",
+        "fee",
+        "bills payment",
+        "bill payment",
+        "instapay-send",
+        "instapay send",
+        "payment",
+        "send",
+    )
+    credit_markers = (
+        "reversal",
+        "refund",
+        "deposit",
+        "interest",
+        "incoming",
+        "received",
+        "transfer in",
+        "cash in",
+    )
+
+    has_debit = any(marker in lowered for marker in debit_markers)
+    has_credit = any(marker in lowered for marker in credit_markers)
+    if has_debit and not has_credit:
+        return "debit"
+    if has_credit and not has_debit:
+        return "credit"
+    return None
+
+
+def _expected_output_balance_for_flow(
+    prev_balance: float,
+    debit: float | None,
+    credit: float | None,
+    flow_direction: str,
+) -> float:
+    debit_value = debit or 0.0
+    credit_value = credit or 0.0
+    if flow_direction == "descending":
+        return prev_balance + debit_value - credit_value
+    return prev_balance - debit_value + credit_value
+
+
+def _infer_output_balance_flow_direction(page_rows: List[Dict]) -> str | None:
+    prev_balance: float | None = None
+    ascending_hits = 0
+    descending_hits = 0
+
+    for row in page_rows:
+        curr_balance = row.get("balance") if isinstance(row.get("balance"), (int, float)) else None
+        debit = _normalize_flow_amount_output(row.get("debit"))
+        credit = _normalize_flow_amount_output(row.get("credit"))
+
+        if prev_balance is not None and curr_balance is not None:
+            if debit is not None and credit is None:
+                if _output_amounts_match(prev_balance - debit, curr_balance):
+                    ascending_hits += 1
+                if _output_amounts_match(prev_balance + debit, curr_balance):
+                    descending_hits += 1
+            elif credit is not None and debit is None:
+                if _output_amounts_match(prev_balance + credit, curr_balance):
+                    ascending_hits += 1
+                if _output_amounts_match(prev_balance - credit, curr_balance):
+                    descending_hits += 1
+
+        if curr_balance is not None:
+            prev_balance = curr_balance
+
+    if ascending_hits > descending_hits:
+        return "ascending"
+    if descending_hits > ascending_hits:
+        return "descending"
+    return None
+
+
+def _sanitize_output_row_amounts(
+    row_copy: Dict,
+    *,
+    prev_balance: float | None,
+    curr_balance: float | None,
+    flow_direction: str | None,
+) -> None:
+    debit = _normalize_flow_amount_output(row_copy.get("debit"))
+    credit = _normalize_flow_amount_output(row_copy.get("credit"))
+    row_copy["debit"] = debit
+    row_copy["credit"] = credit
+    if debit is None or credit is None:
+        return
+
+    if prev_balance is not None and curr_balance is not None and flow_direction:
+        debit_matches = _output_amounts_match(
+            _expected_output_balance_for_flow(prev_balance, debit, None, flow_direction),
+            curr_balance,
+        )
+        credit_matches = _output_amounts_match(
+            _expected_output_balance_for_flow(prev_balance, None, credit, flow_direction),
+            curr_balance,
+        )
+        if debit_matches and not credit_matches:
+            row_copy["credit"] = None
+            return
+        if credit_matches and not debit_matches:
+            row_copy["debit"] = None
+            return
+
+    if prev_balance is not None and curr_balance is not None:
+        delta = abs(curr_balance - prev_balance)
+        debit_matches_delta = _output_amounts_match(delta, abs(debit))
+        credit_matches_delta = _output_amounts_match(delta, abs(credit))
+        if debit_matches_delta and not credit_matches_delta:
+            row_copy["credit"] = None
+            return
+        if credit_matches_delta and not debit_matches_delta:
+            row_copy["debit"] = None
+            return
+
+    description_bias = _output_flow_description_bias(row_copy.get("description"))
+    if description_bias == "debit":
+        row_copy["credit"] = None
+        return
+    if description_bias == "credit":
+        row_copy["debit"] = None
+        return
+
+    row_copy["debit"] = None
+    row_copy["credit"] = None
+
+
+def _sanitize_rows_single_sided_for_output(page_rows: List[Dict]) -> List[Dict]:
+    sanitized: List[Dict] = []
+    prev_balance: float | None = None
+    flow_direction = _infer_output_balance_flow_direction(page_rows)
+
+    for row in page_rows:
+        row_copy = dict(row)
+        curr_balance = row_copy.get("balance") if isinstance(row_copy.get("balance"), (int, float)) else None
+        _sanitize_output_row_amounts(
+            row_copy,
+            prev_balance=prev_balance,
+            curr_balance=curr_balance,
+            flow_direction=flow_direction,
+        )
+        sanitized.append(row_copy)
+        if curr_balance is not None:
+            prev_balance = curr_balance
+
+    return sanitized
 
 
 def _normalize_rows_by_page_for_output(rows_by_page: Dict[str, List[Dict]]) -> Dict[str, List[Dict]]:

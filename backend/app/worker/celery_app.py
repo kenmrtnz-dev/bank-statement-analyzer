@@ -1,31 +1,13 @@
 from __future__ import annotations
 
-import os
-
 from celery import Celery
+from app.settings import _env_bool, _env_int, load_settings
 
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name, str(default))
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return default
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = str(os.getenv(name, str(default))).strip().lower()
-    if raw in {"1", "true", "yes", "on"}:
-        return True
-    if raw in {"0", "false", "no", "off"}:
-        return False
-    return default
-
-
-REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
-CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", REDIS_URL)
-CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", CELERY_BROKER_URL)
-CELERY_TASK_DEFAULT_QUEUE = os.getenv("CELERY_TASK_DEFAULT_QUEUE", "jobs")
+_SETTINGS = load_settings()
+REDIS_URL = _SETTINGS.redis_url
+CELERY_BROKER_URL = _SETTINGS.celery_broker_url
+CELERY_RESULT_BACKEND = _SETTINGS.celery_result_backend
+CELERY_TASK_DEFAULT_QUEUE = _SETTINGS.celery_task_default_queue
 
 celery = Celery(
     "bank_statement_analyzer",
@@ -33,6 +15,8 @@ celery = Celery(
     backend=CELERY_RESULT_BACKEND,
     include=["app.worker.tasks"],
 )
+
+_SETTINGS.validate_for_worker()
 
 celery.conf.update(
     task_default_queue=CELERY_TASK_DEFAULT_QUEUE,

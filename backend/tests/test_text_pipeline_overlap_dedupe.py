@@ -288,6 +288,53 @@ def test_repair_page_flow_columns_still_swaps_wrong_side_on_ascending_pages():
     assert repaired[2]["credit"] is None
 
 
+def test_repair_page_flow_columns_drops_zero_side_from_dual_amount_rows():
+    rows = [
+        {
+            "row_id": "001",
+            "date": "2026-02-01",
+            "description": "Deposit",
+            "debit": "0.00",
+            "credit": "500.00",
+            "balance": "1500.00",
+            "row_type": "transaction",
+        }
+    ]
+
+    repaired = _repair_page_flow_columns(rows, previous_balance_hint="1000.00")
+
+    assert repaired[0]["debit"] is None
+    assert repaired[0]["credit"] == "500.00"
+
+
+def test_repair_page_flow_columns_reduces_dual_amount_rows_to_the_matching_side():
+    rows = [
+        {
+            "row_id": "001",
+            "date": "2026-02-01",
+            "description": "Deposit",
+            "debit": None,
+            "credit": "500.00",
+            "balance": "1500.00",
+            "row_type": "transaction",
+        },
+        {
+            "row_id": "002",
+            "date": "2026-02-02",
+            "description": "ATM WITHDRAWAL",
+            "debit": "50.00",
+            "credit": "20.00",
+            "balance": "1450.00",
+            "row_type": "transaction",
+        },
+    ]
+
+    repaired = _repair_page_flow_columns(rows, previous_balance_hint="1000.00")
+
+    assert repaired[1]["debit"] == "50.00"
+    assert repaired[1]["credit"] is None
+
+
 def test_run_text_pipeline_keeps_descending_unionbank_debits(monkeypatch, tmp_path: Path):
     page_rows = [
         {

@@ -26,6 +26,8 @@ from app.paths import get_data_dir
 DEFAULT_ESPOCRM_BASE_URL = "https://staging-crm.discoverycsc.com/api/v1"
 LEAD_SELECT_FIELDS = "id,accountName,cBankStatementsIds,createdAt,createdByName,assignedUserName"
 ACCOUNT_SELECT_FIELDS = "id,name,cBankStatementsIds,createdAt,createdByName,assignedUserName"
+LEAD_MINIMAL_SELECT_FIELDS = "id,accountName,cBankStatementsIds,createdAt"
+ACCOUNT_MINIMAL_SELECT_FIELDS = "id,name,cBankStatementsIds,createdAt"
 DEFAULT_TIMEOUT = httpx.Timeout(25.0, connect=10.0)
 ATTACHMENT_FILE_ENDPOINTS = ("Attachment", "Attachments")
 DEFAULT_ATTACHMENTS_PAGE_SIZE = 25
@@ -39,6 +41,7 @@ ATTACHMENTS_PAGE_CACHE_VERSION = 3
 _CACHE_LOCK = threading.Lock()
 _ATTACHMENT_PAGE_CACHE: dict[tuple[str, int, int], dict[str, Any]] = {}
 _ATTACHMENT_PROBE_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
+_ENTITY_SELECT_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
 
 
 def _get_espocrm_settings() -> tuple[str, str]:
@@ -148,6 +151,52 @@ def _raise_remote_http_error(prefix: str, status_code: int) -> None:
     if status_code in (401, 403):
         raise HTTPException(status_code=502, detail="espocrm_auth_failed")
     raise HTTPException(status_code=502, detail=f"{prefix}_failed_{status_code}")
+
+
+def _build_entity_request_params(select_fields: str | None, *, max_size: int, offset: int) -> dict[str, Any]:
+    params: dict[str, Any] = {"maxSize": max_size, "offset": offset}
+    if str(select_fields or "").strip():
+        params["select"] = str(select_fields).strip()
+    return params
+
+
+def _get_select_fallbacks(entity_name: str, select_fields: str) -> list[str | None]:
+    variants: list[str | None] = []
+    seen: set[str | None] = set()
+
+    def _add(candidate: str | None) -> None:
+        cleaned = str(candidate).strip() if candidate is not None else None
+        value = cleaned or None
+        if value in seen:
+            return
+        seen.add(value)
+        variants.append(value)
+
+    _add(select_fields)
+    if entity_name == "Lead":
+        _add(LEAD_MINIMAL_SELECT_FIELDS)
+    elif entity_name == "Account":
+        _add(ACCOUNT_MINIMAL_SELECT_FIELDS)
+    _add(None)
+    return variants
+
+
+def _get_entity_select_variants(base_url: str, entity_name: str, select_fields: str) -> list[str | None]:
+    cache_key = (base_url, entity_name)
+    cached_payload = _cache_get(_ENTITY_SELECT_CACHE, cache_key)
+    variants: list[str | None] = []
+    seen: set[str | None] = set()
+    candidates = _get_select_fallbacks(entity_name, select_fields)
+    if isinstance(cached_payload, dict):
+        candidates = [cached_payload.get("select_fields"), *candidates]
+    for candidate in candidates:
+        cleaned = str(candidate).strip() if candidate is not None else None
+        value = cleaned or None
+        if value in seen:
+            continue
+        seen.add(value)
+        variants.append(value)
+    return variants
 
 
 def _env_int(name: str, default: int) -> int:
@@ -316,22 +365,40 @@ def _fetch_entity_batch(
     offset: int,
     max_size: int,
 ) -> tuple[list[dict[str, Any]], bool]:
-    try:
-        response = client.get(
-            f"{base_url}/{entity_name}",
-            params={"select": select_fields, "maxSize": max_size, "offset": offset},
-            headers=headers,
+    select_variants = _get_entity_select_variants(base_url, entity_name, select_fields)
+    response: httpx.Response | None = None
+    payload: Any = None
+    for index, candidate_select in enumerate(select_variants):
+        try:
+            response = client.get(
+                f"{base_url}/{entity_name}",
+                params=_build_entity_request_params(candidate_select, max_size=max_size, offset=offset),
+                headers=headers,
+            )
+        except httpx.RequestError as exc:
+            raise HTTPException(status_code=502, detail=f"espocrm_{entity_name.lower()}_request_failed") from exc
+
+        if response.status_code == 500 and index + 1 < len(select_variants):
+            continue
+
+        if response.status_code >= 400:
+            _raise_remote_http_error(f"espocrm_{entity_name.lower()}_request", response.status_code)
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail=f"espocrm_{entity_name.lower()}_response_invalid_json") from exc
+
+        _cache_set(
+            _ENTITY_SELECT_CACHE,
+            (base_url, entity_name),
+            {"select_fields": candidate_select},
+            ttl_seconds=3600,
         )
-    except httpx.RequestError as exc:
-        raise HTTPException(status_code=502, detail=f"espocrm_{entity_name.lower()}_request_failed") from exc
+        break
 
-    if response.status_code >= 400:
-        _raise_remote_http_error(f"espocrm_{entity_name.lower()}_request", response.status_code)
-
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise HTTPException(status_code=502, detail=f"espocrm_{entity_name.lower()}_response_invalid_json") from exc
+    if response is None:
+        raise HTTPException(status_code=502, detail=f"espocrm_{entity_name.lower()}_request_failed")
 
     batch = _extract_records(payload)
     total = payload.get("total") if isinstance(payload, dict) else None

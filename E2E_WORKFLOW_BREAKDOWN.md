@@ -782,7 +782,7 @@ Per `page_###` entry may include:
 ## 16.1 Core paths/data
 
 - `DATA_DIR`: storage root override
-- `DATABASE_URL`: SQL URL override (`ocr.db` sqlite fallback)
+- `DATABASE_URL`: PostgreSQL connection string override
 - `DB_AUTO_CREATE_SCHEMA`
 - `DB_CONNECT_MAX_WAIT_SECONDS`
 - `DB_CONNECT_RETRY_INTERVAL_SECONDS`
@@ -952,4 +952,3 @@ This section maps the most important runtime variables per function so you can t
 | `list_bank_statement_attachments(...)` | `limit`, `offset`, `probe_mode`, `search_query`, `process_index`, `rows` | list CRM attachments + overlay local process state |
 | `create_job_from_attachment(attachment_id, requested_mode)` | `cleaned_attachment_id`, `source_name`, `owner`, `payload`, `job_id` | create processing job from CRM file and stamp source metadata |
 | `export_job_excel_to_crm_lead(job_id, lead_id)` | `resolved_lead_id`, `workbook_bytes`, `safe_filename`, `attachment_id`, `meta` | upload export workbook back to CRM Lead |
-

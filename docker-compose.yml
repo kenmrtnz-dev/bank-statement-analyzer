@@ -2,7 +2,7 @@ services:
   api:
     platform: linux/amd64
     build:
-      context: ./backend
+      context: .
     container_name: ocr_api
     env_file:
       - .env
@@ -10,45 +10,34 @@ services:
       - "8000:8000"
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-ocr}:${POSTGRES_PASSWORD:-ocrpass}@db:${POSTGRES_PORT:-5433}/${POSTGRES_DB:-ocr}
+      DATA_DIR: /data
     volumes:
-      - ./backend/app:/app/app:ro
       - ocr_data:/data
     depends_on:
       redis:
         condition: service_started
       db:
         condition: service_healthy
-    command: >
-      uvicorn app.main:app
-      --host 0.0.0.0
-      --port 8000
-      --proxy-headers
+    command: ["./scripts/run-api.sh"]
 
   worker:
     platform: linux/amd64
     build:
-      context: ./backend
+      context: .
     container_name: ocr_worker
     env_file:
       - .env
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-ocr}:${POSTGRES_PASSWORD:-ocrpass}@db:${POSTGRES_PORT:-5433}/${POSTGRES_DB:-ocr}
+      DATA_DIR: /data
     volumes:
-      - ./backend/app:/app/app:ro
       - ocr_data:/data
     depends_on:
       redis:
         condition: service_started
       db:
         condition: service_healthy
-    command: >
-      sh -c "celery -A app.worker.celery_app.celery worker
-      --loglevel=INFO
-      --pool=prefork
-      --queues=${CELERY_TASK_DEFAULT_QUEUE:-jobs}
-      --prefetch-multiplier=${CELERY_WORKER_PREFETCH_MULTIPLIER:-1}
-      --concurrency=${CELERY_CONCURRENCY:-4}
-      --max-tasks-per-child=${CELERY_MAX_TASKS_PER_CHILD:-25}"
+    command: ["./scripts/run-worker.sh"]
 
   redis:
     image: redis:7-alpine

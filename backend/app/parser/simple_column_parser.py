@@ -15,6 +15,18 @@ from typing import Any
 
 _DATE_WITH_YEAR = re.compile(r"^(?P<a>\d{1,4})[/-](?P<b>\d{1,2})[/-](?P<c>\d{1,4})$")
 _DATE_NO_YEAR = re.compile(r"^(?P<m>\d{1,2})[/-](?P<d>\d{1,2})$")
+_DATE_TEXTUAL = re.compile(
+    r"^(?:(?P<mon1>[A-Za-z]{3,9})[\s-]+(?P<day1>\d{1,2})(?:[\s,/-]+(?P<year1>\d{2,4}))?"
+    r"|(?P<day2>\d{1,2})[\s-]+(?P<mon2>[A-Za-z]{3,9})(?:[\s,/-]+(?P<year2>\d{2,4}))?)$",
+    re.IGNORECASE,
+)
+_DATE_TEXTUAL_EMBEDDED = re.compile(
+    r"\b(?:"
+    r"(?P<mon1>[A-Za-z]{3,9})[\s-]+(?P<day1>\d{1,2})(?:[\s,/-]+(?P<year1>\d{2,4}))?"
+    r"|(?P<day2>\d{1,2})[\s-]+(?P<mon2>[A-Za-z]{3,9})(?:[\s,/-]+(?P<year2>\d{2,4}))?"
+    r")\b",
+    re.IGNORECASE,
+)
 _YEAR_PATTERN = re.compile(r"(19|20)\d{2}")
 _AMOUNT_PATTERN = re.compile(r"[-+]?[\d,]+(?:\.\d{1,2})?")
 _LINE_DATE_PATTERN = re.compile(r"\b\d{1,4}[/-]\d{1,2}(?:[/-]\d{1,4})?\b")
@@ -24,6 +36,32 @@ _NON_TXN_DESCRIPTION_MARKERS = {
     "page total",
     "carried forward",
     "brought forward",
+}
+_MONTH_MAP = {
+    "jan": 1,
+    "january": 1,
+    "feb": 2,
+    "february": 2,
+    "mar": 3,
+    "march": 3,
+    "apr": 4,
+    "april": 4,
+    "may": 5,
+    "jun": 6,
+    "june": 6,
+    "jul": 7,
+    "july": 7,
+    "aug": 8,
+    "august": 8,
+    "sep": 9,
+    "sept": 9,
+    "september": 9,
+    "oct": 10,
+    "october": 10,
+    "nov": 11,
+    "november": 11,
+    "dec": 12,
+    "december": 12,
 }
 
 
@@ -135,11 +173,23 @@ def _is_date_like(text: str) -> bool:
     raw = str(text or "").strip()
     if not raw:
         return False
-    return bool(_DATE_NO_YEAR.match(raw) or _DATE_WITH_YEAR.match(raw))
+    return bool(_DATE_NO_YEAR.match(raw) or _DATE_WITH_YEAR.match(raw) or _DATE_TEXTUAL.match(raw))
 
 
 def _normalize_spaces(value: str) -> str:
     return " ".join(str(value or "").split())
+
+
+def _is_textual_month(value: str) -> bool:
+    return str(value or "").strip().lower() in _MONTH_MAP
+
+
+def _looks_like_day_of_month(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text.isdigit():
+        return False
+    day = int(text)
+    return 1 <= day <= 31
 
 
 def _infer_statement_year(tokens: list[dict[str, Any]]) -> int | None:
@@ -173,24 +223,72 @@ def _normalize_date_iso(value: str, inferred_year: int | None) -> str | None:
             return None
 
     m_full = _DATE_WITH_YEAR.match(raw)
-    if not m_full:
+    if m_full:
+        a = int(m_full.group("a"))
+        b = int(m_full.group("b"))
+        c = int(m_full.group("c"))
+        year_first = len(m_full.group("a")) == 4
+        year_last = len(m_full.group("c")) == 4
+
+        try:
+            if year_first:
+                return dt.date(a, b, c).isoformat()
+            if year_last:
+                # Treat month/day/year for statement rows.
+                if a > 12 and b <= 12:
+                    return dt.date(c, b, a).isoformat()
+                return dt.date(c, a, b).isoformat()
+        except ValueError:
+            return None
+
+    m_text = _DATE_TEXTUAL.match(raw)
+    if not m_text:
         return None
 
-    a = int(m_full.group("a"))
-    b = int(m_full.group("b"))
-    c = int(m_full.group("c"))
-    year_first = len(m_full.group("a")) == 4
-    year_last = len(m_full.group("c")) == 4
+    if m_text.group("mon1"):
+        month_key = str(m_text.group("mon1") or "").strip().lower()
+        day = int(m_text.group("day1"))
+        year_text = str(m_text.group("year1") or "").strip()
+    else:
+        month_key = str(m_text.group("mon2") or "").strip().lower()
+        day = int(m_text.group("day2"))
+        year_text = str(m_text.group("year2") or "").strip()
+
+    month = _MONTH_MAP.get(month_key)
+    if month is None:
+        return None
+
+    if year_text:
+        year = int(year_text)
+        if year < 100:
+            year += 2000
+    else:
+        year = inferred_year
+    if year is None:
+        return None
 
     try:
-        if year_first:
-            return dt.date(a, b, c).isoformat()
-        if year_last:
-            # Treat month/day/year for statement rows.
-            return dt.date(c, a, b).isoformat()
+        return dt.date(int(year), month, day).isoformat()
     except ValueError:
         return None
-    return None
+
+
+def _extract_embedded_date_iso(text: str, inferred_year: int | None) -> str | None:
+    raw = _normalize_spaces(text)
+    if not raw:
+        return None
+    direct = _normalize_date_iso(raw, inferred_year)
+    if direct:
+        return direct
+    numeric = _LINE_DATE_PATTERN.search(raw)
+    if numeric:
+        embedded_numeric = _normalize_date_iso(numeric.group(0), inferred_year)
+        if embedded_numeric:
+            return embedded_numeric
+    textual = _DATE_TEXTUAL_EMBEDDED.search(raw)
+    if not textual:
+        return None
+    return _normalize_date_iso(textual.group(0), inferred_year)
 
 
 def _looks_like_header_text(text: str) -> bool:
@@ -253,15 +351,19 @@ def _build_rough_rows(tokens: list[dict[str, Any]], start_row_number: int) -> li
 
         number_tokens: list[dict[str, Any]] = []
         description_tokens: list[str] = []
+        has_textual_month = any(_is_textual_month(token.get("text")) for token in row_tokens)
         for token in row_tokens:
             text = str(token.get("text") or "").strip()
             if not text:
                 continue
             if token is date_token:
                 continue
+            if has_textual_month and _looks_like_day_of_month(text):
+                description_tokens.append(text)
+                continue
             amount = _parse_amount(text)
             if amount is not None:
-                number_tokens.append({"value": amount, "x": token["x1"]})
+                number_tokens.append({"value": amount, "x": token["x1"], "has_decimal": "." in text})
                 continue
             if _looks_like_header_text(text):
                 continue
@@ -273,6 +375,7 @@ def _build_rough_rows(tokens: list[dict[str, Any]], start_row_number: int) -> li
             "date_raw": str(date_token["text"]).strip() if date_token else "",
             "description_raw": _normalize_spaces(" ".join(description_tokens)),
             "numbers": numbers,
+            "number_decimal_count": int(sum(1 for item in number_tokens if item.get("has_decimal"))),
             "page_number": int(row_tokens[0].get("page_number") or 0),
             "anchor_y": float(sum(token["cy"] for token in row_tokens) / len(row_tokens)),
         }
@@ -340,6 +443,9 @@ def _reconstruct_ledger(rough_rows: list[dict[str, Any]]) -> list[dict[str, Any]
                 "page_number": int(row.get("page_number") or 1),
                 "date_raw": row.get("date_raw") or "",
                 "description_raw": description,
+                "number_tokens": len(nums),
+                "number_decimal_count": int(row.get("number_decimal_count") or 0),
+                "tx_hint": round(tx_hint, 2) if tx_hint is not None else None,
                 "debit": round(debit, 2),
                 "credit": round(credit, 2),
                 "balance": round(balance, 2) if balance is not None else None,
@@ -352,19 +458,43 @@ def _semantic_cleanup(ledger_rows: list[dict[str, Any]], inferred_year: int | No
     """Pass 3: Semantic cleanup and output normalization."""
     cleaned: list[dict[str, Any]] = []
     previous_balance: float | None = None
+    previous_date_iso: str = ""
 
     for row in ledger_rows:
         date_iso = _normalize_date_iso(str(row.get("date_raw") or ""), inferred_year)
         description = _normalize_spaces(row.get("description_raw") or "")
+        if not date_iso and description:
+            date_iso = _extract_embedded_date_iso(description, inferred_year)
 
         if not date_iso:
             has_numeric_content = bool(
                 (row.get("balance") is not None)
                 or (_parse_amount(row.get("debit")) or 0) > 0
                 or (_parse_amount(row.get("credit")) or 0) > 0
+                or int(row.get("number_decimal_count") or 0) > 0
+                or int(row.get("number_tokens") or 0) >= 2
             )
             if description and cleaned and not _is_non_transaction_description(description) and not has_numeric_content:
                 cleaned[-1]["description"] = _normalize_spaces(f"{cleaned[-1]['description']} {description}")
+                continue
+            if not has_numeric_content or _is_non_transaction_description(description):
+                continue
+            fallback_description = description.strip() or "Transaction"
+            debit = _parse_amount(row.get("debit"))
+            credit = _parse_amount(row.get("credit"))
+            balance = row.get("balance")
+            fallback = {
+                "row_number": int(len(cleaned) + 1),
+                "page_number": int(row.get("page_number") or 1),
+                "date": previous_date_iso,
+                "description": fallback_description,
+                "debit": round(debit or 0.0, 2),
+                "credit": round(credit or 0.0, 2),
+                "balance": round(float(balance), 2) if balance is not None else None,
+            }
+            cleaned.append(fallback)
+            if fallback["balance"] is not None:
+                previous_balance = fallback["balance"]
             continue
 
         if _is_non_transaction_description(description):
@@ -390,6 +520,7 @@ def _semantic_cleanup(ledger_rows: list[dict[str, Any]], inferred_year: int | No
             "balance": round(float(balance), 2) if balance is not None else None,
         }
         cleaned.append(normalized)
+        previous_date_iso = date_iso
         if normalized["balance"] is not None:
             previous_balance = normalized["balance"]
 

@@ -1,8 +1,40 @@
 import json
-import sqlite3
+import os
+from decimal import Decimal
 from pathlib import Path
 
 from app.jobs import service as jobs_service
+from sqlalchemy import create_engine, text
+
+
+def _fetch_job_transactions(job_id: str):
+    engine = create_engine(str(os.environ["DATABASE_URL"]), future=True)
+    try:
+        with engine.connect() as conn:
+            return conn.execute(
+                text(
+                    "SELECT description, credit, (date_bounds ->> 'x1')::numeric FROM job_transactions "
+                    "WHERE job_id = :job_id ORDER BY row_index"
+                ),
+                {"job_id": job_id},
+            ).fetchall()
+    finally:
+        engine.dispose()
+
+
+def _fetch_updated_job_transactions(job_id: str):
+    engine = create_engine(str(os.environ["DATABASE_URL"]), future=True)
+    try:
+        with engine.connect() as conn:
+            return conn.execute(
+                text(
+                    "SELECT description, debit, credit, balance, (date_bounds ->> 'x1')::numeric FROM job_transactions "
+                    "WHERE job_id = :job_id ORDER BY row_index"
+                ),
+                {"job_id": job_id},
+            ).fetchall()
+    finally:
+        engine.dispose()
 
 
 def test_health(client):
@@ -121,13 +153,8 @@ def test_job_flow_with_mocked_pipeline(client, monkeypatch):
     assert parsed.status_code == 200
     assert parsed.json()["page_001"][0]["description"] == "Deposit"
 
-    db_path = Path(jobs_service.DATA_DIR) / "ocr.db"
-    with sqlite3.connect(db_path) as conn:
-        stored = conn.execute(
-            "SELECT description, credit, x1 FROM job_transactions WHERE job_id = ? ORDER BY row_index",
-            (job_id,),
-        ).fetchall()
-    assert stored == [("Deposit", 1000, 0.1)]
+    stored = _fetch_job_transactions(job_id)
+    assert stored == [("Deposit", Decimal("1000.00"), Decimal("0.100000"))]
 
     updated_rows = [
         {
@@ -150,12 +177,8 @@ def test_job_flow_with_mocked_pipeline(client, monkeypatch):
     assert parsed_after_update.status_code == 200
     assert parsed_after_update.json()["page_001"][0]["description"] == "Edited Deposit"
 
-    with sqlite3.connect(db_path) as conn:
-        stored_after_update = conn.execute(
-            "SELECT description, debit, credit, balance, x1 FROM job_transactions WHERE job_id = ? ORDER BY row_index",
-            (job_id,),
-        ).fetchall()
-    assert stored_after_update == [("Edited Deposit", 50, None, 950, 0.1)]
+    stored_after_update = _fetch_updated_job_transactions(job_id)
+    assert stored_after_update == [("Edited Deposit", Decimal("50.00"), None, Decimal("950.00"), Decimal("0.100000"))]
 
     bounds = client.get(f"/jobs/{job_id}/rows/page_001/bounds")
     assert bounds.status_code == 200

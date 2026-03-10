@@ -1,6 +1,6 @@
 import json
 
-from app.jobs.repository import JobTransactionsRepository
+from app.jobs.repository import JobResultsRawRepository, JobStateRepository, JobTransactionsRepository
 
 
 def test_ui_settings_available_for_evaluator(client):
@@ -138,6 +138,56 @@ def test_admin_can_list_paginated_job_transactions_with_filters(client, tmp_path
     assert paged_body["pagination"]["per_page"] == 1
     assert paged_body["pagination"]["total_rows"] == 3
     assert len(paged_body["rows"]) == 1
+
+
+def test_admin_clear_store_removes_job_tables_and_raw_results(client, tmp_path):
+    tx_repo = JobTransactionsRepository(tmp_path)
+    raw_repo = JobResultsRawRepository(tmp_path)
+    state_repo = JobStateRepository(tmp_path)
+
+    tx_repo.replace_job_rows(
+        job_id="job-clear-1",
+        rows_by_page={
+            "page_001": [
+                {
+                    "row_id": "001",
+                    "date": "01/01/2026",
+                    "description": "Sample",
+                    "debit": None,
+                    "credit": 10.0,
+                    "balance": 10.0,
+                    "row_type": "transaction",
+                }
+            ]
+        },
+    )
+    raw_repo.upsert(job_id="job-clear-1", is_ocr=False, raw_xml="<pdf/>")
+    state_repo.sync_job(
+        job_id="job-clear-1",
+        meta={"original_filename": "clear.pdf", "file_size": 123, "is_reversed": False},
+        status={"status": "done", "updated_at": "2026-03-09T00:00:00Z"},
+    )
+
+    job_root = tmp_path / "jobs" / "job-clear-1" / "input"
+    job_root.mkdir(parents=True, exist_ok=True)
+    (job_root / "document.pdf").write_bytes(b"%PDF-1.4\n%%EOF")
+    (tmp_path / "exports" / "sample.txt").write_text("x", encoding="utf-8")
+
+    client.post("/auth/logout")
+    login_admin = client.post("/auth/login", data={"username": "admin", "password": "admin123"})
+    assert login_admin.status_code == 200
+
+    res = client.post("/admin/clear-store")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["ok"] is True
+    assert body["cleared_db_rows"] == 1
+    assert body["cleared_raw_rows"] == 1
+    assert body["cleared_job_state_rows"] == 1
+
+    assert tx_repo.list_rows_paginated()["pagination"]["total_rows"] == 0
+    assert raw_repo.get_by_job_id("job-clear-1") is None
+    assert state_repo.get_job("job-clear-1") is None
 
 
 def test_admin_can_list_jobs_with_owner_and_status_filters(client, tmp_path):

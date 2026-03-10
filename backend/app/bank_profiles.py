@@ -66,6 +66,52 @@ def _normalize_capture_patterns(values: List[str]) -> List[str]:
     return normalized
 
 
+def _load_json_file(path: Path) -> dict:
+    with path.open() as f:
+        data = json.load(f)
+    if isinstance(data, dict):
+        return data
+    return {}
+
+
+def _merge_packaged_defaults(active: dict, packaged: dict) -> dict:
+    merged = dict(active)
+
+    active_profiles = dict(active.get("profiles") or {})
+    packaged_profiles = dict(packaged.get("profiles") or {})
+    for name, raw in packaged_profiles.items():
+        if name not in active_profiles:
+            active_profiles[name] = raw
+    merged["profiles"] = active_profiles
+
+    active_rules = list(active.get("detection_rules") or [])
+    packaged_rules = list(packaged.get("detection_rules") or [])
+    existing_keys = {
+        (
+            str(rule.get("profile", "")).strip(),
+            tuple(_normalize_items(rule.get("contains_any", []))),
+            tuple(_normalize_items(rule.get("contains_all", []))),
+        )
+        for rule in active_rules
+        if isinstance(rule, dict)
+    }
+    for rule in packaged_rules:
+        if not isinstance(rule, dict):
+            continue
+        key = (
+            str(rule.get("profile", "")).strip(),
+            tuple(_normalize_items(rule.get("contains_any", []))),
+            tuple(_normalize_items(rule.get("contains_all", []))),
+        )
+        if key in existing_keys:
+            continue
+        active_rules.append(rule)
+        existing_keys.add(key)
+    merged["detection_rules"] = active_rules
+
+    return merged
+
+
 def _load_profiles_config() -> Tuple[Dict[str, BankProfile], List[DetectionRule]]:
     global ACTIVE_CONFIG_PATH
     path = _config_path()
@@ -82,8 +128,13 @@ def _load_profiles_config() -> Tuple[Dict[str, BankProfile], List[DetectionRule]
         raise RuntimeError(f"bank_profiles_config_missing:{path}")
     ACTIVE_CONFIG_PATH = path
 
-    with path.open() as f:
-        data = json.load(f)
+    data = _load_json_file(path)
+    packaged = _default_packaged_config_path()
+    if packaged.exists() and packaged != path:
+        try:
+            data = _merge_packaged_defaults(data, _load_json_file(packaged))
+        except Exception:
+            pass
 
     raw_profiles = data.get("profiles", {})
     raw_rules = data.get("detection_rules", [])

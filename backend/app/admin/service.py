@@ -13,7 +13,13 @@ from zipfile import ZipFile
 
 from fastapi import HTTPException
 
-from app.jobs.repository import BankCodeFlagsRepository, JobsRepository, JobTransactionsRepository
+from app.jobs.repository import (
+    BankCodeFlagsRepository,
+    JobResultsRawRepository,
+    JobStateRepository,
+    JobsRepository,
+    JobTransactionsRepository,
+)
 from app.jobs.service import export_excel as build_job_excel_export
 from app.jobs.service import export_pdf as build_job_pdf_export
 from app.jobs.service import get_summary as load_job_summary
@@ -805,11 +811,13 @@ def list_job_transactions(
 
 
 def clear_jobs_and_exports() -> dict:
-    """Delete stored job folders, export files, and persisted transaction rows."""
+    """Delete stored job folders, export files, and persisted job-related SQL rows."""
     root = _data_dir()
     jobs_dir = root / "jobs"
     exports_dir = root / "exports"
     cleared_db_rows = JobTransactionsRepository(root).clear_all()
+    cleared_raw_rows = JobResultsRawRepository(root).clear_all()
+    cleared_jobs_table_rows = JobStateRepository(root).clear_all()
 
     removed_jobs = 0
     if jobs_dir.exists():
@@ -830,4 +838,10 @@ def clear_jobs_and_exports() -> dict:
 
     jobs_dir.mkdir(parents=True, exist_ok=True)
     exports_dir.mkdir(parents=True, exist_ok=True)
-    return {"cleared_jobs": removed_jobs, "cleared_exports": removed_exports, "cleared_db_rows": cleared_db_rows}
+    return {
+        "cleared_jobs": removed_jobs,
+        "cleared_exports": removed_exports,
+        "cleared_db_rows": cleared_db_rows,
+        "cleared_raw_rows": cleared_raw_rows,
+        "cleared_job_state_rows": cleared_jobs_table_rows,
+    }

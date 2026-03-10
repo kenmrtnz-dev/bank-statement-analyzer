@@ -7,19 +7,19 @@ import hmac
 import json
 import os
 import secrets
-from pathlib import Path
 from threading import Lock
 from typing import Dict, Optional
 
 from fastapi import HTTPException
 from app.paths import get_data_dir
+from app.settings import load_settings
 
 DATA_DIR = get_data_dir()
 AUTH_DIR = DATA_DIR / "auth"
 USERS_FILE = AUTH_DIR / "users.json"
 
-DEFAULT_ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
-DEFAULT_ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
+DEFAULT_ADMIN_USERNAME = load_settings().admin_username
+DEFAULT_ADMIN_PASSWORD = load_settings().admin_password
 SESSION_COOKIE = "bank_stmt_session"
 
 _SESSIONS: dict[str, dict] = {}
@@ -56,6 +56,8 @@ def _write_users(users: Dict[str, dict]):
 
 def ensure_admin_exists():
     """Seed the default admin account once so a fresh install is always accessible."""
+    if not load_settings().seed_default_users:
+        return
     with _LOCK:
         users = _load_users()
         if DEFAULT_ADMIN_USERNAME in users:

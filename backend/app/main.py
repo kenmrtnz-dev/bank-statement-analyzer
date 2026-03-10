@@ -12,19 +12,23 @@ from app.api.routers.ui import router as ui_router
 from app.admin.router import router as admin_router
 from app.auth.router import router as auth_router
 from app.crm.router import router as crm_router
-from app.jobs.repository import ensure_job_transactions_schema
+from app.jobs.repository import ensure_job_results_raw_schema, ensure_jobs_schema, ensure_job_transactions_schema
 from app.jobs.router import router as jobs_router
 from app.paths import get_data_dir
+from app.settings import load_settings
 
 DATA_DIR = get_data_dir()
 
 
 def _bootstrap_dirs():
     """Create the on-disk folders and DB tables the app expects at runtime."""
+    load_settings().validate_for_api()
     root = Path(DATA_DIR)
     (root / "jobs").mkdir(parents=True, exist_ok=True)
     (root / "exports").mkdir(parents=True, exist_ok=True)
+    ensure_jobs_schema(root)
     ensure_job_transactions_schema(root)
+    ensure_job_results_raw_schema(root)
 
 
 @asynccontextmanager

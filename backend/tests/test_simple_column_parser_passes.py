@@ -62,7 +62,7 @@ def test_generic_parser_three_passes_layout_math_and_cleanup():
     assert rows[1]["balance"] == 11500.0
 
 
-def test_generic_parser_ignores_rows_without_date():
+def test_generic_parser_keeps_numeric_rows_without_date():
     annotations = [
         _annotation("FULL PAGE TEXT", 0, 0, 1, 1),
         _annotation("2025", 170, 16, 220, 30),
@@ -80,4 +80,33 @@ def test_generic_parser_ignores_rows_without_date():
     }
 
     rows = parse_transactions_from_ocr_raw(payload)
-    assert rows == []
+    assert len(rows) == 1
+    assert rows[0]["date"] == ""
+    assert rows[0]["description"] == "no here"
+    assert rows[0]["balance"] is None
+
+
+def test_generic_parser_extracts_embedded_textual_dates():
+    annotations = [
+        _annotation("FULL PAGE TEXT", 0, 0, 1, 1),
+        _annotation("2025", 170, 16, 220, 30),
+        _annotation("Date", 30, 60, 70, 74),
+        _annotation("Description", 140, 60, 250, 74),
+        _annotation("Balance", 670, 60, 760, 74),
+        _annotation("Jan", 140, 100, 180, 114),
+        _annotation("05", 185, 100, 215, 114),
+        _annotation("POS", 220, 100, 260, 114),
+        _annotation("DEBIT", 268, 100, 330, 114),
+        _annotation("100.00", 430, 100, 500, 114),
+        _annotation("900.00", 680, 100, 760, 114),
+    ]
+    payload = {
+        "provider": "google_vision",
+        "pages": [{"page_number": 1, "response": {"textAnnotations": annotations}}],
+    }
+
+    rows = parse_transactions_from_ocr_raw(payload)
+
+    assert len(rows) == 1
+    assert rows[0]["date"] == "2025-01-05"
+    assert rows[0]["description"] == "Jan 05 POS"

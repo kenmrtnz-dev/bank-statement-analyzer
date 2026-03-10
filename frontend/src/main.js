@@ -1,1 +1,0 @@
-import "./legacy/app.js";

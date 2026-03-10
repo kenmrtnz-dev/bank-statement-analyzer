@@ -3,10 +3,11 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from pypdf import PdfReader
 
+from app.services.ocr.apple_vision import AppleVisionOCR
 from app.services.ocr.openai_vision import OpenAIVisionOCR
 
 DEFAULT_DIGITAL_TEXT_THRESHOLD = 300
@@ -30,10 +31,11 @@ class DocumentTextProfile:
 @dataclass
 class ScannedOCRRouter:
     engine_name: str
-    openai_client: OpenAIVisionOCR
+    client: Any
+    openai_client: OpenAIVisionOCR | None = None
 
     def ocr_page(self, image_path: str | Path) -> List[Dict]:
-        return self.openai_client.extract_ocr_items(image_path)
+        return self.client.extract_ocr_items(image_path)
 
 
 def detect_document_text_profile(
@@ -88,8 +90,19 @@ def scanned_render_dpi() -> int:
 
 
 def build_scanned_ocr_router(page_count: int) -> ScannedOCRRouter:
-    openai_client = OpenAIVisionOCR.from_env()
-    return ScannedOCRRouter(
-        engine_name="openai_vision",
-        openai_client=openai_client,
-    )
+    try:
+        openai_client = OpenAIVisionOCR.from_env()
+        return ScannedOCRRouter(
+            engine_name="openai_vision",
+            client=openai_client,
+            openai_client=openai_client,
+        )
+    except Exception as openai_error:
+        if AppleVisionOCR.is_available():
+            local_client = AppleVisionOCR.from_env()
+            return ScannedOCRRouter(
+                engine_name="apple_vision",
+                client=local_client,
+                openai_client=None,
+            )
+        raise openai_error

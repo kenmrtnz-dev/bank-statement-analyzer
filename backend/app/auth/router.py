@@ -14,6 +14,7 @@ from app.auth.service import (
     destroy_session,
     ensure_admin_exists,
 )
+from app.settings import load_settings
 
 router = APIRouter()
 
@@ -31,13 +32,14 @@ def login(username: str = Form(...), password: str = Form(...)):
     ensure_admin_exists()
     user = authenticate_user(username=username, password=password)
     token = create_session(user)
+    settings = load_settings()
     response = JSONResponse({"ok": True, "username": user["username"], "role": user["role"]})
     response.set_cookie(
         key=SESSION_COOKIE,
         value=token,
         httponly=True,
         samesite="lax",
-        secure=False,
+        secure=settings.session_cookie_secure,
         max_age=60 * 60 * 12,
     )
     return response

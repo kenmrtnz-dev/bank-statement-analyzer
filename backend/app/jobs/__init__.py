@@ -1,63 +1,7 @@
-from app.jobs.repository import JobsRepository
-from app.jobs.router import router
-from app.jobs.schemas import JobCancelResponse, JobCreateResponse, JobStartResponse
-from app.jobs.service import (
-    cancel_job,
-    compute_summary,
-    create_job,
-    export_excel,
-    export_pdf,
-    finalize_job_processing,
-    get_all_bounds,
-    get_all_rows,
-    get_cleaned_path,
-    get_ocr_page,
-    get_ocr_openai_raw_page,
-    get_page_bounds,
-    get_page_rows,
-    get_pages_status,
-    get_preview_path,
-    get_status,
-    get_summary,
-    list_cleaned_pages,
-    mark_page_failed,
-    mark_page_retrying,
-    normalize_page_name,
-    reparse_google_vision_job,
-    start_job,
-    process_job_page,
-    update_page_rows,
-)
+"""Jobs package.
 
-__all__ = [
-    "JobCancelResponse",
-    "JobCreateResponse",
-    "JobStartResponse",
-    "JobsRepository",
-    "cancel_job",
-    "compute_summary",
-    "create_job",
-    "export_excel",
-    "export_pdf",
-    "finalize_job_processing",
-    "get_all_bounds",
-    "get_all_rows",
-    "get_cleaned_path",
-    "get_ocr_page",
-    "get_ocr_openai_raw_page",
-    "get_page_bounds",
-    "get_page_rows",
-    "get_pages_status",
-    "get_preview_path",
-    "get_status",
-    "get_summary",
-    "list_cleaned_pages",
-    "mark_page_failed",
-    "mark_page_retrying",
-    "normalize_page_name",
-    "reparse_google_vision_job",
-    "process_job_page",
-    "router",
-    "start_job",
-    "update_page_rows",
-]
+Keep package initialization side-effect free so submodule imports like
+`from app.jobs import service` do not trigger router/service cycles.
+"""
+
+__all__ = []

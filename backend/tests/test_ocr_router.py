@@ -69,6 +69,24 @@ def test_openai_selected_even_when_page_count_exceeds_previous_limit(monkeypatch
     assert selected.openai_client is not None
 
 
+def test_apple_vision_fallback_selected_when_openai_missing(monkeypatch):
+    class _DummyAppleClient:
+        pass
+
+    monkeypatch.setattr(
+        router.OpenAIVisionOCR,
+        "from_env",
+        staticmethod(lambda: (_ for _ in ()).throw(RuntimeError("openai_api_key_missing"))),
+    )
+    monkeypatch.setattr(router.AppleVisionOCR, "is_available", staticmethod(lambda: True))
+    monkeypatch.setattr(router.AppleVisionOCR, "from_env", staticmethod(lambda: _DummyAppleClient()))
+
+    selected = router.build_scanned_ocr_router(page_count=5)
+
+    assert selected.engine_name == "apple_vision"
+    assert selected.openai_client is None
+
+
 def test_plain_text_to_ocr_items_shapes_tokens():
     items = plain_text_to_ocr_items("01/01/2026 Deposit 100.00", page_width=1000, page_height=1000)
     assert items

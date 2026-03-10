@@ -1,7 +1,17 @@
 import json
+import uuid
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from app.jobs.service import get_summary
+from sqlalchemy import create_engine, text
+
+
+def _build_schema_database_url(base_url: str, schema_name: str) -> str:
+    parts = urlsplit(base_url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query["options"] = f"-csearch_path={schema_name}"
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
 
 def test_get_summary_recomputes_when_cached_summary_is_missing_new_fields(monkeypatch, tmp_path: Path):
@@ -39,15 +49,27 @@ def test_get_summary_recomputes_when_cached_summary_is_missing_new_fields(monkey
     }
     (jobs_root / "result" / "summary.json").write_text(json.dumps(stale_summary), encoding="utf-8")
 
+    base_database_url = "postgresql+psycopg://ocr:ocrpass@localhost:5433/ocr"
+    schema_name = f"test_{uuid.uuid4().hex}"
+    admin_engine = create_engine(base_database_url, future=True)
+    with admin_engine.begin() as conn:
+        conn.execute(text(f'CREATE SCHEMA "{schema_name}"'))
+    database_url = _build_schema_database_url(base_database_url, schema_name)
+
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
-    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{(tmp_path / 'ocr.db').resolve()}")
+    monkeypatch.setenv("DATABASE_URL", database_url)
     monkeypatch.setenv("DB_AUTO_CREATE_SCHEMA", "true")
     from app.jobs import service as jobs_service
 
     monkeypatch.setattr(jobs_service, "DATA_DIR", str(tmp_path))
 
-    refreshed = get_summary(job_id)
-    assert "total_credit_monthly_average" in refreshed
-    assert refreshed["total_credit_monthly_average"] == 30.0
-    assert refreshed["monthly"][0]["credit_count"] == 1
-    assert refreshed["monthly"][0]["debit_count"] == 0
+    try:
+        refreshed = get_summary(job_id)
+        assert "total_credit_monthly_average" in refreshed
+        assert refreshed["total_credit_monthly_average"] == 30.0
+        assert refreshed["monthly"][0]["credit_count"] == 1
+        assert refreshed["monthly"][0]["debit_count"] == 0
+    finally:
+        with admin_engine.begin() as conn:
+            conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE'))
+        admin_engine.dispose()

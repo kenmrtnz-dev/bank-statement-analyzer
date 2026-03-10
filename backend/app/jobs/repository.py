@@ -14,12 +14,13 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Dict
 
-from sqlalchemy import create_engine, delete, func, inspect, or_, select, text
+from sqlalchemy import Text, cast, create_engine, delete, func, inspect, or_, select, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import OperationalError
 
-from app.infra.db.models import BankCodeFlagRecord, Base, JobTransactionRecord
+from app.infra.db.models import BankCodeFlagRecord, Base, JobRecord, JobResultRawRecord, JobTransactionRecord
+from app.settings import load_settings
 
 _DB_ENGINE_CACHE: dict[str, Engine] = {}
 _DB_ENGINE_CACHE_GUARD = threading.Lock()
@@ -87,6 +88,14 @@ class JobsRepository:
 
     def write_status(self, job_id: str, payload: Dict[str, Any]):
         self.write_json(self.path(job_id, "status.json"), payload)
+        try:
+            JobStateRepository(self.data_dir).sync_job(
+                job_id=str(job_id),
+                meta=self.read_json(self.path(job_id, "meta.json"), default={}),
+                status=payload,
+            )
+        except Exception:
+            logger.exception("Failed to sync jobs table for %s", job_id)
 
     def list_png(self, job_id: str, folder: str) -> list[str]:
         target = self.path(job_id, folder)
@@ -105,11 +114,12 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def _resolve_database_url(data_dir: str | Path) -> str:
-    configured = str(os.getenv("DATABASE_URL") or "").strip()
+    configured = load_settings().database_url
     if configured:
         return configured
-    db_path = Path(data_dir) / "ocr.db"
-    return f"sqlite:///{db_path.resolve()}"
+    raise RuntimeError(
+        "DATABASE_URL is required. Configure Postgres explicitly."
+    )
 
 
 def _db_connect_max_wait_seconds() -> float:
@@ -132,12 +142,9 @@ def _run_schema_bootstrap(
     data_dir: str | Path,
     operation: Callable[[str, Engine], None],
 ) -> None:
-    """Run schema setup, retrying transient startup failures for non-SQLite databases."""
+    """Run schema setup, retrying transient startup failures for PostgreSQL startup races."""
     url = _resolve_database_url(data_dir)
     engine = _get_db_engine(data_dir)
-    if url.startswith("sqlite"):
-        operation(url, engine)
-        return
 
     deadline = time.monotonic() + _db_connect_max_wait_seconds()
     retry_interval = _db_connect_retry_interval_seconds()
@@ -170,8 +177,7 @@ def _get_db_engine(data_dir: str | Path) -> Engine:
         engine = _DB_ENGINE_CACHE.get(url)
         if engine is not None:
             return engine
-        connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}
-        engine = create_engine(url, future=True, connect_args=connect_args)
+        engine = create_engine(url, future=True)
         _DB_ENGINE_CACHE[url] = engine
         return engine
 
@@ -180,14 +186,33 @@ def ensure_job_transactions_schema(data_dir: str | Path) -> None:
     """Create the job-transactions table when schema auto-creation is enabled."""
     if not _env_bool("DB_AUTO_CREATE_SCHEMA", True):
         return
+    ensure_jobs_schema(data_dir)
 
     def _apply(url: str, engine: Engine) -> None:
+        key = f"{url}#job_transactions"
         with _DB_ENGINE_CACHE_GUARD:
-            if url in _DB_SCHEMA_READY:
+            if key in _DB_SCHEMA_READY:
                 return
         Base.metadata.create_all(engine, tables=[JobTransactionRecord.__table__])
         with _DB_ENGINE_CACHE_GUARD:
-            _DB_SCHEMA_READY.add(url)
+            _DB_SCHEMA_READY.add(key)
+
+    _run_schema_bootstrap(data_dir, _apply)
+
+
+def ensure_job_results_raw_schema(data_dir: str | Path) -> None:
+    """Create the job-results-raw table when schema auto-creation is enabled."""
+    if not _env_bool("DB_AUTO_CREATE_SCHEMA", True):
+        return
+
+    def _apply(url: str, engine: Engine) -> None:
+        key = f"{url}#job_results_raw"
+        with _DB_ENGINE_CACHE_GUARD:
+            if key in _DB_SCHEMA_READY:
+                return
+        Base.metadata.create_all(engine, tables=[JobResultRawRecord.__table__])
+        with _DB_ENGINE_CACHE_GUARD:
+            _DB_SCHEMA_READY.add(key)
 
     _run_schema_bootstrap(data_dir, _apply)
 
@@ -209,6 +234,46 @@ def ensure_bank_code_flags_schema(data_dir: str | Path) -> None:
                 with engine.begin() as conn:
                     conn.execute(text("DROP TABLE bank_code_flags"))
         Base.metadata.create_all(engine, tables=[BankCodeFlagRecord.__table__])
+        with _DB_ENGINE_CACHE_GUARD:
+            _DB_SCHEMA_READY.add(key)
+
+    _run_schema_bootstrap(data_dir, _apply)
+
+
+def ensure_jobs_schema(data_dir: str | Path) -> None:
+    """Create or repair the jobs table used for persisted UI-facing job metadata."""
+    if not _env_bool("DB_AUTO_CREATE_SCHEMA", True):
+        return
+
+    expected_columns = {
+        "job_id": 'ALTER TABLE jobs ADD COLUMN job_id VARCHAR(36)',
+        "file_name": "ALTER TABLE jobs ADD COLUMN file_name VARCHAR(512) NOT NULL DEFAULT ''",
+        "file_size": "ALTER TABLE jobs ADD COLUMN file_size BIGINT NOT NULL DEFAULT 0",
+        "processing_status": "ALTER TABLE jobs ADD COLUMN processing_status VARCHAR(32) NOT NULL DEFAULT 'queued'",
+        "process_started": "ALTER TABLE jobs ADD COLUMN process_started TIMESTAMPTZ NULL",
+        "process_end": "ALTER TABLE jobs ADD COLUMN process_end TIMESTAMPTZ NULL",
+        "is_reversed": "ALTER TABLE jobs ADD COLUMN is_reversed BOOLEAN NOT NULL DEFAULT FALSE",
+    }
+
+    def _apply(url: str, engine: Engine) -> None:
+        key = f"{url}#jobs"
+        with _DB_ENGINE_CACHE_GUARD:
+            if key in _DB_SCHEMA_READY:
+                return
+        inspector = inspect(engine)
+        if "jobs" not in inspector.get_table_names():
+            Base.metadata.create_all(engine, tables=[JobRecord.__table__])
+        else:
+            existing_columns = {column.get("name") for column in inspector.get_columns("jobs")}
+            with engine.begin() as conn:
+                for column_name, ddl in expected_columns.items():
+                    if column_name not in existing_columns:
+                        conn.execute(text(ddl))
+                if "job_id" in existing_columns:
+                    pk = inspector.get_pk_constraint("jobs") or {}
+                    constrained = pk.get("constrained_columns") or []
+                    if "job_id" not in constrained:
+                        conn.execute(text("ALTER TABLE jobs ADD PRIMARY KEY (job_id)"))
         with _DB_ENGINE_CACHE_GUARD:
             _DB_SCHEMA_READY.add(key)
 
@@ -286,6 +351,166 @@ def _consume_bound(state: dict[str, Any], *, row_id: str, row_index: int) -> dic
     return {}
 
 
+_JOB_TX_BOUND_FIELDS = (
+    "row_number_bounds",
+    "date_bounds",
+    "debit_bounds",
+    "credit_bounds",
+    "balance_bounds",
+)
+
+
+def _page_sort_value(page_key: str) -> tuple[int, str]:
+    text = str(page_key or "").strip()
+    if text.isdigit():
+        return int(text), text
+    if text.startswith("page_") and text[5:].isdigit():
+        value = str(int(text[5:]))
+        return int(value), value
+    return 0, text
+
+
+def _output_page_key(page_key: str) -> str:
+    text = str(page_key or "").strip()
+    if text.isdigit():
+        return f"page_{int(text):03}"
+    if text.startswith("page_") and text[5:].isdigit():
+        return f"page_{int(text[5:]):03}"
+    return text
+
+
+def _page_number_from_key(page_key: str) -> int:
+    return _page_sort_value(page_key)[0]
+
+
+def _normalize_bound_payload(value: Any) -> dict[str, float] | None:
+    if not isinstance(value, dict):
+        return None
+    normalized: dict[str, float] = {}
+    for key in ("x1", "y1", "x2", "y2"):
+        number = _to_float(value.get(key))
+        if number is None:
+            return None
+        normalized[key] = number
+    return normalized
+
+
+def _expand_bound_payload(bound: dict[str, Any]) -> dict[str, dict[str, float] | None]:
+    expanded = {field: None for field in _JOB_TX_BOUND_FIELDS}
+    legacy_row_bounds = _normalize_bound_payload(bound)
+    for field in _JOB_TX_BOUND_FIELDS:
+        expanded[field] = _normalize_bound_payload(bound.get(field)) or legacy_row_bounds
+    return expanded
+
+
+def _merge_bound_payloads(*bounds: Any) -> dict[str, float] | None:
+    valid = [_normalize_bound_payload(item) for item in bounds]
+    valid = [item for item in valid if item is not None]
+    if not valid:
+        return None
+    return {
+        "x1": min(item["x1"] for item in valid),
+        "y1": min(item["y1"] for item in valid),
+        "x2": max(item["x2"] for item in valid),
+        "y2": max(item["y2"] for item in valid),
+    }
+
+
+def _row_core_signature(row: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        _normalize_row_number_value(row.get("row_number"), fallback=row.get("rownumber")),
+        str(row.get("date") or ""),
+        str(row.get("description") or ""),
+        _to_decimal(row.get("debit")),
+        _to_decimal(row.get("credit")),
+        _to_decimal(row.get("balance")),
+        str(row.get("row_type") or "transaction"),
+    )
+
+
+def _normalize_row_number_value(value: Any, fallback: Any = None) -> int | None:
+    candidate = value if value is not None else fallback
+    if candidate is None:
+        return None
+    if isinstance(candidate, int):
+        return candidate
+    text = str(candidate).strip()
+    if not text:
+        return None
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if not digits:
+        return None
+    try:
+        return int(digits)
+    except ValueError:
+        return None
+
+
+class JobResultsRawRepository:
+    """Store one raw extraction payload per job for audit/debug workflows."""
+
+    def __init__(self, data_dir: str | Path):
+        self.data_dir = Path(data_dir)
+        ensure_jobs_schema(self.data_dir)
+        ensure_job_results_raw_schema(self.data_dir)
+        self.engine = _get_db_engine(self.data_dir)
+
+    def upsert(
+        self,
+        *,
+        job_id: str,
+        is_ocr: bool,
+        raw_xml: str | None = None,
+        raw_json: dict[str, Any] | list[Any] | None = None,
+    ) -> None:
+        now = dt.datetime.now(dt.timezone.utc)
+        with Session(self.engine) as session:
+            record = session.execute(
+                select(JobResultRawRecord).where(JobResultRawRecord.job_id == str(job_id)).limit(1)
+            ).scalar_one_or_none()
+            if record is None:
+                record = JobResultRawRecord(
+                    id=str(uuid.uuid4()),
+                    job_id=str(job_id),
+                    is_ocr=bool(is_ocr),
+                    raw_xml=raw_xml,
+                    raw_json=raw_json,
+                    created_at=now,
+                    updated_at=now,
+                )
+                session.add(record)
+            else:
+                record.is_ocr = bool(is_ocr)
+                record.raw_xml = raw_xml
+                record.raw_json = raw_json
+                record.updated_at = now
+            session.commit()
+
+    def get_by_job_id(self, job_id: str) -> dict[str, Any] | None:
+        with Session(self.engine) as session:
+            record = session.execute(
+                select(JobResultRawRecord).where(JobResultRawRecord.job_id == str(job_id)).limit(1)
+            ).scalar_one_or_none()
+            if record is None:
+                return None
+            return {
+                "id": str(record.id),
+                "job_id": str(record.job_id),
+                "is_ocr": bool(record.is_ocr),
+                "raw_xml": record.raw_xml,
+                "raw_json": record.raw_json,
+                "created_at": record.created_at.isoformat() if record.created_at else None,
+                "updated_at": record.updated_at.isoformat() if record.updated_at else None,
+            }
+
+    def clear_all(self) -> int:
+        with Session(self.engine) as session:
+            count = session.execute(select(func.count()).select_from(JobResultRawRecord)).scalar_one()
+            session.execute(delete(JobResultRawRecord))
+            session.commit()
+            return int(count or 0)
+
+
 class JobTransactionsRepository:
     """Store normalized parsed rows and bounds in SQL for editing and reporting."""
 
@@ -296,60 +521,25 @@ class JobTransactionsRepository:
 
     def has_rows(self, job_id: str) -> bool:
         with Session(self.engine) as session:
-            stmt = select(JobTransactionRecord.id).where(JobTransactionRecord.job_id == str(job_id)).limit(1)
+            stmt = (
+                select(JobTransactionRecord.id)
+                .where(
+                    JobTransactionRecord.job_id == str(job_id),
+                    JobTransactionRecord.is_deleted.is_(False),
+                )
+                .limit(1)
+            )
             return session.execute(stmt).scalar_one_or_none() is not None
 
     def get_rows_by_job(self, job_id: str) -> Dict[str, list[dict[str, Any]]]:
-        with Session(self.engine) as session:
-            stmt = (
-                select(JobTransactionRecord)
-                .where(JobTransactionRecord.job_id == str(job_id))
-                .order_by(JobTransactionRecord.page_key.asc(), JobTransactionRecord.row_index.asc())
-            )
-            records = session.execute(stmt).scalars().all()
-
-        out: Dict[str, list[dict[str, Any]]] = {}
-        for record in records:
-            page_rows = out.setdefault(str(record.page_key), [])
-            page_rows.append(
-                {
-                    "row_id": str(record.row_id or ""),
-                    "rownumber": record.rownumber,
-                    "row_number": str(record.row_number or (record.rownumber or "") or ""),
-                    "date": str(record.date or ""),
-                    "description": str(record.description or ""),
-                    "debit": _to_float(record.debit),
-                    "credit": _to_float(record.credit),
-                    "balance": _to_float(record.balance),
-                    "row_type": str(record.row_type or "transaction"),
-                }
-            )
-        return out
+        records = self._fetch_records(job_id, include_deleted=False)
+        rows_by_page, _ = self._records_to_payload(records, include_deleted=False)
+        return rows_by_page
 
     def get_bounds_by_job(self, job_id: str) -> Dict[str, list[dict[str, Any]]]:
-        with Session(self.engine) as session:
-            stmt = (
-                select(JobTransactionRecord)
-                .where(JobTransactionRecord.job_id == str(job_id))
-                .order_by(JobTransactionRecord.page_key.asc(), JobTransactionRecord.row_index.asc())
-            )
-            records = session.execute(stmt).scalars().all()
-
-        out: Dict[str, list[dict[str, Any]]] = {}
-        for record in records:
-            if all(value is None for value in (record.x1, record.y1, record.x2, record.y2)):
-                continue
-            page_bounds = out.setdefault(str(record.page_key), [])
-            page_bounds.append(
-                {
-                    "row_id": str(record.row_id or ""),
-                    "x1": _to_float(record.x1),
-                    "y1": _to_float(record.y1),
-                    "x2": _to_float(record.x2),
-                    "y2": _to_float(record.y2),
-                }
-            )
-        return out
+        records = self._fetch_records(job_id, include_deleted=False)
+        _, bounds_by_page = self._records_to_payload(records, include_deleted=False)
+        return bounds_by_page
 
     def replace_job_rows(
         self,
@@ -366,6 +556,7 @@ class JobTransactionsRepository:
             is_manual_edit=is_manual_edit,
         )
         with Session(self.engine) as session:
+            self._ensure_job_record(session, str(job_id))
             session.execute(delete(JobTransactionRecord).where(JobTransactionRecord.job_id == str(job_id)))
             session.add_all(JobTransactionRecord(**payload) for payload in payloads)
             session.commit()
@@ -378,23 +569,82 @@ class JobTransactionsRepository:
         *,
         is_manual_edit: bool = True,
     ) -> None:
-        normalized_page = str(page_key)
-        existing_bounds = self.get_bounds_by_job(job_id).get(normalized_page, [])
-        payloads = self._build_payloads(
-            job_id=str(job_id),
-            rows_by_page={normalized_page: rows},
-            bounds_by_page={normalized_page: existing_bounds},
+        output_page_key = _output_page_key(page_key)
+        existing_active_rows = self.get_rows_by_job(job_id)
+        existing_active_bounds = self.get_bounds_by_job(job_id)
+        existing_all_rows, existing_all_bounds = self._records_to_payload(
+            self._fetch_records(job_id, include_deleted=True),
+            include_deleted=True,
+        )
+
+        page_existing_rows = existing_active_rows.get(output_page_key, [])
+        page_existing_bounds = existing_active_bounds.get(output_page_key, [])
+        existing_by_row_id = {
+            str(item.get("row_id") or "").strip(): item for item in page_existing_rows if str(item.get("row_id") or "").strip()
+        }
+        bounds_by_row_id = {
+            str(item.get("row_id") or "").strip(): item for item in page_existing_bounds if str(item.get("row_id") or "").strip()
+        }
+
+        next_rows: list[dict[str, Any]] = []
+        next_bounds: list[dict[str, Any]] = []
+        seen_row_ids: set[str] = set()
+
+        for idx, row in enumerate(rows or [], start=1):
+            if not isinstance(row, dict):
+                continue
+            row_id = str(row.get("row_id") or "").strip() or f"{idx:03}"
+            seen_row_ids.add(row_id)
+            existing = existing_by_row_id.get(row_id)
+            is_new_row = existing is None
+            is_modified = bool(is_manual_edit) and (is_new_row or _row_core_signature(existing) != _row_core_signature(row))
+            next_rows.append(
+                {
+                    "row_id": row_id,
+                    "row_number": _normalize_row_number_value(row.get("row_number"), fallback=row.get("rownumber")),
+                    "date": str(row.get("date") or ""),
+                    "description": str(row.get("description") or ""),
+                    "debit": row.get("debit"),
+                    "credit": row.get("credit"),
+                    "balance": row.get("balance"),
+                    "row_type": str(row.get("row_type") or "transaction"),
+                    "is_new_row": is_new_row,
+                    "is_modified": is_modified,
+                    "is_deleted": False,
+                }
+            )
+            preserved_bounds = bounds_by_row_id.get(row_id) or {}
+            next_bounds.append(dict(preserved_bounds))
+
+        for existing in page_existing_rows:
+            row_id = str(existing.get("row_id") or "").strip()
+            if not row_id or row_id in seen_row_ids:
+                continue
+            next_rows.append(
+                {
+                    "row_id": row_id,
+                    "row_number": _normalize_row_number_value(existing.get("row_number"), fallback=existing.get("rownumber")),
+                    "date": str(existing.get("date") or ""),
+                    "description": str(existing.get("description") or ""),
+                    "debit": existing.get("debit"),
+                    "credit": existing.get("credit"),
+                    "balance": existing.get("balance"),
+                    "row_type": str(existing.get("row_type") or "transaction"),
+                    "is_new_row": bool(existing.get("is_new_row")),
+                    "is_modified": True,
+                    "is_deleted": True,
+                }
+            )
+            next_bounds.append(dict(bounds_by_row_id.get(row_id) or {}))
+
+        existing_all_rows[output_page_key] = next_rows
+        existing_all_bounds[output_page_key] = next_bounds
+        self.replace_job_rows(
+            job_id=job_id,
+            rows_by_page=existing_all_rows,
+            bounds_by_page=existing_all_bounds,
             is_manual_edit=is_manual_edit,
         )
-        with Session(self.engine) as session:
-            session.execute(
-                delete(JobTransactionRecord).where(
-                    JobTransactionRecord.job_id == str(job_id),
-                    JobTransactionRecord.page_key == normalized_page,
-                )
-            )
-            session.add_all(JobTransactionRecord(**payload) for payload in payloads)
-            session.commit()
 
     def clear_all(self) -> int:
         with Session(self.engine) as session:
@@ -423,7 +673,7 @@ class JobTransactionsRepository:
 
         page_value = str(page_key or "").strip()
         if page_value:
-            filters.append(JobTransactionRecord.page_key == page_value)
+            filters.append(JobTransactionRecord.page_key == _output_page_key(page_value))
 
         search_value = str(search or "").strip().lower()
         if search_value:
@@ -432,7 +682,7 @@ class JobTransactionsRepository:
                 or_(
                     func.lower(JobTransactionRecord.job_id).like(pattern),
                     func.lower(JobTransactionRecord.page_key).like(pattern),
-                    func.lower(JobTransactionRecord.row_id).like(pattern),
+                    cast(JobTransactionRecord.row_number, Text).like(pattern),
                     func.lower(JobTransactionRecord.date).like(pattern),
                     func.lower(JobTransactionRecord.description).like(pattern),
                 )
@@ -482,64 +732,269 @@ class JobTransactionsRepository:
     ) -> list[dict[str, Any]]:
         now = dt.datetime.utcnow()
         payloads: list[dict[str, Any]] = []
-        for page_key in sorted((rows_by_page or {}).keys()):
+        global_row_index = 0
+        for page_key in sorted((rows_by_page or {}).keys(), key=_page_sort_value):
             rows = rows_by_page.get(page_key) or []
             bounds_state = _prepare_bounds_state(bounds_by_page.get(page_key))
+            canonical_page_key = _output_page_key(page_key)
             for row_index, row in enumerate(rows, start=1):
                 if not isinstance(row, dict):
                     continue
                 row_id = str(row.get("row_id") or "").strip() or f"{row_index:03}"
                 bound = _consume_bound(bounds_state, row_id=row_id, row_index=row_index)
+                expanded_bounds = _expand_bound_payload(bound)
+                global_row_index += 1
                 payloads.append(
                     {
                         "id": str(uuid.uuid4()),
                         "job_id": job_id,
-                        "page_key": str(page_key),
-                        "row_index": int(row_index),
-                        "row_id": row_id,
-                        "rownumber": row.get("rownumber"),
-                        "row_number": str(row.get("row_number") or ""),
+                        "page_key": canonical_page_key,
+                        "page_number": _page_number_from_key(canonical_page_key),
+                        "row_index": int(global_row_index),
+                        "row_number": _normalize_row_number_value(row.get("row_number"), fallback=row.get("rownumber")),
                         "date": str(row.get("date") or ""),
                         "description": str(row.get("description") or ""),
                         "debit": _to_decimal(row.get("debit")),
                         "credit": _to_decimal(row.get("credit")),
                         "balance": _to_decimal(row.get("balance")),
+                        "row_number_bounds": expanded_bounds["row_number_bounds"],
+                        "date_bounds": expanded_bounds["date_bounds"],
+                        "debit_bounds": expanded_bounds["debit_bounds"],
+                        "credit_bounds": expanded_bounds["credit_bounds"],
+                        "balance_bounds": expanded_bounds["balance_bounds"],
                         "row_type": str(row.get("row_type") or "transaction"),
-                        "x1": _to_decimal(bound.get("x1")),
-                        "y1": _to_decimal(bound.get("y1")),
-                        "x2": _to_decimal(bound.get("x2")),
-                        "y2": _to_decimal(bound.get("y2")),
-                        "is_manual_edit": bool(is_manual_edit),
+                        "is_new_row": bool(row.get("is_new_row", False)),
+                        "is_modified": bool(row.get("is_modified", is_manual_edit)),
+                        "is_deleted": bool(row.get("is_deleted", False)),
                         "created_at": now,
                         "updated_at": now,
                     }
                 )
         return payloads
 
+    @staticmethod
+    def _ensure_job_record(session: Session, job_id: str) -> None:
+        record = session.get(JobRecord, str(job_id))
+        if record is not None:
+            return
+        now = dt.datetime.now(dt.timezone.utc)
+        session.add(
+            JobRecord(
+                job_id=str(job_id),
+                file_name=f"{job_id}.pdf",
+                file_size=0,
+                processing_status="done",
+                process_started=now,
+                process_end=now,
+                is_reversed=False,
+            )
+        )
+
     def _serialize_record(self, record: JobTransactionRecord) -> dict[str, Any]:
         updated_at = record.updated_at.isoformat() if record.updated_at else None
+        merged_bounds = _merge_bound_payloads(
+            record.row_number_bounds,
+            record.date_bounds,
+            record.debit_bounds,
+            record.credit_bounds,
+            record.balance_bounds,
+        )
         return {
             "id": str(record.id),
             "job_id": str(record.job_id),
-            "page_key": str(record.page_key),
+            "page_key": _output_page_key(record.page_key),
+            "page_number": int(record.page_number),
             "row_index": int(record.row_index),
-            "row_id": str(record.row_id or ""),
-            "rownumber": record.rownumber,
-            "row_number": str(record.row_number or (record.rownumber or "") or ""),
+            "row_id": f"{int(record.row_index):03}",
+            "rownumber": record.row_number,
+            "row_number": str(record.row_number or ""),
             "date": str(record.date or ""),
             "description": str(record.description or ""),
             "debit": _to_float(record.debit),
             "credit": _to_float(record.credit),
             "balance": _to_float(record.balance),
             "row_type": str(record.row_type or "transaction"),
-            "bounds": {
-                "x1": _to_float(record.x1),
-                "y1": _to_float(record.y1),
-                "x2": _to_float(record.x2),
-                "y2": _to_float(record.y2),
-            },
-            "is_manual_edit": bool(record.is_manual_edit),
+            "bounds": merged_bounds,
+            "row_number_bounds": record.row_number_bounds,
+            "date_bounds": record.date_bounds,
+            "debit_bounds": record.debit_bounds,
+            "credit_bounds": record.credit_bounds,
+            "balance_bounds": record.balance_bounds,
+            "is_new_row": bool(record.is_new_row),
+            "is_modified": bool(record.is_modified),
+            "is_deleted": bool(record.is_deleted),
             "updated_at": updated_at,
+        }
+
+    def _fetch_records(self, job_id: str, *, include_deleted: bool) -> list[JobTransactionRecord]:
+        with Session(self.engine) as session:
+            stmt = (
+                select(JobTransactionRecord)
+                .where(JobTransactionRecord.job_id == str(job_id))
+                .order_by(
+                    JobTransactionRecord.page_number.asc(),
+                    JobTransactionRecord.row_index.asc(),
+                    JobTransactionRecord.updated_at.asc(),
+                )
+            )
+            if not include_deleted:
+                stmt = stmt.where(JobTransactionRecord.is_deleted.is_(False))
+            return session.execute(stmt).scalars().all()
+
+    def _records_to_payload(
+        self,
+        records: list[JobTransactionRecord],
+        *,
+        include_deleted: bool,
+    ) -> tuple[Dict[str, list[dict[str, Any]]], Dict[str, list[dict[str, Any]]]]:
+        rows_by_page: Dict[str, list[dict[str, Any]]] = {}
+        bounds_by_page: Dict[str, list[dict[str, Any]]] = {}
+        page_counters: dict[str, int] = {}
+        for record in records:
+            if record.is_deleted and not include_deleted:
+                continue
+            page_key = _output_page_key(record.page_key)
+            page_counters[page_key] = page_counters.get(page_key, 0) + 1
+            row_id = f"{page_counters[page_key]:03}"
+            row_payload = {
+                "row_id": row_id,
+                "rownumber": record.row_number,
+                "row_number": str(record.row_number or ""),
+                "date": str(record.date or ""),
+                "description": str(record.description or ""),
+                "debit": _to_float(record.debit),
+                "credit": _to_float(record.credit),
+                "balance": _to_float(record.balance),
+                "row_type": str(record.row_type or "transaction"),
+                "is_new_row": bool(record.is_new_row),
+                "is_modified": bool(record.is_modified),
+                "is_deleted": bool(record.is_deleted),
+            }
+            rows_by_page.setdefault(page_key, []).append(row_payload)
+
+            merged_bounds = _merge_bound_payloads(
+                record.row_number_bounds,
+                record.date_bounds,
+                record.debit_bounds,
+                record.credit_bounds,
+                record.balance_bounds,
+            )
+            if merged_bounds is None and not any(
+                getattr(record, field) is not None for field in _JOB_TX_BOUND_FIELDS
+            ):
+                continue
+            bounds_payload = {
+                "row_id": row_id,
+                "x1": merged_bounds["x1"] if merged_bounds else None,
+                "y1": merged_bounds["y1"] if merged_bounds else None,
+                "x2": merged_bounds["x2"] if merged_bounds else None,
+                "y2": merged_bounds["y2"] if merged_bounds else None,
+                "row_number_bounds": record.row_number_bounds,
+                "date_bounds": record.date_bounds,
+                "debit_bounds": record.debit_bounds,
+                "credit_bounds": record.credit_bounds,
+                "balance_bounds": record.balance_bounds,
+            }
+            bounds_by_page.setdefault(page_key, []).append(bounds_payload)
+        return rows_by_page, bounds_by_page
+
+
+def _parse_iso_datetime(value: Any) -> dt.datetime | None:
+    text_value = str(value or "").strip()
+    if not text_value:
+        return None
+    normalized = text_value.replace("Z", "+00:00")
+    try:
+        return dt.datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+
+class JobStateRepository:
+    """Persist lightweight job lifecycle metadata for the UI and reload behavior."""
+
+    def __init__(self, data_dir: str | Path):
+        self.data_dir = Path(data_dir)
+        ensure_jobs_schema(self.data_dir)
+        self.engine = _get_db_engine(self.data_dir)
+
+    def sync_job(self, *, job_id: str, meta: dict[str, Any] | None, status: dict[str, Any] | None) -> None:
+        payload_meta = dict(meta or {})
+        payload_status = dict(status or {})
+        file_name = str(payload_meta.get("original_filename") or payload_meta.get("file_name") or "").strip()
+        if not file_name:
+            return
+        raw_file_size = payload_meta.get("file_size")
+        try:
+            file_size = max(0, int(raw_file_size or 0))
+        except (TypeError, ValueError):
+            file_size = 0
+        processing_status = str(payload_status.get("status") or "queued").strip().lower() or "queued"
+        is_reversed = bool(payload_meta.get("is_reversed", False))
+        status_updated_at = _parse_iso_datetime(payload_status.get("updated_at"))
+        explicit_cancelled_at = _parse_iso_datetime(payload_status.get("cancelled_at"))
+        now_utc = dt.datetime.now(dt.timezone.utc)
+
+        with Session(self.engine) as session:
+            record = session.get(JobRecord, str(job_id))
+            if record is None:
+                record = JobRecord(
+                    job_id=str(job_id),
+                    file_name=file_name,
+                    file_size=file_size,
+                    processing_status=processing_status,
+                    process_started=None,
+                    process_end=None,
+                    is_reversed=is_reversed,
+                )
+                session.add(record)
+            else:
+                record.file_name = file_name
+                record.file_size = file_size
+                record.processing_status = processing_status
+                record.is_reversed = is_reversed
+
+            if record.process_started is None and processing_status in {"queued", "processing", "done", "done_with_warnings", "failed", "cancelled"}:
+                record.process_started = status_updated_at or now_utc
+            if processing_status in {"done", "done_with_warnings", "failed", "cancelled"}:
+                record.process_end = explicit_cancelled_at or status_updated_at or now_utc
+            elif processing_status in {"queued", "processing"}:
+                record.process_end = None
+            session.commit()
+
+    def set_reversed(self, *, job_id: str, is_reversed: bool) -> dict[str, Any]:
+        with Session(self.engine) as session:
+            record = session.get(JobRecord, str(job_id))
+            if record is None:
+                raise KeyError(job_id)
+            record.is_reversed = bool(is_reversed)
+            session.commit()
+            return self.serialize(record)
+
+    def get_job(self, job_id: str) -> dict[str, Any] | None:
+        with Session(self.engine) as session:
+            record = session.get(JobRecord, str(job_id))
+            if record is None:
+                return None
+            return self.serialize(record)
+
+    def clear_all(self) -> int:
+        with Session(self.engine) as session:
+            count = session.execute(select(func.count()).select_from(JobRecord)).scalar_one()
+            session.execute(delete(JobRecord))
+            session.commit()
+            return int(count or 0)
+
+    @staticmethod
+    def serialize(record: JobRecord) -> dict[str, Any]:
+        return {
+            "job_id": str(record.job_id),
+            "file_name": str(record.file_name or ""),
+            "file_size": int(record.file_size or 0),
+            "processing_status": str(record.processing_status or ""),
+            "process_started": record.process_started.isoformat() if record.process_started else None,
+            "process_end": record.process_end.isoformat() if record.process_end else None,
+            "is_reversed": bool(record.is_reversed),
         }
 
 
@@ -652,8 +1107,10 @@ class BankCodeFlagsRepository:
 
 __all__ = [
     "BankCodeFlagsRepository",
+    "JobResultsRawRepository",
     "JobTransactionsRepository",
     "JobsRepository",
     "ensure_bank_code_flags_schema",
+    "ensure_job_results_raw_schema",
     "ensure_job_transactions_schema",
 ]

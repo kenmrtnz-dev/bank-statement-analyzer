@@ -27,7 +27,7 @@ export default defineConfig({
   },
   globalSetup: path.join(__dirname, 'e2e/global-setup.ts'),
   webServer: {
-    command: `cd ../ && uvicorn app.main:app --host 127.0.0.1 --port ${PORT}`,
+    command: `cd ../ && uvicorn --app-dir backend app.main:app --host 127.0.0.1 --port ${PORT}`,
     url: `${BASE_URL}/health`,
     reuseExistingServer: true,
     timeout: 120_000,

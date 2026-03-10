@@ -12,9 +12,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY pyproject.toml README.md ./
+COPY backend ./backend
+COPY scripts ./scripts
 
-COPY app /app/app
+RUN pip install --no-cache-dir .
+RUN chmod +x scripts/*.sh
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+ENV DATA_DIR=/data
+
+CMD ["./scripts/run-api.sh"]

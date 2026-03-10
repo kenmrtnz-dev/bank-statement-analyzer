@@ -43,6 +43,7 @@ OCR_ROW_FILTER_LENIENT = str(os.getenv("OCR_ROW_FILTER_LENIENT", "true")).strip(
     "yes",
     "on",
 }
+FLOW_AMOUNT_TOLERANCE = Decimal("0.005")
 
 ProgressReporter = Callable[[str, str, int], None]
 
@@ -235,8 +236,6 @@ def _run_text_pipeline(input_pdf: Path, ocr_dir: Path, report: ProgressReporter)
             current_rows=filtered_rows,
             current_bounds=filtered_bounds,
         )
-        filtered_rows = _repair_page_flow_columns(filtered_rows, previous_balance_hint=last_balance_hint)
-
         selected_profile = str(parser_diag.get("profile_selected") or profile.name)
         header_anchors = parser_diag.get("header_anchors")
         if isinstance(header_anchors, dict) and header_anchors:
@@ -305,7 +304,6 @@ def _run_ocr_pipeline(
                 header_hint=header_hints_by_profile.get("last"),
                 last_date_hint=last_date_hint or None,
             )
-            page_rows = _repair_page_flow_columns(page_rows, previous_balance_hint=last_balance_hint)
             parsed_output[page_name] = page_rows
             bounds_output[page_name] = page_bounds
             diagnostics["pages"][page_name] = page_diag
@@ -737,8 +735,8 @@ def _infer_balance_flow_direction(page_rows: List[Dict], previous_balance_hint=N
 
     for row in page_rows:
         curr_balance = _amount_to_decimal(row.get("balance"))
-        debit = _amount_to_decimal(row.get("debit"))
-        credit = _amount_to_decimal(row.get("credit"))
+        debit = _normalize_flow_amount_decimal(row.get("debit"))
+        credit = _normalize_flow_amount_decimal(row.get("credit"))
 
         if prev_balance is not None and curr_balance is not None:
             if debit is not None and credit is None:
@@ -762,6 +760,90 @@ def _infer_balance_flow_direction(page_rows: List[Dict], previous_balance_hint=N
     return None
 
 
+def _expected_balance_for_flow(prev_balance: Decimal, debit: Decimal | None, credit: Decimal | None, flow_direction: str) -> Decimal:
+    debit_value = debit or Decimal("0")
+    credit_value = credit or Decimal("0")
+    if flow_direction == "descending":
+        return prev_balance + debit_value - credit_value
+    return prev_balance - debit_value + credit_value
+
+
+def _normalize_flow_amount_decimal(value):
+    amount = _amount_to_decimal(value)
+    if amount is None:
+        return None
+    if abs(amount) <= FLOW_AMOUNT_TOLERANCE:
+        return None
+    return amount
+
+
+def _normalize_flow_amount_value(value):
+    amount = _normalize_amount_value(value)
+    if amount is None:
+        return None
+    if abs(amount) <= float(FLOW_AMOUNT_TOLERANCE):
+        return None
+    return amount
+
+
+def _sanitize_row_flow_amounts(
+    row_copy: Dict,
+    *,
+    prev_balance: Decimal | None,
+    curr_balance: Decimal | None,
+    flow_direction: str | None,
+) -> tuple[Decimal | None, Decimal | None]:
+    debit = _normalize_flow_amount_decimal(row_copy.get("debit"))
+    credit = _normalize_flow_amount_decimal(row_copy.get("credit"))
+    if debit is None:
+        row_copy["debit"] = None
+    if credit is None:
+        row_copy["credit"] = None
+    if debit is None or credit is None:
+        return debit, credit
+
+    if prev_balance is not None and curr_balance is not None and flow_direction:
+        debit_matches = _amounts_match(
+            _expected_balance_for_flow(prev_balance, debit, None, flow_direction),
+            curr_balance,
+        )
+        credit_matches = _amounts_match(
+            _expected_balance_for_flow(prev_balance, None, credit, flow_direction),
+            curr_balance,
+        )
+        if debit_matches and not credit_matches:
+            row_copy["credit"] = None
+            return debit, None
+        if credit_matches and not debit_matches:
+            row_copy["debit"] = None
+            return None, credit
+
+    if prev_balance is not None and curr_balance is not None:
+        delta = abs(curr_balance - prev_balance)
+        debit_matches_delta = _amounts_match(delta, abs(debit))
+        credit_matches_delta = _amounts_match(delta, abs(credit))
+        if debit_matches_delta and not credit_matches_delta:
+            row_copy["credit"] = None
+            return debit, None
+        if credit_matches_delta and not debit_matches_delta:
+            row_copy["debit"] = None
+            return None, credit
+
+    description_bias = _flow_description_bias(row_copy.get("description"))
+    if description_bias == "debit":
+        row_copy["credit"] = None
+        return debit, None
+    if description_bias == "credit":
+        row_copy["debit"] = None
+        return None, credit
+
+    # When the parser cannot justify one side, emit neither rather than
+    # preserving an impossible dual-sided transaction row.
+    row_copy["debit"] = None
+    row_copy["credit"] = None
+    return None, None
+
+
 def _repair_page_flow_columns(page_rows: List[Dict], previous_balance_hint=None) -> List[Dict]:
     if not page_rows:
         return page_rows
@@ -772,18 +854,19 @@ def _repair_page_flow_columns(page_rows: List[Dict], previous_balance_hint=None)
     for row in page_rows:
         row_copy = dict(row)
         curr_balance = _amount_to_decimal(row_copy.get("balance"))
-        debit = _amount_to_decimal(row_copy.get("debit"))
-        credit = _amount_to_decimal(row_copy.get("credit"))
+        debit, credit = _sanitize_row_flow_amounts(
+            row_copy,
+            prev_balance=prev_balance,
+            curr_balance=curr_balance,
+            flow_direction=flow_direction,
+        )
         description_bias = _flow_description_bias(row_copy.get("description"))
 
         if prev_balance is not None and curr_balance is not None and flow_direction:
             if debit is not None and credit is None:
-                if flow_direction == "ascending":
-                    expected_current = prev_balance - debit
-                    expected_swapped = prev_balance + debit
-                else:
-                    expected_current = prev_balance + debit
-                    expected_swapped = prev_balance - debit
+                expected_current = _expected_balance_for_flow(prev_balance, debit, None, flow_direction)
+                swapped_flow = "descending" if flow_direction == "ascending" else "ascending"
+                expected_swapped = _expected_balance_for_flow(prev_balance, debit, None, swapped_flow)
                 if (
                     description_bias != "debit"
                     and not _amounts_match(expected_current, curr_balance)
@@ -794,12 +877,9 @@ def _repair_page_flow_columns(page_rows: List[Dict], previous_balance_hint=None)
                     credit = debit
                     debit = None
             elif credit is not None and debit is None:
-                if flow_direction == "ascending":
-                    expected_current = prev_balance + credit
-                    expected_swapped = prev_balance - credit
-                else:
-                    expected_current = prev_balance - credit
-                    expected_swapped = prev_balance + credit
+                expected_current = _expected_balance_for_flow(prev_balance, None, credit, flow_direction)
+                swapped_flow = "descending" if flow_direction == "ascending" else "ascending"
+                expected_swapped = _expected_balance_for_flow(prev_balance, None, credit, swapped_flow)
                 if (
                     description_bias != "credit"
                     and not _amounts_match(expected_current, curr_balance)
