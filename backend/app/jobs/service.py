@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import fcntl
 import io
 import json
 import math
@@ -11,6 +12,7 @@ import os
 import threading
 import uuid
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from xml.sax.saxutils import escape as xml_escape
@@ -303,7 +305,7 @@ def get_status(job_id: str) -> Dict:
     parse_mode = str(payload.get("parse_mode") or "auto")
     runtime_status = str(payload.get("status") or "").strip().lower()
     # OCR jobs fan out into page tasks, so the parent job status is synthesized from page state.
-    if parse_mode == "ocr" and runtime_status in {"queued", "processing"}:
+    if runtime_status in {"queued", "processing"}:
         page_status = _load_page_status_map(repo, job_id)
         if page_status:
             changed = False
@@ -315,22 +317,29 @@ def get_status(job_id: str) -> Dict:
                 if not task_id:
                     continue
                 task_state = _get_celery_task_state(task_id)
-                if task_state in {"FAILURE", "REVOKED"}:
+                if task_state in {"SUCCESS", "FAILURE", "REVOKED"}:
+                    latest_fragment = _read_page_fragment(repo, job_id, page_name)
                     item = dict(item)
-                    item["status"] = "failed"
-                    item["message"] = f"task_terminated:{task_state.lower()}"
+                    if latest_fragment is not None:
+                        item["status"] = "done"
+                        item["rows_parsed"] = int(
+                            (latest_fragment.get("diag") or {}).get("rows_parsed")
+                            or len(latest_fragment.get("rows") or [])
+                        )
+                    else:
+                        item["status"] = "failed"
+                        item["message"] = f"task_terminated:{task_state.lower()}"
                     item["updated_at"] = dt.datetime.utcnow().isoformat() + "Z"
                     page_status[page_name] = item
                     changed = True
             if changed:
                 _write_page_status_map(repo, job_id, page_status)
             payload = _refresh_job_progress(repo, job_id, parse_mode=parse_mode)
-            # When no OCR pages are still active, finalize the merged outputs on demand.
             if int(payload.get("pages_total") or 0) > 0 and int(payload.get("pages_inflight") or 0) == 0:
                 payload = finalize_job_processing(job_id=job_id, parse_mode=parse_mode)
-        payload["progress"] = _coerce_progress(payload.get("progress"), 0)
-        payload["is_reversed"] = bool(job_state.get("is_reversed", False))
-        return payload
+            payload["progress"] = _coerce_progress(payload.get("progress"), 0)
+            payload["is_reversed"] = bool(job_state.get("is_reversed", False))
+            return payload
 
     task_id = str(payload.get("task_id") or "").strip()
     if runtime_status in {"queued", "processing"} and task_id:
@@ -814,30 +823,28 @@ def process_job_page(
     if not (cleaned_dir / page_file).exists():
         raise RuntimeError(f"cleaned_page_missing:{page_file}")
 
-    page_status = _load_page_status_map(repo, job_id)
-    payload = dict(page_status.get(page_name) or {})
-    payload["status"] = "processing"
-    payload["page_index"] = int(page_index)
-    payload["page_count"] = int(page_count)
-    payload["updated_at"] = dt.datetime.utcnow().isoformat() + "Z"
-    if task_id:
-        payload["task_id"] = task_id
-    page_status[page_name] = payload
-    _write_page_status_map(repo, job_id, page_status)
+    with _edit_page_status_map(repo, job_id) as page_status:
+        payload = dict(page_status.get(page_name) or {})
+        payload["status"] = "processing"
+        payload["page_index"] = int(page_index)
+        payload["page_count"] = int(page_count)
+        payload["updated_at"] = dt.datetime.utcnow().isoformat() + "Z"
+        if task_id:
+            payload["task_id"] = task_id
+        page_status[page_name] = payload
     _refresh_job_progress(repo, job_id, parse_mode=parse_mode, active_task_id=task_id)
 
     def _heartbeat(wait_seconds: float):
         # Long OCR waits still emit status so the processing UI can show that work is alive.
-        current = _load_page_status_map(repo, job_id)
-        target = dict(current.get(page_name) or {})
-        if str(target.get("status") or "").strip().lower() == "done":
-            return
-        target["status"] = "processing"
-        target["step"] = "rate_limit_wait"
-        target["wait_seconds"] = round(float(wait_seconds), 3)
-        target["updated_at"] = dt.datetime.utcnow().isoformat() + "Z"
-        current[page_name] = target
-        _write_page_status_map(repo, job_id, current)
+        with _edit_page_status_map(repo, job_id) as current:
+            target = dict(current.get(page_name) or {})
+            if str(target.get("status") or "").strip().lower() == "done":
+                return
+            target["status"] = "processing"
+            target["step"] = "rate_limit_wait"
+            target["wait_seconds"] = round(float(wait_seconds), 3)
+            target["updated_at"] = dt.datetime.utcnow().isoformat() + "Z"
+            current[page_name] = target
 
     page_name, page_rows, page_bounds, page_diag = process_ocr_page(
         page_file=page_file,
@@ -847,13 +854,12 @@ def process_job_page(
     )
     _write_page_fragment(repo, job_id, page_name, page_rows=page_rows, page_bounds=page_bounds, page_diag=page_diag)
 
-    page_status = _load_page_status_map(repo, job_id)
-    payload = dict(page_status.get(page_name) or {})
-    payload["status"] = "done"
-    payload["rows_parsed"] = int(page_diag.get("rows_parsed") or len(page_rows))
-    payload["updated_at"] = dt.datetime.utcnow().isoformat() + "Z"
-    page_status[page_name] = payload
-    _write_page_status_map(repo, job_id, page_status)
+    with _edit_page_status_map(repo, job_id) as page_status:
+        payload = dict(page_status.get(page_name) or {})
+        payload["status"] = "done"
+        payload["rows_parsed"] = int(page_diag.get("rows_parsed") or len(page_rows))
+        payload["updated_at"] = dt.datetime.utcnow().isoformat() + "Z"
+        page_status[page_name] = payload
 
     merged = _refresh_job_progress(repo, job_id, parse_mode=parse_mode, active_task_id=task_id)
     if merged.get("pages_total", 0) > 0 and int(merged.get("pages_inflight") or 0) == 0:
@@ -877,19 +883,18 @@ def mark_page_retrying(
     """Persist retry metadata for a page task before Celery requeues it."""
     repo = JobsRepository(DATA_DIR)
     page_name = normalize_page_name(page_name)
-    page_status = _load_page_status_map(repo, job_id)
-    payload = dict(page_status.get(page_name) or {})
-    payload["status"] = "retrying"
-    payload["retry_attempt"] = max(0, int(retry_attempt))
-    payload["retry_max_attempts"] = max(0, int(retry_max_attempts))
-    payload["retry_in_seconds"] = max(0, int(retry_in_seconds))
-    if message:
-        payload["message"] = _error_message(message)
-    payload["updated_at"] = dt.datetime.utcnow().isoformat() + "Z"
-    if task_id:
-        payload["task_id"] = task_id
-    page_status[page_name] = payload
-    _write_page_status_map(repo, job_id, page_status)
+    with _edit_page_status_map(repo, job_id) as page_status:
+        payload = dict(page_status.get(page_name) or {})
+        payload["status"] = "retrying"
+        payload["retry_attempt"] = max(0, int(retry_attempt))
+        payload["retry_max_attempts"] = max(0, int(retry_max_attempts))
+        payload["retry_in_seconds"] = max(0, int(retry_in_seconds))
+        if message:
+            payload["message"] = _error_message(message)
+        payload["updated_at"] = dt.datetime.utcnow().isoformat() + "Z"
+        if task_id:
+            payload["task_id"] = task_id
+        page_status[page_name] = payload
     _refresh_job_progress(repo, job_id, parse_mode=parse_mode, active_task_id=task_id)
 
 
@@ -905,17 +910,16 @@ def mark_page_failed(
     """Persist a terminal page failure and finalize when no pages remain in flight."""
     repo = JobsRepository(DATA_DIR)
     page_name = normalize_page_name(page_name)
-    page_status = _load_page_status_map(repo, job_id)
-    payload = dict(page_status.get(page_name) or {})
-    payload["status"] = "failed"
-    payload["message"] = _error_message(message)
-    payload["retry_attempt"] = max(0, int(retry_attempt))
-    payload["retry_max_attempts"] = max(0, int(retry_max_attempts))
-    payload["updated_at"] = dt.datetime.utcnow().isoformat() + "Z"
-    if task_id:
-        payload["task_id"] = task_id
-    page_status[page_name] = payload
-    _write_page_status_map(repo, job_id, page_status)
+    with _edit_page_status_map(repo, job_id) as page_status:
+        payload = dict(page_status.get(page_name) or {})
+        payload["status"] = "failed"
+        payload["message"] = _error_message(message)
+        payload["retry_attempt"] = max(0, int(retry_attempt))
+        payload["retry_max_attempts"] = max(0, int(retry_max_attempts))
+        payload["updated_at"] = dt.datetime.utcnow().isoformat() + "Z"
+        if task_id:
+            payload["task_id"] = task_id
+        page_status[page_name] = payload
     merged = _refresh_job_progress(repo, job_id, parse_mode=parse_mode, active_task_id=task_id)
     if merged.get("pages_total", 0) > 0 and int(merged.get("pages_inflight") or 0) == 0:
         try:
@@ -1193,8 +1197,22 @@ def _page_status_path(repo: JobsRepository, job_id: str) -> Path:
     return repo.path(job_id, "result", "page_status.json")
 
 
+def _page_status_lock_path(repo: JobsRepository, job_id: str) -> Path:
+    return repo.path(job_id, "result", "page_status.lock")
+
+
 def _page_fragment_path(repo: JobsRepository, job_id: str, page_name: str) -> Path:
     return repo.path(job_id, "result", "page_fragments", f"{normalize_page_name(page_name)}.json")
+
+
+def _coerce_page_status_map(data: Any) -> Dict[str, Dict[str, Any]]:
+    if not isinstance(data, dict):
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for key, value in data.items():
+        if isinstance(value, dict):
+            out[str(key)] = dict(value)
+    return out
 
 
 def _load_pages_manifest(repo: JobsRepository, job_id: str) -> Dict[str, Any]:
@@ -1232,14 +1250,25 @@ def _write_pages_manifest(repo: JobsRepository, job_id: str, page_files: List[st
 
 def _load_page_status_map(repo: JobsRepository, job_id: str) -> Dict[str, Dict[str, Any]]:
     path = _page_status_path(repo, job_id)
-    data = repo.read_json(path, default={})
-    if not isinstance(data, dict):
-        return {}
-    out: Dict[str, Dict[str, Any]] = {}
-    for key, value in data.items():
-        if isinstance(value, dict):
-            out[str(key)] = dict(value)
-    return out
+    return _coerce_page_status_map(repo.read_json(path, default={}))
+
+
+@contextmanager
+def _edit_page_status_map(repo: JobsRepository, job_id: str):
+    """Serialize read-modify-write updates so parallel page workers cannot drop each other's state."""
+    lock_path = _page_status_lock_path(repo, job_id)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        payload = _load_page_status_map(repo, job_id)
+        try:
+            yield payload
+        except Exception:
+            raise
+        else:
+            repo.write_json(_page_status_path(repo, job_id), payload)
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _write_page_status_map(repo: JobsRepository, job_id: str, payload: Dict[str, Dict[str, Any]]) -> None:

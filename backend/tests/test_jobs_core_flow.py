@@ -315,6 +315,72 @@ def test_reparse_google_vision_endpoint_removed(client):
     assert res.status_code == 404
 
 
+def test_get_status_reconciles_stale_google_vision_page_tasks(client, monkeypatch):
+    create = client.post(
+        "/jobs",
+        files={"file": ("statement.pdf", b"%PDF-1.4\n%%EOF", "application/pdf")},
+        data={"mode": "google_vision", "auto_start": "false"},
+    )
+    assert create.status_code == 200
+    job_id = create.json()["job_id"]
+
+    repo = jobs_service.JobsRepository(jobs_service.DATA_DIR)
+    repo.write_status(
+        job_id,
+        {
+            "status": "processing",
+            "step": "ocr_parsing",
+            "progress": 94,
+            "parse_mode": "google_vision",
+            "pages_total": 2,
+            "pages_done": 1,
+            "pages_failed": 0,
+            "pages_inflight": 1,
+            "active_task_ids": ["task-page-002"],
+        },
+    )
+    repo.write_json(repo.path(job_id, "result", "pages_manifest.json"), {"pages": ["page_001.png", "page_002.png"]})
+    repo.write_json(
+        repo.path(job_id, "result", "page_status.json"),
+        {
+            "page_001": {
+                "status": "done",
+                "task_id": "task-page-001",
+                "page_index": 1,
+                "page_count": 2,
+                "rows_parsed": 1,
+            },
+            "page_002": {
+                "status": "processing",
+                "task_id": "task-page-002",
+                "page_index": 2,
+                "page_count": 2,
+            },
+        },
+    )
+    repo.write_json(
+        repo.path(job_id, "result", "page_fragments", "page_001.json"),
+        {"page": "page_001", "rows": [{"row_id": "001", "description": "p1"}], "bounds": [], "diag": {"rows_parsed": 1}},
+    )
+    repo.write_json(
+        repo.path(job_id, "result", "page_fragments", "page_002.json"),
+        {"page": "page_002", "rows": [{"row_id": "002", "description": "p2"}], "bounds": [], "diag": {"rows_parsed": 1}},
+    )
+    monkeypatch.setattr(jobs_service, "_get_celery_task_state", lambda task_id: "SUCCESS" if task_id else "")
+
+    status = client.get(f"/jobs/{job_id}")
+    assert status.status_code == 200
+    payload = status.json()
+    assert payload["status"] == "done"
+    assert payload["step"] == "completed"
+    assert payload["progress"] == 100
+    assert payload["pages_done"] == 2
+    assert payload["pages_inflight"] == 0
+
+    page_status = repo.read_json(repo.path(job_id, "result", "page_status.json"), default={})
+    assert page_status["page_002"]["status"] == "done"
+
+
 def test_cancel_job_endpoint_marks_draft_cancelled(client, monkeypatch):
     monkeypatch.setattr(jobs_service, "resolve_parse_mode", lambda *_args, **_kwargs: "text")
 
