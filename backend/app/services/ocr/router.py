@@ -8,6 +8,7 @@ from typing import Any, Dict, List
 from pypdf import PdfReader
 
 from app.services.ocr.apple_vision import AppleVisionOCR
+from app.services.ocr.google_vision import GoogleVisionOCR
 from app.services.ocr.openai_vision import OpenAIVisionOCR
 
 DEFAULT_DIGITAL_TEXT_THRESHOLD = 300
@@ -91,13 +92,13 @@ def scanned_render_dpi() -> int:
 
 def build_scanned_ocr_router(page_count: int) -> ScannedOCRRouter:
     try:
-        openai_client = OpenAIVisionOCR.from_env()
+        google_vision_client = GoogleVisionOCR.from_env()
         return ScannedOCRRouter(
-            engine_name="openai_vision",
-            client=openai_client,
-            openai_client=openai_client,
+            engine_name="google_vision",
+            client=google_vision_client,
+            openai_client=None,
         )
-    except Exception as openai_error:
+    except Exception as google_error:
         if AppleVisionOCR.is_available():
             local_client = AppleVisionOCR.from_env()
             return ScannedOCRRouter(
@@ -105,4 +106,4 @@ def build_scanned_ocr_router(page_count: int) -> ScannedOCRRouter:
                 client=local_client,
                 openai_client=None,
             )
-        raise openai_error
+        raise google_error

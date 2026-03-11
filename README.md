@@ -155,12 +155,7 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 - `mode=pdftotext` forces the modern text-layer pipeline.
 - `mode=google_vision` forces the modern OCR pipeline.
 - Data is stored in `${DATA_DIR:-<repo>/storage}/jobs/<job_id>/...`.
-- Scanned PDFs route to OpenAI Vision OCR:
-  - `OPENAI_API_KEY`
-  - `OPENAI_OCR_USE_STRUCTURED_ROWS=true` (use OpenAI to return row fields + bounds directly)
-  - `MAX_OPENAI_PAGES_PER_DOC=50`
-  - `OPENAI_TIMEOUT_SECONDS=60`
-- Google Vision mode configuration:
+- Scanned PDFs route to Google Vision OCR:
   - `GOOGLE_VISION_API_KEY` (or `GOOGLE_APPLICATION_CREDENTIALS`)
   - `GOOGLE_VISION_BATCH_SIZE=5`
   - `GOOGLE_VISION_PDF_DPI=120`

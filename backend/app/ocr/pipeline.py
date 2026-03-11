@@ -27,7 +27,7 @@ from app.statement_parser import (
     parse_page_with_profile_fallback,
 )
 
-OCR_BACKEND = "openai_vision"
+OCR_BACKEND = "google_vision"
 PREVIEW_MAX_PIXELS = int(os.getenv("PREVIEW_MAX_PIXELS", "6000000"))
 OPENAI_OCR_USE_STRUCTURED_ROWS = str(os.getenv("OPENAI_OCR_USE_STRUCTURED_ROWS", "true")).strip().lower() in {
     "1",
