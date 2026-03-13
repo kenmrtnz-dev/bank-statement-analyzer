@@ -32,9 +32,12 @@
     previewTabButtons: Array.from(document.querySelectorAll('[data-preview-tab]')),
     previewTabPreviewBtn: document.getElementById('previewTabPreviewBtn'),
     previewTabDisbalanceBtn: document.getElementById('previewTabDisbalanceBtn'),
+    previewTabFlaggedBtn: document.getElementById('previewTabFlaggedBtn'),
     previewImagePanel: document.getElementById('previewImagePanel'),
     previewDisbalancePanel: document.getElementById('previewDisbalancePanel'),
+    previewFlaggedPanel: document.getElementById('previewFlaggedPanel'),
     disbalanceRowsBody: document.getElementById('disbalanceRowsBody'),
+    flaggedRowsBody: document.getElementById('flaggedRowsBody'),
     previewImage: document.getElementById('previewImage'),
     previewEmpty: document.getElementById('previewEmpty'),
     overlay: document.getElementById('overlay'),
@@ -1096,6 +1099,7 @@
     if (els.rowCount) els.rowCount.textContent = '0 rows';
     if (els.parsedJsonBody) els.parsedJsonBody.textContent = '';
     renderDisbalanceTable();
+    renderFlaggedTransactionsTable();
     updateReverseRowsActionState();
     syncParsedSectionHeightToPreview();
   }
@@ -1128,7 +1132,9 @@
   }
 
   function normalizePreviewPanelTab(rawTab) {
-    return String(rawTab || '').trim().toLowerCase() === 'disbalance' ? 'disbalance' : 'preview';
+    const tab = String(rawTab || '').trim().toLowerCase();
+    if (tab === 'disbalance' || tab === 'flagged') return tab;
+    return 'preview';
   }
 
   function formatSignedAmount(value) {
@@ -1216,17 +1222,47 @@
     return entries;
   }
 
-  function renderDisbalanceTable() {
-    if (!els.disbalanceRowsBody) return;
-    const rowsBody = els.disbalanceRowsBody;
-    rowsBody.innerHTML = '';
+  function collectFlaggedTransactionEntries() {
+    const entries = [];
+    for (const page of getOrderedPages()) {
+      const rows = getOrderedRows(page);
+      for (let idx = 0; idx < rows.length; idx += 1) {
+        const row = rows[idx] || {};
+        const description = normalizeEditableCellValue(row?.description).trim();
+        const match = getDescriptionFlagMatch(description, page);
+        if (!match) continue;
 
+        entries.push({
+          page,
+          rowId: String(row?.row_id || '').trim() || String(idx + 1).padStart(3, '0'),
+          date: normalizeEditableCellValue(row?.date).trim(),
+          description,
+          bank: match.bank,
+          code: match.code,
+        });
+      }
+    }
+    return entries;
+  }
+
+  function updatePreviewSupplementalTabLabels() {
     if (els.previewTabDisbalanceBtn) {
       const loadedCount = collectDisbalanceEntries().length;
       els.previewTabDisbalanceBtn.textContent = state.disbalanceLoading
         ? `Disbalance (${loadedCount}+)`
         : `Disbalance (${loadedCount})`;
     }
+    if (els.previewTabFlaggedBtn) {
+      const count = collectFlaggedTransactionEntries().length;
+      els.previewTabFlaggedBtn.textContent = `Flagged Transactions (${count})`;
+    }
+  }
+
+  function renderDisbalanceTable() {
+    if (!els.disbalanceRowsBody) return;
+    const rowsBody = els.disbalanceRowsBody;
+    rowsBody.innerHTML = '';
+    updatePreviewSupplementalTabLabels();
 
     if (state.disbalanceLoading) {
       const tr = document.createElement('tr');
@@ -1260,6 +1296,42 @@
     }
   }
 
+  function renderFlaggedTransactionsTable() {
+    if (!els.flaggedRowsBody) return;
+    const rowsBody = els.flaggedRowsBody;
+    rowsBody.innerHTML = '';
+    updatePreviewSupplementalTabLabels();
+
+    if (state.disbalanceLoading) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = '<td colspan="7" class="table-empty-cell">Loading flagged transactions…</td>';
+      rowsBody.appendChild(tr);
+      return;
+    }
+
+    const entries = collectFlaggedTransactionEntries();
+    if (!entries.length) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = '<td colspan="7" class="table-empty-cell">No flagged transactions found.</td>';
+      rowsBody.appendChild(tr);
+      return;
+    }
+
+    for (const entry of entries) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td>${escapeHtml(entry.page)}</td>
+        <td>${escapeHtml(entry.rowId)}</td>
+        <td>${escapeHtml(formatParsedRowDate(entry.date))}</td>
+        <td>${escapeHtml(entry.description || '-')}</td>
+        <td>${escapeHtml(entry.bank || '-')}</td>
+        <td>${escapeHtml(entry.code || '-')}</td>
+        <td><button class="row-action-btn action-review flagged-jump-btn" type="button" data-page="${escapeHtml(entry.page)}" data-row-id="${escapeHtml(entry.rowId)}">Go to Row</button></td>
+      `;
+      rowsBody.appendChild(tr);
+    }
+  }
+
   async function ensureAllPagesParsedLoaded() {
     if (!state.jobId) return;
     const missingPages = (state.pages || []).filter((page) => !Array.isArray(state.parsedByPage[page]));
@@ -1268,6 +1340,7 @@
 
     state.disbalanceLoading = true;
     renderDisbalanceTable();
+    renderFlaggedTransactionsTable();
 
     state.disbalanceLoadPromise = (async () => {
       let payload = null;
@@ -1293,13 +1366,15 @@
       state.disbalanceLoadPromise = null;
       state.disbalanceLoading = false;
       renderDisbalanceTable();
+      renderFlaggedTransactionsTable();
     }
   }
 
   function setPreviewPanelTab(tab) {
     const next = normalizePreviewPanelTab(tab);
-    const wasDisbalance = state.previewPanelTab === 'disbalance';
-    if (next === 'disbalance' && state.previewPanelTab !== 'disbalance' && els.previewSectionCard) {
+    const wasSupplemental = state.previewPanelTab !== 'preview';
+    const isSupplemental = next !== 'preview';
+    if (isSupplemental && state.previewPanelTab === 'preview' && els.previewSectionCard) {
       const currentHeight = Math.round(els.previewSectionCard.getBoundingClientRect().height || 0);
       if (Number.isFinite(currentHeight) && currentHeight > 0) {
         state.previewPanelHeightRef = currentHeight;
@@ -1307,11 +1382,13 @@
     }
     state.previewPanelTab = next;
     const isDisbalance = next === 'disbalance';
+    const isFlagged = next === 'flagged';
 
-    if (els.previewImagePanel) els.previewImagePanel.classList.toggle('hidden', isDisbalance);
+    if (els.previewImagePanel) els.previewImagePanel.classList.toggle('hidden', isSupplemental);
     if (els.previewDisbalancePanel) els.previewDisbalancePanel.classList.toggle('hidden', !isDisbalance);
+    if (els.previewFlaggedPanel) els.previewFlaggedPanel.classList.toggle('hidden', !isFlagged);
     if (els.previewSectionCard) {
-      if (isDisbalance && state.previewPanelHeightRef > 0) {
+      if (isSupplemental && state.previewPanelHeightRef > 0) {
         els.previewSectionCard.style.minHeight = `${state.previewPanelHeightRef}px`;
       } else {
         els.previewSectionCard.style.removeProperty('min-height');
@@ -1325,15 +1402,16 @@
       button.setAttribute('aria-selected', active ? 'true' : 'false');
     }
 
-    if (isDisbalance) {
+    if (isSupplemental) {
       renderDisbalanceTable();
+      renderFlaggedTransactionsTable();
       ensureAllPagesParsedLoaded().catch(() => {
         renderDisbalanceTable();
+        renderFlaggedTransactionsTable();
       });
-    } else if (els.previewTabDisbalanceBtn) {
-      const count = collectDisbalanceEntries().length;
-      els.previewTabDisbalanceBtn.textContent = `Disbalance (${count})`;
-      if (wasDisbalance) {
+    } else {
+      updatePreviewSupplementalTabLabels();
+      if (wasSupplemental) {
         window.requestAnimationFrame(() => {
           loadPreview({ preserveSelectedRow: true, forceReload: true });
           drawSelectedBound();
@@ -1923,6 +2001,7 @@
       }
     }
     renderDisbalanceTable();
+    updatePreviewSupplementalTabLabels();
   }
 
   function applyDescriptionFlagStyles(page) {
@@ -1942,6 +2021,7 @@
       tr.classList.toggle('bank-code-flag-row', Boolean(match));
       input.title = match ? `Flagged transaction code ${match.code} (${match.bank})` : '';
     }
+    renderFlaggedTransactionsTable();
   }
 
   function getParsedRowVisualState(page, row, rowId, mismatchIds, baselineRowsById) {
@@ -2630,8 +2710,10 @@
     renderPages();
     await loadCurrentPageData();
     renderDisbalanceTable();
+    renderFlaggedTransactionsTable();
     ensureAllPagesParsedLoaded().catch(() => {
       renderDisbalanceTable();
+      renderFlaggedTransactionsTable();
     });
     updateExportAvailability();
     updatePreviewEmptyState();
@@ -3086,6 +3168,20 @@
       const target = e.target;
       if (!(target instanceof HTMLElement)) return;
       const btn = target.closest('.disbalance-jump-btn');
+      if (!btn) return;
+      const page = String(btn.getAttribute('data-page') || '').trim();
+      const rowId = String(btn.getAttribute('data-row-id') || '').trim();
+      jumpToParsedRow(page, rowId).catch((err) => {
+        alert(`Unable to jump to row: ${normalizeApiErrorMessage(err?.message)}`);
+      });
+    });
+  }
+
+  if (els.flaggedRowsBody) {
+    els.flaggedRowsBody.addEventListener('click', (e) => {
+      const target = e.target;
+      if (!(target instanceof HTMLElement)) return;
+      const btn = target.closest('.flagged-jump-btn');
       if (!btn) return;
       const page = String(btn.getAttribute('data-page') || '').trim();
       const rowId = String(btn.getAttribute('data-row-id') || '').trim();

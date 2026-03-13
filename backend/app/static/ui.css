@@ -814,12 +814,14 @@ button:active,
   background: #f3f1ff;
 }
 
-.disbalance-table-wrap {
+.disbalance-table-wrap,
+.flagged-transactions-table-wrap {
   margin-top: 8px;
   max-height: 320px;
 }
 
-.disbalance-table-wrap td {
+.disbalance-table-wrap td,
+.flagged-transactions-table-wrap td {
   font-size: 12px;
 }
 

@@ -197,6 +197,7 @@
               <div class="preview-panel-tabs" role="tablist" aria-label="Preview panel tabs">
                 <button id="previewTabPreviewBtn" class="preview-panel-tab active" type="button" data-preview-tab="preview" role="tab" aria-selected="true">Preview</button>
                 <button id="previewTabDisbalanceBtn" class="preview-panel-tab" type="button" data-preview-tab="disbalance" role="tab" aria-selected="false">Disbalance</button>
+                <button id="previewTabFlaggedBtn" class="preview-panel-tab" type="button" data-preview-tab="flagged" role="tab" aria-selected="false">Flagged Transactions</button>
               </div>
               <div id="previewImagePanel">
                 <div class="preview-wrap" id="previewWrap">
@@ -222,6 +223,24 @@
                       </tr>
                     </thead>
                     <tbody id="disbalanceRowsBody"></tbody>
+                  </table>
+                </div>
+              </div>
+              <div id="previewFlaggedPanel" class="hidden">
+                <div class="table-wrap flagged-transactions-table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Page</th>
+                        <th>Row</th>
+                        <th>Date</th>
+                        <th>Description</th>
+                        <th>Bank</th>
+                        <th>Code</th>
+                        <th>Action</th>
+                      </tr>
+                    </thead>
+                    <tbody id="flaggedRowsBody"></tbody>
                   </table>
                 </div>
               </div>
