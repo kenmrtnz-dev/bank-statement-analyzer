@@ -6,6 +6,7 @@ import datetime as dt
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 import time
@@ -195,6 +196,12 @@ def ensure_job_transactions_schema(data_dir: str | Path) -> None:
                 return
         inspector = inspect(engine)
         expected_columns = set(JobTransactionRecord.__table__.c.keys())
+        additive_columns = {
+            "is_flagged": "ALTER TABLE job_transactions ADD COLUMN is_flagged BOOLEAN NOT NULL DEFAULT FALSE",
+            "is_disbalanced": "ALTER TABLE job_transactions ADD COLUMN is_disbalanced BOOLEAN NOT NULL DEFAULT FALSE",
+            "disbalance_expected_balance": "ALTER TABLE job_transactions ADD COLUMN disbalance_expected_balance NUMERIC(18, 2) NULL",
+            "disbalance_delta": "ALTER TABLE job_transactions ADD COLUMN disbalance_delta NUMERIC(18, 2) NULL",
+        }
         legacy_columns = {
             "row_id",
             "rownumber",
@@ -210,7 +217,12 @@ def ensure_job_transactions_schema(data_dir: str | Path) -> None:
             existing_columns = {column.get("name") for column in inspector.get_columns("job_transactions")}
             missing_columns = expected_columns - existing_columns
             if missing_columns:
-                if legacy_columns.issubset(existing_columns):
+                additive_missing = missing_columns & set(additive_columns)
+                if additive_missing and missing_columns == additive_missing:
+                    with engine.begin() as conn:
+                        for column_name in sorted(additive_missing):
+                            conn.execute(text(additive_columns[column_name]))
+                elif legacy_columns.issubset(existing_columns):
                     _rebuild_legacy_job_transactions_schema(engine)
                 else:
                     missing = ", ".join(sorted(missing_columns))
@@ -612,6 +624,97 @@ def _normalize_row_number_value(value: Any, fallback: Any = None) -> int | None:
         return None
 
 
+def _normalize_bank_flag_code(value: Any) -> str:
+    return re.sub(r"[^A-Z0-9_-]", "", str(value or "").strip().upper())
+
+
+def _description_contains_flag_code(description: Any, code: str) -> bool:
+    text = str(description or "").upper()
+    token = _normalize_bank_flag_code(code)
+    if not text or not token:
+        return False
+    pattern = re.compile(rf"(^|[^A-Z0-9]){re.escape(token)}([^A-Z0-9]|$)")
+    return bool(pattern.search(text))
+
+
+def _compute_is_flagged(description: Any, codes: set[str]) -> bool:
+    if not codes:
+        return False
+    return any(_description_contains_flag_code(description, code) for code in codes)
+
+
+def _infer_balance_flow_direction(rows: list[dict[str, Any]]) -> str:
+    if len(rows) < 2:
+        return "ascending"
+    ascending_hits = 0
+    descending_hits = 0
+    for idx in range(1, len(rows)):
+        prev = rows[idx - 1] or {}
+        current = rows[idx] or {}
+        prev_bal = _to_float(prev.get("balance"))
+        curr_bal = _to_float(current.get("balance"))
+        debit = _to_float(current.get("debit"))
+        credit = _to_float(current.get("credit"))
+        if prev_bal is None or curr_bal is None:
+            continue
+        if debit is not None and credit is None:
+            if abs((prev_bal - debit) - curr_bal) <= 0.01:
+                ascending_hits += 1
+            if abs((prev_bal + debit) - curr_bal) <= 0.01:
+                descending_hits += 1
+        elif credit is not None and debit is None:
+            if abs((prev_bal + credit) - curr_bal) <= 0.01:
+                ascending_hits += 1
+            if abs((prev_bal - credit) - curr_bal) <= 0.01:
+                descending_hits += 1
+    if descending_hits > ascending_hits:
+        return "descending"
+    return "ascending"
+
+
+def _expected_balance_for_flow(prev_balance: float | None, debit: float | None, credit: float | None, flow_direction: str) -> float | None:
+    if prev_balance is None:
+        return None
+    debit_value = debit if debit is not None else 0.0
+    credit_value = credit if credit is not None else 0.0
+    if flow_direction == "descending":
+        return prev_balance + debit_value - credit_value
+    return prev_balance - debit_value + credit_value
+
+
+def _compute_disbalance_fields(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    flow_direction = _infer_balance_flow_direction(rows)
+    for idx, row in enumerate(rows):
+        payload = dict(row or {})
+        payload["is_disbalanced"] = False
+        payload["disbalance_expected_balance"] = None
+        payload["disbalance_delta"] = None
+        if idx == 0:
+            output.append(payload)
+            continue
+        prev = rows[idx - 1] or {}
+        prev_bal = _to_float(prev.get("balance"))
+        curr_bal = _to_float(payload.get("balance"))
+        debit = _to_float(payload.get("debit"))
+        credit = _to_float(payload.get("credit"))
+        has_flow = debit is not None or credit is not None
+        if prev_bal is None or curr_bal is None or not has_flow:
+            output.append(payload)
+            continue
+        expected = _expected_balance_for_flow(prev_bal, debit, credit, flow_direction)
+        if expected is None:
+            output.append(payload)
+            continue
+        delta = curr_bal - expected
+        if abs(delta) > 0.01:
+            payload["is_disbalanced"] = True
+            payload["disbalance_expected_balance"] = round(expected, 2)
+            payload["disbalance_delta"] = round(delta, 2)
+        output.append(payload)
+    return output
+
+
 class JobResultsRawRepository:
     """Store one raw extraction payload per job for audit/debug workflows."""
 
@@ -683,6 +786,7 @@ class JobTransactionsRepository:
     def __init__(self, data_dir: str | Path):
         self.data_dir = Path(data_dir)
         ensure_job_transactions_schema(self.data_dir)
+        ensure_bank_code_flags_schema(self.data_dir)
         self.engine = _get_db_engine(self.data_dir)
 
     def has_rows(self, job_id: str) -> bool:
@@ -698,11 +802,13 @@ class JobTransactionsRepository:
             return session.execute(stmt).scalar_one_or_none() is not None
 
     def get_rows_by_job(self, job_id: str) -> Dict[str, list[dict[str, Any]]]:
+        self._sync_flagged_status(job_id)
         records = self._fetch_records(job_id, include_deleted=False)
         rows_by_page, _ = self._records_to_payload(records, include_deleted=False)
         return rows_by_page
 
     def get_bounds_by_job(self, job_id: str) -> Dict[str, list[dict[str, Any]]]:
+        self._sync_flagged_status(job_id)
         records = self._fetch_records(job_id, include_deleted=False)
         _, bounds_by_page = self._records_to_payload(records, include_deleted=False)
         return bounds_by_page
@@ -774,6 +880,7 @@ class JobTransactionsRepository:
                     "credit": row.get("credit"),
                     "balance": row.get("balance"),
                     "row_type": str(row.get("row_type") or "transaction"),
+                    "is_flagged": bool(row.get("is_flagged", False)),
                     "is_new_row": is_new_row,
                     "is_modified": is_modified,
                     "is_deleted": False,
@@ -796,6 +903,7 @@ class JobTransactionsRepository:
                     "credit": existing.get("credit"),
                     "balance": existing.get("balance"),
                     "row_type": str(existing.get("row_type") or "transaction"),
+                    "is_flagged": bool(existing.get("is_flagged", False)),
                     "is_new_row": bool(existing.get("is_new_row")),
                     "is_modified": True,
                     "is_deleted": True,
@@ -855,6 +963,7 @@ class JobTransactionsRepository:
             )
 
         with Session(self.engine) as session:
+            self._sync_flagged_status(session=session, job_id=job_value or None)
             count_stmt = select(func.count()).select_from(JobTransactionRecord)
             row_stmt = select(JobTransactionRecord).order_by(
                 JobTransactionRecord.updated_at.desc(),
@@ -899,8 +1008,9 @@ class JobTransactionsRepository:
         now = dt.datetime.utcnow()
         payloads: list[dict[str, Any]] = []
         global_row_index = 0
+        flag_codes = self._load_flag_codes()
         for page_key in sorted((rows_by_page or {}).keys(), key=_page_sort_value):
-            rows = rows_by_page.get(page_key) or []
+            rows = _compute_disbalance_fields(rows_by_page.get(page_key) or [])
             bounds_state = _prepare_bounds_state(bounds_by_page.get(page_key))
             canonical_page_key = _output_page_key(page_key)
             for row_index, row in enumerate(rows, start=1):
@@ -929,6 +1039,10 @@ class JobTransactionsRepository:
                         "credit_bounds": expanded_bounds["credit_bounds"],
                         "balance_bounds": expanded_bounds["balance_bounds"],
                         "row_type": str(row.get("row_type") or "transaction"),
+                        "is_flagged": _compute_is_flagged(row.get("description"), flag_codes),
+                        "is_disbalanced": bool(row.get("is_disbalanced", False)),
+                        "disbalance_expected_balance": _to_decimal(row.get("disbalance_expected_balance")),
+                        "disbalance_delta": _to_decimal(row.get("disbalance_delta")),
                         "is_new_row": bool(row.get("is_new_row", False)),
                         "is_modified": bool(row.get("is_modified", is_manual_edit)),
                         "is_deleted": bool(row.get("is_deleted", False)),
@@ -980,6 +1094,10 @@ class JobTransactionsRepository:
             "credit": _to_float(record.credit),
             "balance": _to_float(record.balance),
             "row_type": str(record.row_type or "transaction"),
+            "is_flagged": bool(record.is_flagged),
+            "is_disbalanced": bool(record.is_disbalanced),
+            "disbalance_expected_balance": _to_float(record.disbalance_expected_balance),
+            "disbalance_delta": _to_float(record.disbalance_delta),
             "bounds": merged_bounds,
             "row_number_bounds": record.row_number_bounds,
             "date_bounds": record.date_bounds,
@@ -1032,6 +1150,10 @@ class JobTransactionsRepository:
                 "credit": _to_float(record.credit),
                 "balance": _to_float(record.balance),
                 "row_type": str(record.row_type or "transaction"),
+                "is_flagged": bool(record.is_flagged),
+                "is_disbalanced": bool(record.is_disbalanced),
+                "disbalance_expected_balance": _to_float(record.disbalance_expected_balance),
+                "disbalance_delta": _to_float(record.disbalance_delta),
                 "is_new_row": bool(record.is_new_row),
                 "is_modified": bool(record.is_modified),
                 "is_deleted": bool(record.is_deleted),
@@ -1063,6 +1185,56 @@ class JobTransactionsRepository:
             }
             bounds_by_page.setdefault(page_key, []).append(bounds_payload)
         return rows_by_page, bounds_by_page
+
+    def _load_flag_codes(self) -> set[str]:
+        with Session(self.engine) as session:
+            stmt = select(BankCodeFlagRecord.tx_code).distinct()
+            rows = session.execute(stmt).scalars().all()
+        return {_normalize_bank_flag_code(value) for value in rows if _normalize_bank_flag_code(value)}
+
+    def _sync_flagged_status(
+        self,
+        job_id: str | None = None,
+        *,
+        session: Session | None = None,
+    ) -> None:
+        own_session = session is None
+        active_session = session or Session(self.engine)
+        try:
+            flag_codes = self._load_flag_codes()
+            if not flag_codes:
+                stmt = select(JobTransactionRecord).where(JobTransactionRecord.is_flagged.is_(True))
+                if job_id:
+                    stmt = stmt.where(JobTransactionRecord.job_id == str(job_id))
+                records = active_session.execute(stmt).scalars().all()
+                changed = False
+                now = dt.datetime.now(dt.timezone.utc)
+                for record in records:
+                    record.is_flagged = False
+                    record.updated_at = now
+                    changed = True
+                if changed and own_session:
+                    active_session.commit()
+                return
+
+            stmt = select(JobTransactionRecord)
+            if job_id:
+                stmt = stmt.where(JobTransactionRecord.job_id == str(job_id))
+            records = active_session.execute(stmt).scalars().all()
+            changed = False
+            now = dt.datetime.now(dt.timezone.utc)
+            for record in records:
+                next_flagged = _compute_is_flagged(record.description, flag_codes)
+                if bool(record.is_flagged) == next_flagged:
+                    continue
+                record.is_flagged = next_flagged
+                record.updated_at = now
+                changed = True
+            if changed and own_session:
+                active_session.commit()
+        finally:
+            if own_session:
+                active_session.close()
 
 
 def _parse_iso_datetime(value: Any) -> dt.datetime | None:

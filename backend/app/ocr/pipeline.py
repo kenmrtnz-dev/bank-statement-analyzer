@@ -81,6 +81,8 @@ def run_pipeline(job_dir: str | Path, parse_mode: str, report: ProgressReporter)
         try:
             parsed_output, bounds_output, diagnostics = _run_text_pipeline(
                 input_pdf=input_pdf,
+                pages_dir=pages_dir,
+                cleaned_dir=cleaned_dir,
                 ocr_dir=ocr_dir,
                 report=report,
             )
@@ -121,12 +123,21 @@ def run_pipeline(job_dir: str | Path, parse_mode: str, report: ProgressReporter)
     }
 
 
-def _run_text_pipeline(input_pdf: Path, ocr_dir: Path, report: ProgressReporter) -> tuple[Dict, Dict, Dict]:
+def _run_text_pipeline(
+    input_pdf: Path,
+    ocr_dir: Path,
+    report: ProgressReporter,
+    *,
+    pages_dir: Path | None = None,
+    cleaned_dir: Path | None = None,
+) -> tuple[Dict, Dict, Dict]:
     report("processing", "text_extraction", 10)
     layout_pages = extract_pdf_layout_pages(str(input_pdf))
     if not layout_pages:
         raise RuntimeError("text_layer_not_found")
 
+    pages_dir = Path(pages_dir or (input_pdf.parent / "pages"))
+    cleaned_dir = Path(cleaned_dir or (input_pdf.parent / "cleaned"))
     parsed_output: Dict[str, List[Dict]] = {}
     bounds_output: Dict[str, List[Dict]] = {}
     diagnostics: Dict[str, Dict] = {"job": {"source_type": "text"}, "pages": {}}
@@ -136,6 +147,23 @@ def _run_text_pipeline(input_pdf: Path, ocr_dir: Path, report: ProgressReporter)
     last_balance_hint = None
     previous_page_rows: List[Dict] = []
     seen_row_signatures: set[tuple] = set()
+    fallback_page_files: List[str] | None = None
+    fallback_ocr_router = None
+
+    def _ensure_text_ocr_fallback() -> tuple[List[str], object]:
+        nonlocal fallback_page_files, fallback_ocr_router
+        if fallback_page_files is None:
+            fallback_page_files = prepare_ocr_pages(
+                input_pdf=input_pdf,
+                pages_dir=pages_dir,
+                cleaned_dir=cleaned_dir,
+                report=None,
+            )
+        if fallback_ocr_router is None:
+            fallback_ocr_router = build_scanned_ocr_router(page_count=len(fallback_page_files))
+            diagnostics["job"]["source_type"] = "mixed"
+            diagnostics["job"]["ocr_backend"] = fallback_ocr_router.engine_name
+        return fallback_page_files, fallback_ocr_router
 
     total = len(layout_pages)
     for idx, layout in enumerate(layout_pages, start=1):
@@ -144,6 +172,54 @@ def _run_text_pipeline(input_pdf: Path, ocr_dir: Path, report: ProgressReporter)
         page_w = float(layout.get("width") or 1)
         page_h = float(layout.get("height") or 1)
         text = str(layout.get("text") or "")
+
+        if not words and not text.strip():
+            page_files, ocr_router = _ensure_text_ocr_fallback()
+            if idx > len(page_files):
+                raise RuntimeError(f"ocr_fallback_page_missing:{page_name}")
+            _, filtered_rows, filtered_bounds, page_diag = process_ocr_page(
+                page_file=page_files[idx - 1],
+                cleaned_dir=cleaned_dir,
+                ocr_dir=ocr_dir,
+                ocr_router=ocr_router,
+                header_hint=last_header_hint,
+                last_date_hint=last_date_hint or None,
+            )
+            filtered_rows, filtered_bounds = _dedupe_page_overlap(
+                previous_rows=previous_page_rows,
+                current_rows=filtered_rows,
+                current_bounds=filtered_bounds,
+            )
+            filtered_rows, filtered_bounds = _dedupe_document_rows(
+                seen_signatures=seen_row_signatures,
+                current_rows=filtered_rows,
+                current_bounds=filtered_bounds,
+            )
+            selected_profile = str(page_diag.get("profile_selected") or "GENERIC")
+            header_anchors = page_diag.get("header_anchors")
+            if isinstance(header_anchors, dict) and header_anchors:
+                header_hints_by_profile[selected_profile] = dict(header_anchors)
+                last_header_hint = dict(header_anchors)
+
+            parsed_output[page_name] = filtered_rows
+            bounds_output[page_name] = filtered_bounds
+            previous_page_rows = filtered_rows
+            page_last_date = _last_row_date(filtered_rows)
+            if page_last_date:
+                last_date_hint = page_last_date
+            page_last_balance = _last_row_balance(filtered_rows)
+            if page_last_balance is not None:
+                last_balance_hint = page_last_balance
+
+            page_diag_payload = dict(page_diag)
+            page_diag_payload["source_type"] = "ocr"
+            page_diag_payload["rows_parsed"] = len(filtered_rows)
+            page_diag_payload["fallback_mode"] = "empty_text_page_ocr"
+            diagnostics["pages"][page_name] = page_diag_payload
+
+            progress = 15 + int((idx / max(total, 1)) * 75)
+            report("processing", "text_parsing", progress)
+            continue
 
         profile = detect_bank_profile(text)
         page_rows, page_bounds, parser_diag = parse_page_with_profile_fallback(

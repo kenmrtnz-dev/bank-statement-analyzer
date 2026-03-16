@@ -783,11 +783,31 @@ button:active,
   margin-top: 8px;
   border: 1px solid var(--line);
   border-radius: 12px;
-  overflow: hidden;
+  overflow: auto;
   min-height: 220px;
   position: relative;
   background: #e9edf6;
   box-shadow: inset 0 0 0 1px #dbe1ef;
+  cursor: grab;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.preview-wrap::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+.preview-wrap.is-panning {
+  cursor: grabbing;
+  user-select: none;
+}
+
+.preview-stage {
+  position: relative;
+  width: 100%;
+  min-height: 220px;
+  line-height: 0;
 }
 
 .preview-panel-tabs {
@@ -822,7 +842,23 @@ button:active,
 
 .disbalance-table-wrap td,
 .flagged-transactions-table-wrap td {
-  font-size: 12px;
+  font-size: 11px;
+}
+
+.disbalance-table-wrap thead th,
+.flagged-transactions-table-wrap thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: #fafbff;
+  font-size: 11px;
+}
+
+.disbalance-table-wrap .row-action-btn,
+.flagged-transactions-table-wrap .row-action-btn {
+  height: 24px;
+  padding: 0 8px;
+  font-size: 11px;
 }
 
 #previewImage {
@@ -881,19 +917,20 @@ button:active,
 
 .summary-metrics-grid {
   display: grid;
-  grid-template-columns: repeat(7, minmax(0, 1fr));
-  gap: 6px;
+  grid-template-columns: repeat(8, minmax(0, 1fr));
+  gap: 5px;
 }
 
 .summary-metric-card {
   border: 1px solid #e3e6f2;
   border-radius: 10px;
-  padding: 7px;
+  padding: 6px;
   background: #ffffff;
+  min-width: 0;
 }
 
 .metric-label {
-  font-size: 8px;
+  font-size: 7px;
   font-weight: 700;
   letter-spacing: 0.05em;
   text-transform: uppercase;
@@ -901,8 +938,8 @@ button:active,
 }
 
 .metric-value {
-  margin-top: 4px;
-  font-size: 14px;
+  margin-top: 3px;
+  font-size: 13px;
   line-height: 1.15;
   font-weight: 800;
   color: #1e2745;

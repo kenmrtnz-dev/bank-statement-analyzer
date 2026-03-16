@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Bank Statement Analyzer</title>
-    <link rel="stylesheet" href="/static/ui.css?v=20260309b" />
+    <link rel="stylesheet" href="/static/ui.css?v=20260316h" />
   </head>
   <body>
     <main class="app-shell">
@@ -82,7 +82,8 @@
                     <th>File</th>
                     <th>Size</th>
                     <th>Date</th>
-                    <th>Owner</th>
+                    <th>Time Started</th>
+                    <th>Elapsed</th>
                     <th>Status</th>
                     <th>Actions</th>
                   </tr>
@@ -202,8 +203,10 @@
               <div id="previewImagePanel">
                 <div class="preview-wrap" id="previewWrap">
                   <div id="previewEmpty" class="preview-empty">Page preview will appear here.</div>
-                  <img id="previewImage" alt="Page preview" />
-                  <canvas id="overlay"></canvas>
+                  <div class="preview-stage" id="previewStage">
+                    <img id="previewImage" alt="Page preview" />
+                    <canvas id="overlay"></canvas>
+                  </div>
                 </div>
                 <div class="hint">Click a row to show bounds on the image.</div>
               </div>
@@ -215,10 +218,9 @@
                         <th>Page</th>
                         <th>Row</th>
                         <th>Date</th>
-                        <th>Description</th>
                         <th>Expected</th>
                         <th>Actual</th>
-                        <th>Delta</th>
+                        <th>Variance</th>
                         <th>Action</th>
                       </tr>
                     </thead>
@@ -235,7 +237,6 @@
                         <th>Row</th>
                         <th>Date</th>
                         <th>Description</th>
-                        <th>Bank</th>
                         <th>Code</th>
                         <th>Action</th>
                       </tr>
@@ -258,7 +259,6 @@
                       <option value="generic">Generic Parser</option>
                     </select>
                   </div>
-                  <button id="parsedDebugToggleBtn" type="button" class="parsed-header-action ghost">Debug JSON</button>
                   <button id="reverseRowsBtn" type="button" class="parsed-header-action" disabled>Reverse Order</button>
                   <div class="parsed-header-meta">
                     <div class="parsed-row-legend" aria-label="Parsed row colors">
@@ -312,6 +312,6 @@
       </section>
     </main>
 
-    <script src="/static/ui.js?v=20260310j"></script>
+    <script src="/static/ui.js?v=20260316u"></script>
   </body>
 </html>

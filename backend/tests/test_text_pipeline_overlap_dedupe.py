@@ -120,6 +120,94 @@ def test_run_text_pipeline_reuses_last_date_from_previous_page(monkeypatch, tmp_
     assert parsed["page_002"][0]["debit"] == "500.00"
 
 
+def test_run_text_pipeline_falls_back_to_ocr_for_empty_text_pages(monkeypatch, tmp_path: Path):
+    calls = {"prepare": 0, "ocr": 0}
+    page_two_words = [
+        _word("Date", 40, 20),
+        _word("Description", 180, 20, 90),
+        _word("Debit", 470, 20),
+        _word("Credit", 560, 20),
+        _word("Balance", 680, 20, 70),
+        _word("02/01/2026", 40, 60, 74),
+        _word("TEXT", 180, 60, 44),
+        _word("DEPOSIT", 230, 60, 64),
+        _word("50.00", 560, 60, 52),
+        _word("150.00", 690, 60, 58),
+    ]
+
+    monkeypatch.setattr(
+        ocr_pipeline,
+        "extract_pdf_layout_pages",
+        lambda _path: [
+            {"width": 900.0, "height": 1200.0, "words": [], "text": ""},
+            {
+                "width": 900.0,
+                "height": 1200.0,
+                "words": page_two_words,
+                "text": "Date Description Debit Credit Balance 02/01/2026 TEXT DEPOSIT 50.00 150.00",
+            },
+        ],
+    )
+
+    def _prepare_pages(**_kwargs):
+        calls["prepare"] += 1
+        return ["page_001.png", "page_002.png"]
+
+    class _FakeRouter:
+        engine_name = "fake_ocr"
+        openai_client = None
+
+    def _process_ocr_page(page_file, cleaned_dir, ocr_dir, **_kwargs):
+        del cleaned_dir, ocr_dir
+        calls["ocr"] += 1
+        assert page_file == "page_001.png"
+        return (
+            "page_001",
+            [
+                {
+                    "row_id": "001",
+                    "date": "01/31/2026",
+                    "description": "OCR DEPOSIT",
+                    "debit": None,
+                    "credit": "100.00",
+                    "balance": "100.00",
+                    "row_type": "transaction",
+                }
+            ],
+            [],
+            {
+                "source_type": "ocr",
+                "ocr_backend": "fake_ocr",
+                "rows_parsed": 1,
+                "profile_detected": "GENERIC",
+                "profile_selected": "GENERIC",
+                "header_detected": True,
+                "header_hint_used": False,
+            },
+        )
+
+    monkeypatch.setattr(ocr_pipeline, "prepare_ocr_pages", _prepare_pages)
+    monkeypatch.setattr(ocr_pipeline, "build_scanned_ocr_router", lambda page_count=1: _FakeRouter())
+    monkeypatch.setattr(ocr_pipeline, "process_ocr_page", _process_ocr_page)
+
+    parsed, _bounds, diagnostics = ocr_pipeline._run_text_pipeline(
+        input_pdf=tmp_path / "sample.pdf",
+        ocr_dir=tmp_path / "ocr",
+        pages_dir=tmp_path / "pages",
+        cleaned_dir=tmp_path / "cleaned",
+        report=lambda *_args, **_kwargs: None,
+    )
+
+    assert calls == {"prepare": 1, "ocr": 1}
+    assert diagnostics["job"]["source_type"] == "mixed"
+    assert diagnostics["job"]["ocr_backend"] == "fake_ocr"
+    assert diagnostics["pages"]["page_001"]["fallback_mode"] == "empty_text_page_ocr"
+    assert diagnostics["pages"]["page_001"]["rows_parsed"] == 1
+    assert parsed["page_001"][0]["description"] == "OCR DEPOSIT"
+    assert parsed["page_002"][0]["description"] == "TEXT DEPOSIT"
+    assert parsed["page_002"][0]["credit"] == "50.00"
+
+
 def test_run_text_pipeline_reuses_last_header_hint_across_profile_change(monkeypatch, tmp_path: Path):
     page_one_words = [
         _word("Book", 158, 20, 52),

@@ -8,6 +8,54 @@ This document describes the complete processing workflow in the current codebase
 - mode-specific parser/OCR behavior (`auto`, `text`, `ocr`, `pdftotext`, `google_vision`)
 - storage artifacts (files/DB rows) written during processing
 
+## 0. Verified Browser Pass (March 12, 2026)
+
+Commands executed from `frontend/` during this pass:
+
+- `npm run test:e2e`
+- `npm run test:e2e:live`
+
+Observed results:
+
+- `npm run test:e2e` -> `5 passed`, `4 skipped`; the CRM table height regression check remains intentionally marked with `test.fail(...)` in `frontend/e2e/crm-table.spec.ts`
+- `npm run test:e2e:live` -> `3 passed`, `1 skipped` (`E2E_SAMPLE_JOB_ID` was not set, so the real processing-page check did not run)
+
+What this pass actually verified:
+
+- real auth endpoints and route gating
+- uploads workspace render under a logged-in evaluator session
+- CRM table pagination/search behavior
+- summary-month checkbox recalculation on the processing page
+- live `/crm/attachments?q=...` request emission
+- logout redirect back to `/login`
+
+What this pass did **not** verify:
+
+- a full real-PDF upload from browser -> queue -> worker -> completed result inside Playwright
+- a real processing-page render for a specific finished job, because `E2E_SAMPLE_JOB_ID` was unset
+
+## 0.1 Playwright Harness Entry Points
+
+- Config file: `frontend/playwright.config.ts`
+- Spec folder: `frontend/e2e/`
+- Global auth/bootstrap: `frontend/e2e/global-setup.ts`
+- Default `baseURL`: `http://127.0.0.1:${PORT}` where `PORT = process.env.E2E_PORT || '8000'`
+- Shared evaluator auth state file: `frontend/e2e/.auth/evaluator.json`
+
+Harness behavior:
+
+1. `globalSetup` logs in as `admin`
+2. creates a one-off evaluator account
+3. enables upload testing via `POST /admin/settings/upload-testing`
+4. logs in as that evaluator
+5. writes browser storage state to `frontend/e2e/.auth/evaluator.json`
+
+Server boot behavior:
+
+- Playwright points `webServer.url` at `${BASE_URL}/health`
+- if that URL is already healthy, `reuseExistingServer: true` means the suite reuses the running app
+- otherwise it starts `uvicorn --app-dir backend app.main:app --host 127.0.0.1 --port ${PORT}`
+
 ## 1. Runtime Architecture (Current App)
 
 ## 1.1 Core Components
@@ -19,9 +67,9 @@ This document describes the complete processing workflow in the current codebase
 - **Filesystem + SQL persistence**: `backend/app/jobs/repository.py`
 - **OCR pipeline**: `backend/app/ocr/pipeline.py`
 - **OCR engine wrapper**: `backend/app/services/ocr/router.py`
-- **OpenAI Vision client**: `backend/app/services/ocr/openai_vision.py`
-- **Legacy v1 parser pipeline**: `backend/app/parser/pipeline.py`
-- **Google Vision extractor for legacy pipeline**: `backend/app/parser/extractors/google_vision.py`
+- **OCR provider adapters**: `backend/app/services/ocr/google_vision.py`, `backend/app/services/ocr/apple_vision.py`, `backend/app/services/ocr/openai_vision.py`
+- **Text-layer extractor**: `backend/app/pdf_text_extract.py`
+- **Shared Google Vision extraction helpers**: `backend/app/parser/extractors/google_vision.py`
 - **CRM integration**: `backend/app/crm/router.py`, `backend/app/crm/service.py`
 - **Background queue**: Celery (`backend/app/worker/celery_app.py`, `backend/app/worker/tasks.py`)
 
@@ -54,7 +102,9 @@ At script load (`(() => { ... })()`):
 1. Initializes constants:
 - `STORAGE_KEY = 'bsa_uploaded_jobs_v1'`
 - `MODE_STORAGE_KEY = 'bsa_process_mode_v1'`
-- `SUPPORTED_PROCESS_MODES = {auto,text,ocr,pdftotext,google_vision}`
+- `SUPPORTED_PROCESS_MODES = {auto}` (**UI whitelist only**)
+- `EDITABLE_ROW_FIELDS = ['date', 'description', 'debit', 'credit', 'balance']`
+- `ROW_SAVE_DEBOUNCE_MS = 220`
 
 2. Captures DOM refs in `els`.
 3. Creates global state object `state` with keys including:
@@ -63,10 +113,23 @@ At script load (`(() => { ... })()`):
 - CRM: `crmAttachments`, `crmProcessByAttachment`, `crmLeadByJobId`, `crmUploadedByJobId`, `crmStatusTimer`
 - summary/editor: `summaryRaw`, `summaryIncludedMonths`, `selectedRowId`, `pageSaveTimers`
 
-4. Calls startup functions:
+4. Calls startup functions in this exact order:
 - `renderUploadedRows()`
+- `initProcessingGoogleVisionParser()`
 - `initRequestedProcessMode()` (loads parse mode from localStorage)
+- `setGoogleVisionReparseVisibility(null)`
+- `setCrmRefreshState()`
+- `setCrmLoadMoreState()`
+- `setCrmPaginationState()`
+- `renderCrmAttachmentRows()`
+- `setParsedPanelMode('table')`
+- `setPreviewPanelTab('preview')`
 - `syncRoute(...)`
+- `setExportLinks(false)`
+- `renderSummary(null)`
+- `updatePreviewEmptyState()`
+- `updatePageNav()`
+- `syncParsedSectionHeightToPreview()`
 - `initAuth()`
 - `reconcileStoredJobsStatuses()` (best-effort after auth)
 
@@ -76,20 +139,45 @@ At script load (`(() => { ... })()`):
 
 1. `GET /auth/me`
 - sets `state.authRole`
+- updates `#userRoleLabel`
+- toggles admin link visibility
 
 2. `GET /ui/settings`
 - sets `state.uploadTestingEnabled`
 - sets `state.bankCodeFlags`
+- calls `applyFeatureVisibility()`
 
 3. If role is evaluator/admin, loads CRM list:
 - `GET /crm/attachments?...`
+- stores rows in `state.crmAttachments`
+- overlays process state into `state.crmProcessByAttachment`
 
 4. Starts CRM status poller when in uploads view.
+
+5. On any `401`, shared `api(...)` redirects to `/login` and throws.
 
 ### Auth backend functions
 
 - `/auth/me` -> `auth.router.me` -> dependency `get_current_user`
 - `/ui/settings` -> `auth.router.ui_settings` -> `admin.service.get_ui_settings`
+
+## 2.3 Route Resolution Before Any User Action
+
+The browser only has one real app shell (`backend/app/static/index.html`), so route behavior is split between backend gatekeeping and frontend `syncRoute(...)`.
+
+Backend route gatekeeping:
+
+- `GET /`, `GET /uploads`, and `GET /evaluator` require an authenticated non-admin user or redirect
+- `GET /processing` allows authenticated evaluators **and** admins
+- anonymous users are redirected to `/login`
+- admins hitting `/` or `/uploads` are redirected to `/admin`
+
+Frontend route activation:
+
+1. `syncRoute(currentUrl, true)` parses `window.location.pathname` and `job-id` query params
+2. `setView(view)` toggles uploads/processing panes and nav active state
+3. if route is `/processing?job-id=...`, `setActiveJob(jobId, false)` starts loading that job immediately
+4. `buildRoute(...)` and `history.replaceState/pushState` keep the URL aligned with `state.view` and `state.jobId`
 
 ## 3. Processing Mode Selection
 
@@ -98,11 +186,18 @@ At script load (`(() => { ... })()`):
 - Dropdown DOM: `#mode` (from `index.html`)
 - UI reads mode via `getRequestedProcessMode()`
 - UI normalizes with `normalizeRequestedProcessMode()`
+- `normalizeRequestedProcessMode()` only accepts values present in `SUPPORTED_PROCESS_MODES`
+- because the current whitelist is only `auto`, any stale stored value is coerced back to `auto`
 - persisted in localStorage key `bsa_process_mode_v1`
 
-## 3.2 Accepted Modes
+## 3.2 Accepted Modes (UI vs API)
+
+Browser UI currently accepts/persists only:
 
 - `auto`
+
+Backend API still accepts:
+
 - `text`
 - `ocr`
 - `pdftotext`
@@ -110,11 +205,18 @@ At script load (`(() => { ... })()`):
 
 ## 3.3 Backend Normalization/Resolution
 
-- `app.ocr.pipeline.normalize_parse_mode(mode)` validates mode
+- `jobs.service._normalize_requested_mode(...)` validates the request against `_SUPPORTED_PARSE_MODES`
 - `app.ocr.pipeline.resolve_parse_mode(input_pdf, requested_mode)` delegates to `services/ocr/router.py`
-- `resolve_document_parse_mode(...)` behavior:
-- if requested is explicit (`text|ocr|google_vision|pdftotext`) -> use it
-- else detect profile via PDF text density and return `text` or `ocr`
+- `resolve_document_parse_mode(...)` returns **canonical backend labels**, not the raw aliases:
+- requested `text` or `pdftotext` -> `pdftotext`
+- requested `ocr` or `google_vision` -> `google_vision`
+- requested `auto` -> inspect PDF text density, then return `pdftotext` for digital PDFs or `google_vision` for scanned PDFs
+
+Practical implication:
+
+- the browser only sends `auto`
+- persisted job status normally shows `parse_mode = pdftotext` or `parse_mode = google_vision`
+- `text` and `ocr` are accepted request aliases, not the dominant runtime values
 
 ## 4. E2E Flow A: Direct Upload -> Auto Start
 
@@ -122,13 +224,24 @@ This is the main evaluator flow from the upload card.
 
 ## 4.1 Frontend upload execution
 
-Triggered by form submit or file drop.
+Triggered by either:
+
+- file picker change on `#pdfFile`, which auto-submits the form via `requestSubmit()`
+- file drop on `#uploadSurface`, which directly calls `uploadSelectedFile(files[0])`
 
 Functions and order:
 
 1. `createJob(e)`
 2. `uploadSelectedFile(file)`
-3. `uploadWithProgress(file, mode, autoStart=true)`
+3. `setUploadProgress(0, true)`
+4. `getRequestedProcessMode()` -> currently always `auto`
+5. `uploadWithProgress(file, mode, autoStart=true)`
+
+Transport details:
+
+- `uploadWithProgress(...)` uses `XMLHttpRequest` rather than `fetch`
+- `xhr.upload.onprogress` drives `#uploadProgressBar` + `#uploadProgressText`
+- response body is expected as JSON and resolved into `payload.job_id / payload.parse_mode / payload.started`
 
 HTTP call:
 
@@ -142,6 +255,9 @@ UI variables updated after success:
 
 - `state.uploadedJobs` via `upsertUploadedJob(...)`
 - row fields: `jobId`, `fileName`, `sizeBytes`, `status`, `step`, `progress`, `parseMode`
+- successful auto-start inserts the row as `processing / initializing / 1%` before polling catches up
+- `els.file.value` is cleared after a successful upload
+- progress UI is hidden again after a short timeout
 
 If `payload.started === true`, UI calls `setActiveJob(payload.job_id, true)`.
 
@@ -262,17 +378,30 @@ When failed/cancelled:
 
 ## 6.3 Result load sequence
 
-`loadResultData()` calls in parallel:
+`loadResultData()` first calls `flushPendingPageSaves()` to make sure inline edits are settled before rehydrating state.
+
+Then it calls in parallel:
 
 - `GET /jobs/{jobId}/cleaned`
 - `GET /jobs/{jobId}/summary`
 - `GET /jobs/{jobId}/parse-diagnostics` (best-effort)
 
-Then per page:
+Then it:
+
+- extracts page names from `cleaned.pages`
+- sorts them by numeric page order
+- applies reverse order if `state.reversePageOrder === true`
+- resets `state.parsedByPage`, `state.baselineParsedByPage`, `state.boundsByPage`, `state.openaiRawByPage`
+- sets `state.currentPage` to the first page
+- parses `diagnostics.pages[*].profile_selected` into `state.pageProfileByPage`
+- renders summary immediately if `summary.total_transactions > 0`
+- renders page navigation and kicks off first-page hydration
+
+Per-page hydration then uses:
 
 - `GET /jobs/{jobId}/parsed/{page}`
 - `GET /jobs/{jobId}/rows/{page}/bounds`
-- preview image URL: `GET /jobs/{jobId}/preview/{page}`
+- preview image URL: `GET /jobs/{jobId}/preview/{page}` (lazy via `<img src=...>`)
 
 Optional debug JSON:
 
@@ -334,11 +463,15 @@ Top-level behavior:
 1. writes progress heartbeat via local `report(status, step, progress)` closure
 2. normalizes `selected_mode`
 3. branches:
-- `google_vision` or `pdftotext` -> **legacy v1 parser pipeline**
-- non-`ocr` (usually `text`) -> `ocr.run_pipeline(...)` single-task
-- `ocr` -> fan-out page task model
+- if `selected_mode not in {"ocr", "google_vision"}` -> run single-worker `ocr.run_pipeline(...)`
+- if `selected_mode in {"ocr", "google_vision"}` -> run page-fanout OCR workflow
 
-## 9.2 Text mode path (`selected_mode != "ocr"` and not legacy)
+Important current-state note:
+
+- the resolver usually hands `process_job(...)` the canonical values `pdftotext` or `google_vision`
+- explicit alias inputs `text` and `ocr` are generally normalized away earlier, inside `resolve_parse_mode(...)`
+
+## 9.2 Single-worker text-layer path (`selected_mode in {"text", "pdftotext"}`)
 
 Functions executed:
 
@@ -358,6 +491,11 @@ Functions executed:
 8. computes summary `compute_summary(...)` -> `result/summary.json`
 9. writes final status: `done/completed/progress=100`
 
+In current browser-driven flows, this path normally appears as:
+
+- request mode: `auto`
+- resolved `parse_mode`: `pdftotext`
+
 ### Text-mode page diagnostics keys
 
 - `source_type`
@@ -370,7 +508,7 @@ Functions executed:
 - `header_hint_used`
 - `fallback_mode`
 
-## 9.3 OCR mode path (`selected_mode == "ocr"`)
+## 9.3 OCR fan-out path (`selected_mode in {"ocr", "google_vision"}`)
 
 This mode is asynchronous and page-fanout.
 
@@ -381,7 +519,7 @@ This mode is asynchronous and page-fanout.
 3. If no manifest, generate pages:
 - `prepare_ocr_pages(input_pdf, pages_dir, cleaned_dir, report)`
 - `_render_pdf_pages(...)` using pdf2image
-- `clean_page(...)` image preprocessing
+- current implementation copies rendered images into `cleaned/` without additional cleaning transforms
 4. write manifest via `_write_pages_manifest`
 5. load existing `page_status.json`
 6. for each page:
@@ -405,28 +543,27 @@ Flow:
 2. define heartbeat callback for rate-limit waits
 3. call `ocr.pipeline.process_ocr_page(...)`
 
-`process_ocr_page` internal branches:
+`process_ocr_page` internal behavior:
 
-1. if structured rows enabled and engine=openai:
-- `openai_client.extract_structured_rows(page_path, rate_limit_heartbeat)`
-- writes `ocr/page_###.openai_raw.json`
-- normalizes rows/bounds via `_normalize_structured_ai_rows`
-- returns immediately if rows valid
-
-2. fallback path:
-- `ocr_router.ocr_page(page_path)` -> OpenAI token OCR
-- writes `ocr/page_###.json`
-- optionally writes `ocr/page_###.openai_raw.json`
-- converts tokens to words `_ocr_items_to_words`
-- profile detect + `parse_page_with_profile_fallback`
-- `_filter_rows_and_bounds`
+1. build or reuse OCR router from `build_scanned_ocr_router(...)`
+2. current router selection order is:
+- `GoogleVisionOCR.from_env()`
+- else `AppleVisionOCR.from_env()` if available
+3. optional OpenAI structured-row shortcut exists in code, but the current router does not choose `openai_vision`
+4. normal path:
+- `ocr_router.ocr_page(page_path)`
+- write raw token items to `ocr/page_###.json`
+- convert OCR items to word boxes via `_ocr_items_to_words(...)`
+- detect bank profile from OCR text
+- parse via `parse_page_with_profile_fallback(...)`
+- filter and renumber rows/bounds
 
 Back in service:
 
-4. write page fragment file: `result/page_fragments/page_###.json`
-5. mark page `done` with `rows_parsed`
-6. refresh parent progress
-7. if no inflight pages, enqueue finalize task (`jobs.finalize_job`)
+5. write page fragment file: `result/page_fragments/page_###.json`
+6. mark page `done` with `rows_parsed`
+7. refresh parent progress
+8. if no inflight pages, enqueue finalize task (`jobs.finalize_job`)
 
 ### Finalize stage (`finalize_job_processing`)
 
@@ -451,56 +588,22 @@ Flow:
 - all succeeded -> `done`
 7. write final `status.json` with `progress=100`
 
-## 9.4 Legacy mode path (`google_vision`, `pdftotext`)
+## 9.4 Canonical Backend Mode Labels (`google_vision`, `pdftotext`)
 
-Triggered in `jobs.service.process_job` when mode is one of those two.
+Current `/jobs` processing uses these labels as the durable runtime values:
 
-Flow:
+- `pdftotext` = text-layer extraction path in `app/ocr/pipeline.py`
+- `google_vision` = scanned-document OCR fan-out path in `jobs.service.process_job(...)`
 
-1. call `run_legacy_parser_document(input_pdf, ocr_engine=selected_mode)`
-2. inside `parser.pipeline.process_document(...)`:
+Important clarifications:
 
-- if `pdftotext`:
-- `pdf_text_extractor.extract_text(path)`
-
-- if `google_vision`:
-- `google_vision.extract_text_with_details(path)`
-- may call Vision REST API (API key mode) or Vision client (service account mode)
-
-- if `auto` (legacy not used in this branch from jobs.service):
-- checks `has_embedded_text` then picks pdftotext or google vision
-
-3. parser stages executed in order:
-- `bank_detector.detect_bank(text)`
-- `template_loader.load_template(bank)`
-- `row_detector.detect_rows(text)`
-- `column_detector.detect_columns(template)`
-- `table_builder.build_table(rows, column_map)`
-- `description_merger.merge_descriptions(raw_table)`
-- `transaction_extractor.extract_transactions(merged_rows)`
-- `normalizer.normalize_transactions(extracted_rows)`
-- `balance_validator.validate_balances(normalized_rows)`
-- `_build_summary(normalized_rows)`
-
-4. jobs service maps legacy transactions into UI row shape (`page_001` only)
-5. writes optional raw OCR payload:
-- `ocr/page_001.google_vision_raw.json` (when available)
-6. persists parsed rows/bounds, writes diagnostics + summary
-7. writes final status `done`
-
-### Legacy result diagnostics fields
-
-`diagnostics.job` includes:
-
-- `parse_mode`
-- `source_type = legacy_parser`
-- `parser_strategy = v1`
-- `ocr_engine_requested`
-- `ocr_source`
-- `bank`
-- optional `validation`
-- optional `legacy_summary`
-- optional `ocr_raw_available`, `ocr_raw_page_count`
+1. `text` and `ocr` are accepted API aliases, but they are usually converted to `pdftotext` / `google_vision` before work starts
+2. the job service does **not** currently route `pdftotext`/`google_vision` through `backend/app/parser/pipeline.py` as its main execution path
+3. the Google Vision provider adapter in `backend/app/services/ocr/google_vision.py` still reuses helper functions from `backend/app/parser/extractors/google_vision.py`
+4. raw provider artifacts can still appear under:
+- `ocr/page_###.json`
+- `ocr/page_###.openai_raw.json` (only if an OpenAI OCR router is ever selected)
+- `ocr/page_###.google_vision_raw.json` (when explicitly written by Google Vision-backed helpers)
 
 ## 10. Celery Retry + Failure Bookkeeping
 
@@ -527,13 +630,37 @@ Page failure still allows finalize to complete with warnings/partial outputs.
 
 ## 11.1 CRM attachment listing
 
-Frontend call:
+Frontend entry points:
+
+- initial load inside `initAuth()`
+- `#crmRefreshBtn` click
+- `#crmSearch` input after 220 ms debounce
+- `#crmPrevBtn` / `#crmNextBtn` pagination clicks
+
+Network call:
 
 - `GET /crm/attachments?limit&offset&probe&q`
 
 Backend route:
 
 - `crm.router.list_attachments_endpoint` -> `crm.service.list_bank_statement_attachments`
+
+Frontend state flow:
+
+1. `loadCrmAttachments(reset=true)` sets loading flags and clears errors
+2. builds query params from:
+- `state.crmLimit`
+- `state.crmOffset`
+- `state.crmProbeMode`
+- optional `state.crmSearch`
+3. stores response items in `state.crmAttachments`
+4. updates paging values:
+- `state.crmCurrentOffset`
+- `state.crmNextOffset`
+- `state.crmHasMore`
+5. `syncCrmProcessMapFromItems(...)` overlays server-provided process status
+6. `refreshCrmProcessStatuses()` live-refreshes any locally queued/processing jobs
+7. `renderCrmAttachmentRows()` applies client-side status-tab filtering and writes `#crmPageInfo` (`Showing X-Y`)
 
 Service behavior:
 
@@ -824,7 +951,7 @@ Per `page_###` entry may include:
 - `PREVIEW_MAX_PIXELS`
 - `FALLBACK_PREVIEW_DPI`
 
-## 16.4 Google Vision (legacy pipeline)
+## 16.4 Google Vision provider
 
 - `GOOGLE_VISION_API_KEY`
 - `GOOGLE_VISION_BATCH_SIZE`
@@ -856,7 +983,7 @@ Per `page_###` entry may include:
 4. `_start_job_worker` -> `_enqueue_job`
 5. `worker.tasks.process_job_task`
 6. `jobs.service.process_job`
-7. branch to mode pipeline (`run_pipeline` / legacy parser / OCR fanout)
+7. branch to resolved mode pipeline (`run_pipeline` for `pdftotext`, OCR fanout for `google_vision`)
 
 ## 17.2 OCR fanout
 
@@ -878,14 +1005,17 @@ Per `page_###` entry may include:
 
 ## 18. Important Behavioral Notes
 
-1. `auto` mode currently resolves only to `text` or `ocr` (not to `google_vision` / `pdftotext`).
-2. Legacy modes (`google_vision`, `pdftotext`) are single-task and currently collapsed into `page_001` output in `jobs.service.process_job`.
+1. `auto` mode currently resolves to canonical backend labels `pdftotext` or `google_vision`, based on PDF text density.
+2. `text` and `ocr` are accepted request aliases, but persisted status normally shows `pdftotext` or `google_vision`.
 3. OCR job progress is intentionally capped below 100 until finalize succeeds (`_compute_page_progress` max 99).
 4. UI status normalizes backend states:
 - `done` -> `completed`
 - `done_with_warnings` -> `needs_review`
-5. Manual row edits persist to SQL first, then regenerate JSON artifacts and summary.
-6. OpenAI OCR has on-disk cache + Redis-backed rate limiter; if Redis unavailable, rate limiting is skipped (best effort).
+5. The current browser UI only exposes `auto`, even though the backend still accepts explicit mode values through the API.
+6. Manual row edits persist to SQL first, then regenerate JSON artifacts and summary.
+7. `prepare_ocr_pages(...)` currently copies rendered page PNGs into `cleaned/`; there is no extra image-cleaning transform in this path.
+8. OpenAI OCR has on-disk cache + Redis-backed rate limiter; if Redis unavailable, rate limiting is skipped (best effort).
+9. The present Playwright suite still does not cover a real upload -> worker-complete -> result-render browser flow.
 
 
 ## 19. Function-to-Variable Map (High-Value Execution Paths)
@@ -896,14 +1026,14 @@ This section maps the most important runtime variables per function so you can t
 
 | Function | Key Variables Read | Key Variables Written | Endpoint(s) |
 |---|---|---|---|
-| `initRequestedProcessMode()` | `MODE_STORAGE_KEY`, `els.mode`, `SUPPORTED_PROCESS_MODES` | `els.mode.value`, localStorage mode value | none |
+| `initRequestedProcessMode()` | `MODE_STORAGE_KEY`, `els.mode`, `SUPPORTED_PROCESS_MODES` (currently only `auto`) | `els.mode.value`, localStorage mode value | none |
 | `uploadWithProgress(file, mode, autoStart)` | `file`, `mode`, `autoStart` | upload progress UI via `setUploadProgress` | `POST /jobs` |
 | `uploadSelectedFile(file)` | `file`, `getRequestedProcessMode()` | `state.uploadedJobs`, progress UI | `POST /jobs` |
 | `setActiveJob(jobId, switchToProcessing)` | `jobId`, `state.crmLeadByJobId` | `state.jobId`, `state.currentCrmLeadId`, resets `state.parsedByPage/state.boundsByPage/state.openaiRawByPage` | `GET /jobs/{id}` |
-| `startJob(jobId)` | `jobId`, mode dropdown | updates upload row status | `POST /jobs/{id}/start` |
+| `startJob(jobId)` | `jobId`, mode dropdown (`#mode`, currently `auto`) | updates upload row status | `POST /jobs/{id}/start` |
 | `cancelJob(jobId)` | `jobId`, cached uploaded row | updates status row and active header | `POST /jobs/{id}/cancel`, then `GET /jobs/{id}` |
 | `pollStatus()` | `state.jobId` | `state.isCompleted`, `state.currentParseMode`, upload row status | `GET /jobs/{id}` |
-| `loadResultData()` | `state.jobId` | `state.pages`, `state.currentPage`, parsed/bounds caches, summary render | `GET /jobs/{id}/cleaned`, `GET /summary`, `GET /parse-diagnostics` |
+| `loadResultData()` | `state.jobId` | `state.pages`, `state.currentPage`, parsed/bounds caches, summary render | `GET /jobs/{id}/cleaned`, `GET /jobs/{id}/summary`, `GET /jobs/{id}/parse-diagnostics` |
 | `loadCurrentPageData()` | `state.jobId`, `state.currentPage` | `state.parsedByPage[page]`, `state.boundsByPage[page]` | `GET /jobs/{id}/parsed/{page}`, `GET /jobs/{id}/rows/{page}/bounds` |
 | `ensureCurrentPageOpenaiRawLoaded()` | `state.jobId`, `state.currentPage` | `state.openaiRawByPage[page]` | `GET /jobs/{id}/ocr/{page}/openai-raw` |
 | `persistPageRows(page)` | `state.parsedByPage[page]`, `state.jobId` | row cache normalization + summary rerender | `PUT /jobs/{id}/parsed/{page}` |
@@ -952,3 +1082,66 @@ This section maps the most important runtime variables per function so you can t
 | `list_bank_statement_attachments(...)` | `limit`, `offset`, `probe_mode`, `search_query`, `process_index`, `rows` | list CRM attachments + overlay local process state |
 | `create_job_from_attachment(attachment_id, requested_mode)` | `cleaned_attachment_id`, `source_name`, `owner`, `payload`, `job_id` | create processing job from CRM file and stamp source metadata |
 | `export_job_excel_to_crm_lead(job_id, lead_id)` | `resolved_lead_id`, `workbook_bytes`, `safe_filename`, `attachment_id`, `meta` | upload export workbook back to CRM Lead |
+
+## 20. Playwright Harness and Coverage Map
+
+## 20.1 Config and Global Setup
+
+- Key `frontend/playwright.config.ts` values:
+- `testDir = ./e2e`
+- `workers = 1`
+- `fullyParallel = false`
+- `storageState = frontend/e2e/.auth/evaluator.json`
+- `globalSetup = frontend/e2e/global-setup.ts`
+- `reporter = list + html`
+- `webServer.reuseExistingServer = true`
+
+Global setup sequence (`frontend/e2e/global-setup.ts`):
+
+1. create API request context
+2. `POST /auth/login` as admin
+3. generate unique evaluator username/password
+4. `POST /admin/evaluators`
+5. `POST /admin/settings/upload-testing` with `{enabled: true}`
+6. log in as the generated evaluator
+7. save storage state for the browser tests
+
+Special auth override:
+
+- `frontend/e2e/auth.spec.ts` uses `test.use({ storageState: { cookies: [], origins: [] } })`
+- this forces the two login smoke tests to start unauthenticated, instead of inheriting the evaluator session from global setup
+
+## 20.2 Spec-by-Spec Coverage
+
+`frontend/e2e/auth.spec.ts`
+
+- invalid login shows `#loginError`
+- admin login redirects to `/admin`
+- admin landing page contains `#activeTabLabel = Accounts`
+
+`frontend/e2e/crm-table.spec.ts`
+
+- mocks `GET /crm/attachments`
+- verifies page size `12`, pagination via `#crmNextBtn`, and search via `#crmSearch`
+- includes a known expected-failure scenario for CRM table-height stability on short last pages
+
+`frontend/e2e/processing-summary.spec.ts`
+
+- mocks `/jobs/test-job`, `/jobs/test-job/cleaned`, and `/jobs/test-job/summary`
+- verifies the first monthly summary checkbox starts checked
+- unchecking it recomputes visible summary totals (`Total Credit` becomes `₱0.00`)
+
+`frontend/e2e/integration-live.spec.ts`
+
+- gated by `E2E_RUN_LIVE=1`
+- verifies live evaluator `/uploads` render
+- verifies CRM search emits `q=alpha` to backend requests
+- verifies logout returns to `/login`
+- contains an additional real processing-page smoke check gated by `E2E_SAMPLE_JOB_ID`
+
+## 20.3 Verified Run Status on March 12, 2026
+
+- `npm run test:e2e` completed with `5 passed` and `4 skipped`
+- `npm run test:e2e:live` completed with `3 passed` and `1 skipped`
+- skipped live scenario: `processing page renders core controls for a real job id`
+- no current Playwright spec uploads a real PDF and waits through worker completion, so that end-to-end gap remains open despite the passing suite
