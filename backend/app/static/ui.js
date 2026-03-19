@@ -15,6 +15,13 @@
     mode: document.getElementById('mode'),
     processingGoogleVisionParserWrap: document.getElementById('processingGoogleVisionParserWrap'),
     processingGoogleVisionParser: document.getElementById('processingGoogleVisionParser'),
+    pageNotesBtn: document.getElementById('pageNotesBtn'),
+    pageNotesModal: document.getElementById('pageNotesModal'),
+    pageNotesSubtitle: document.getElementById('pageNotesSubtitle'),
+    pageNotesInput: document.getElementById('pageNotesInput'),
+    pageNotesCloseBtn: document.getElementById('pageNotesCloseBtn'),
+    pageNotesCancelBtn: document.getElementById('pageNotesCancelBtn'),
+    pageNotesSaveBtn: document.getElementById('pageNotesSaveBtn'),
     startBtn: document.getElementById('startBtn'),
     jobId: document.getElementById('jobId'),
     jobStatus: document.getElementById('jobStatus'),
@@ -153,7 +160,11 @@
     bankCodeFlagsPromise: null,
     pageProfileByPage: {},
     parseDiagnostics: null,
-    googleVisionParserInFlight: false
+    googleVisionParserInFlight: false,
+    pageNotesByPage: {},
+    pageNotesModalOpen: false,
+    pageNotesSaving: false,
+    pageNotesLoading: false
   };
   const ROUTE_TO_VIEW = {
     '/uploads': 'uploads',
@@ -2864,6 +2875,109 @@
     if (els.pagePrevBtn) els.pagePrevBtn.disabled = !(idx > 0);
     if (els.pageNextBtn) els.pageNextBtn.disabled = !(idx >= 0 && idx < total - 1);
     if (els.pageLastBtn) els.pageLastBtn.disabled = !(idx >= 0 && idx < total - 1);
+    updatePageNotesActionState();
+  }
+
+  function getCurrentPageNotes() {
+    const page = String(state.currentPage || '').trim();
+    if (!page) return '';
+    const value = state.pageNotesByPage[page];
+    return typeof value === 'string' ? value : '';
+  }
+
+  function updatePageNotesActionState() {
+    if (!els.pageNotesBtn) return;
+    const hasJobAndPage = Boolean(state.jobId && state.currentPage);
+    els.pageNotesBtn.disabled = !hasJobAndPage || state.pageNotesSaving || state.pageNotesLoading;
+    els.pageNotesBtn.classList.toggle('has-notes', Boolean(getCurrentPageNotes().trim()));
+    els.pageNotesBtn.title = hasJobAndPage ? 'Page notes' : 'Page notes';
+  }
+
+  function setPageNotesModalOpen(open) {
+    state.pageNotesModalOpen = Boolean(open);
+    if (els.pageNotesModal) {
+      els.pageNotesModal.classList.toggle('hidden', !state.pageNotesModalOpen);
+    }
+    if (state.pageNotesModalOpen && els.pageNotesInput) {
+      window.setTimeout(() => {
+        els.pageNotesInput.focus();
+        els.pageNotesInput.select();
+      }, 0);
+    }
+  }
+
+  async function ensureCurrentPageNotesLoaded(forceReload = false) {
+    const page = String(state.currentPage || '').trim();
+    const jobId = String(state.jobId || '').trim();
+    if (!jobId || !page) return '';
+    if (!forceReload && Object.prototype.hasOwnProperty.call(state.pageNotesByPage, page)) {
+      return getCurrentPageNotes();
+    }
+    state.pageNotesLoading = true;
+    updatePageNotesActionState();
+    try {
+      const payload = await api(`/jobs/${jobId}/pages/${page}/notes`);
+      const notes = typeof payload?.notes === 'string' ? payload.notes : '';
+      state.pageNotesByPage[page] = notes;
+      return notes;
+    } finally {
+      state.pageNotesLoading = false;
+      updatePageNotesActionState();
+    }
+  }
+
+  async function openPageNotesModal() {
+    if (!state.jobId || !state.currentPage || state.pageNotesSaving) return;
+    try {
+      const notes = await ensureCurrentPageNotesLoaded();
+      if (els.pageNotesSubtitle) {
+        els.pageNotesSubtitle.textContent = `Add remarks for ${String(state.currentPage || '').replace(/^page_/, 'Page ')}.`;
+      }
+      if (els.pageNotesInput) {
+        els.pageNotesInput.value = notes;
+      }
+      setPageNotesModalOpen(true);
+    } catch (err) {
+      showToast(`Unable to load page notes: ${normalizeApiErrorMessage(err?.message)}`, 'error', 4200);
+    }
+  }
+
+  function closePageNotesModal() {
+    if (state.pageNotesSaving) return;
+    setPageNotesModalOpen(false);
+  }
+
+  async function saveCurrentPageNotes() {
+    const page = String(state.currentPage || '').trim();
+    const jobId = String(state.jobId || '').trim();
+    if (!jobId || !page || !els.pageNotesInput || state.pageNotesSaving) return;
+    state.pageNotesSaving = true;
+    updatePageNotesActionState();
+    if (els.pageNotesSaveBtn) {
+      els.pageNotesSaveBtn.disabled = true;
+      els.pageNotesSaveBtn.textContent = 'Saving...';
+    }
+    try {
+      const payload = await api(`/jobs/${jobId}/pages/${page}/notes`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ notes: els.pageNotesInput.value || '' })
+      });
+      const nextNotes = typeof payload?.notes === 'string' ? payload.notes : '';
+      state.pageNotesByPage[page] = nextNotes;
+      updatePageNotesActionState();
+      setPageNotesModalOpen(false);
+      showToast('Page notes saved.', 'success');
+    } catch (err) {
+      showToast(`Unable to save page notes: ${normalizeApiErrorMessage(err?.message)}`, 'error', 4200);
+    } finally {
+      state.pageNotesSaving = false;
+      updatePageNotesActionState();
+      if (els.pageNotesSaveBtn) {
+        els.pageNotesSaveBtn.disabled = false;
+        els.pageNotesSaveBtn.textContent = 'Save';
+      }
+    }
   }
 
   function sanitizePageNumberInput() {
@@ -2900,6 +3014,7 @@
     if (!state.jobId || !state.currentPage) return;
     const page = state.currentPage;
     loadPreview();
+    updatePageNotesActionState();
 
     const pending = [];
     if (!state.parsedByPage[page]) {
@@ -2919,6 +3034,9 @@
     if (pending.length) {
       await Promise.all(pending);
     }
+    ensureCurrentPageNotesLoaded().catch(() => {
+      // Keep notes loading best-effort so row rendering is never blocked.
+    });
     if (state.parsedPanelMode === 'json') {
       await ensureCurrentPageOpenaiRawLoaded();
       renderParsedDebugJson();
@@ -2964,9 +3082,13 @@
     state.openaiRawByPage = {};
     state.pageProfileByPage = parsePageProfilesFromDiagnostics(diagnostics);
     state.parseDiagnostics = diagnostics && typeof diagnostics === 'object' ? diagnostics : null;
+    state.pageNotesByPage = {};
+    state.pageNotesLoading = false;
+    state.pageNotesSaving = false;
     state.disbalanceLoading = false;
     state.disbalanceLoadPromise = null;
     state.totalParsedRows = Number(summary?.total_transactions || 0);
+    setPageNotesModalOpen(false);
 
     for (const page of state.pages) {
       if (!Array.isArray(state.parsedByPage[page])) state.parsedByPage[page] = [];
@@ -3039,10 +3161,14 @@
     state.baselineParsedByPage = {};
     state.openaiRawByPage = {};
     state.pageProfileByPage = {};
+    state.pageNotesByPage = {};
+    state.pageNotesLoading = false;
+    state.pageNotesSaving = false;
     state.disbalanceLoading = false;
     state.disbalanceLoadPromise = null;
     setExportLinks(false);
     setParsedPanelMode(state.parsedPanelMode);
+    setPageNotesModalOpen(false);
     clearRows();
     renderSummary(null);
     if (switchToProcessing) syncRoute('/processing', false, id);
@@ -3233,6 +3359,40 @@
       state.selectedRowId = null;
       loadCurrentPageData().catch((err) => alert(`Page load failed: ${err.message}`));
       updatePageNav();
+    });
+  }
+
+  if (els.pageNotesBtn) {
+    els.pageNotesBtn.addEventListener('click', () => {
+      openPageNotesModal();
+    });
+  }
+  if (els.pageNotesCloseBtn) {
+    els.pageNotesCloseBtn.addEventListener('click', () => {
+      closePageNotesModal();
+    });
+  }
+  if (els.pageNotesCancelBtn) {
+    els.pageNotesCancelBtn.addEventListener('click', () => {
+      closePageNotesModal();
+    });
+  }
+  if (els.pageNotesSaveBtn) {
+    els.pageNotesSaveBtn.addEventListener('click', () => {
+      saveCurrentPageNotes();
+    });
+  }
+  if (els.pageNotesModal) {
+    els.pageNotesModal.addEventListener('click', (evt) => {
+      if (evt.target === els.pageNotesModal) closePageNotesModal();
+    });
+  }
+  if (els.pageNotesInput) {
+    els.pageNotesInput.addEventListener('keydown', (evt) => {
+      if ((evt.metaKey || evt.ctrlKey) && evt.key === 'Enter') {
+        evt.preventDefault();
+        saveCurrentPageNotes();
+      }
     });
   }
 
@@ -3466,6 +3626,12 @@
     });
   }
   window.addEventListener('popstate', () => syncRoute(`${window.location.pathname}${window.location.search}`, true));
+  window.addEventListener('keydown', (evt) => {
+    if (evt.key === 'Escape' && state.pageNotesModalOpen) {
+      evt.preventDefault();
+      closePageNotesModal();
+    }
+  });
 
   if (els.previewImage) els.previewImage.addEventListener('load', drawSelectedBound);
   if (els.previewImage) els.previewImage.addEventListener('load', resetPreviewZoom);

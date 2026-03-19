@@ -271,3 +271,85 @@ def test_filter_rows_drops_balance_forwarded_and_beginning_balance_rows():
         }
     ]
     assert filtered_bounds == [{"row_id": "001", "x1": 0.1, "y1": 0.3, "x2": 0.2, "y2": 0.4}]
+
+
+def test_run_ocr_pipeline_passes_previous_page_balance_hint_into_page_two_processing(monkeypatch, tmp_path: Path):
+    job_dir = tmp_path / "job"
+    pages_dir = job_dir / "pages"
+    cleaned_dir = job_dir / "cleaned"
+    ocr_dir = job_dir / "ocr"
+    for path in (pages_dir, cleaned_dir, ocr_dir):
+        path.mkdir(parents=True, exist_ok=True)
+
+    page_files = ["page_001.png", "page_002.png"]
+    for file_name in page_files:
+        (cleaned_dir / file_name).write_bytes(b"fake image bytes")
+
+    seen_previous_balance_hints = []
+
+    def _fake_process_ocr_page(*, page_file, **kwargs):
+        seen_previous_balance_hints.append(kwargs.get("previous_balance_hint"))
+        if page_file == "page_001.png":
+            return (
+                "page_001",
+                [
+                    {
+                        "row_id": "001",
+                        "date": "06/04/2025",
+                        "description": "Cash Deposit",
+                        "debit": None,
+                        "credit": "127001.00",
+                        "balance": "258224.86",
+                        "row_type": "transaction",
+                    }
+                ],
+                [{"row_id": "001", "x1": 0.1, "y1": 0.1, "x2": 0.9, "y2": 0.2}],
+                {"profile_selected": "CHINABANK", "rows_parsed": 1},
+            )
+        return (
+            "page_002",
+            [
+                {
+                    "row_id": "001",
+                    "date": "06/04/2025",
+                    "description": "PM REM",
+                    "debit": "2340.31",
+                    "credit": None,
+                    "balance": "260565.17",
+                    "row_type": "transaction",
+                },
+                {
+                    "row_id": "002",
+                    "date": "06/04/2025",
+                    "description": "PM TRANSFER FR PNB PGW",
+                    "debit": "50000.00",
+                    "credit": None,
+                    "balance": "310565.17",
+                    "row_type": "transaction",
+                },
+            ],
+            [
+                {"row_id": "001", "x1": 0.1, "y1": 0.2, "x2": 0.9, "y2": 0.3},
+                {"row_id": "002", "x1": 0.1, "y1": 0.3, "x2": 0.9, "y2": 0.4},
+            ],
+            {"profile_selected": "CHINABANK", "rows_parsed": 2},
+        )
+
+    class _FakeRouter:
+        engine_name = "fake_ocr"
+
+    monkeypatch.setattr(ocr_pipeline, "prepare_ocr_pages", lambda **_kwargs: page_files)
+    monkeypatch.setattr(ocr_pipeline, "build_scanned_ocr_router", lambda page_count=1: _FakeRouter())
+    monkeypatch.setattr(ocr_pipeline, "process_ocr_page", _fake_process_ocr_page)
+
+    parsed, _bounds, diagnostics = ocr_pipeline._run_ocr_pipeline(
+        input_pdf=job_dir / "input.pdf",
+        pages_dir=pages_dir,
+        cleaned_dir=cleaned_dir,
+        ocr_dir=ocr_dir,
+        report=lambda *_args, **_kwargs: None,
+    )
+
+    assert diagnostics["pages"]["page_002"]["rows_parsed"] == 2
+    assert parsed["page_002"][0]["debit"] == "2340.31"
+    assert seen_previous_balance_hints == [None, ocr_pipeline.Decimal("258224.86")]

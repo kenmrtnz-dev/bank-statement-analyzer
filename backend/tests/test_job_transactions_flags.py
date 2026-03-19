@@ -105,3 +105,58 @@ def test_job_transactions_persist_disbalance_fields(app_with_temp_data):
     assert rows[1]["is_disbalanced"] is True
     assert rows[1]["disbalance_expected_balance"] == 90.0
     assert rows[1]["disbalance_delta"] == -10.0
+
+
+def test_replace_job_rows_can_overwrite_existing_pages_without_duplicate_insert(app_with_temp_data):
+    _app, tmp_path = app_with_temp_data
+    repo = JobsRepository(tmp_path)
+    job_id = "33333333-3333-3333-3333-333333333333"
+    root = repo.ensure_job_layout(job_id)
+    repo.write_bytes(root / "input" / "document.pdf", b"%PDF-1.4 test")
+    repo.write_json(
+        root / "meta.json",
+        {
+            "original_filename": "statement.pdf",
+            "file_size": 14,
+        },
+    )
+
+    parsed_repo = JobTransactionsRepository(tmp_path)
+    parsed_repo.replace_job_rows(
+        job_id=job_id,
+        rows_by_page={
+            "page_001": [
+                {
+                    "row_id": "001",
+                    "date": "2026-02-01",
+                    "description": "First pass",
+                    "credit": "100.00",
+                    "balance": "100.00",
+                }
+            ]
+        },
+        bounds_by_page={},
+        is_manual_edit=False,
+    )
+
+    parsed_repo.replace_job_rows(
+        job_id=job_id,
+        rows_by_page={
+            "page_001": [
+                {
+                    "row_id": "001",
+                    "date": "2026-02-02",
+                    "description": "Second pass",
+                    "credit": "120.00",
+                    "balance": "220.00",
+                }
+            ]
+        },
+        bounds_by_page={},
+        is_manual_edit=False,
+    )
+
+    rows = parsed_repo.get_rows_by_job(job_id)["page_001"]
+    assert len(rows) == 1
+    assert rows[0]["description"] == "Second pass"
+    assert rows[0]["credit"] == 120.0

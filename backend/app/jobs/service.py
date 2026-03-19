@@ -23,11 +23,20 @@ from pdf2image import convert_from_path
 from PIL import Image
 from pypdf import PdfReader
 
+from app.bank_profiles import detect_bank_profile
 from app.jobs.repository import JobResultsRawRepository, JobStateRepository, JobsRepository, JobTransactionsRepository
-from app.ocr import prepare_ocr_pages, process_ocr_page, resolve_parse_mode, run_pipeline
+from app.ocr import prepare_ocr_pages, process_ocr_page, resolve_parse_mode
+from app.ocr.pipeline import (
+    _filter_rows_and_bounds,
+    _image_size,
+    _last_row_balance,
+    _last_row_date,
+    _ocr_items_to_words,
+    _repair_page_flow_columns,
+)
 from app.paths import get_data_dir
-from app.pdf_text_extract import extract_pdf_layout_xml
-from app.statement_parser import normalize_date
+from app.pdf_text_extract import extract_pdf_layout_pages, extract_pdf_layout_xml, layout_page_to_json_payload
+from app.statement_parser import normalize_date, parse_page_with_profile_fallback
 
 DATA_DIR = get_data_dir()
 FALLBACK_PREVIEW_DPI = int(os.getenv("FALLBACK_PREVIEW_DPI", "130"))
@@ -143,7 +152,9 @@ def create_job(
         meta_payload["created_role"] = owner_role
     repo.write_json(root / "meta.json", meta_payload)
 
-    parse_mode = resolve_parse_mode(str(input_pdf), normalized_requested_mode)
+    parse_mode = normalized_requested_mode
+    if parse_mode != "auto":
+        parse_mode = resolve_parse_mode(str(input_pdf), normalized_requested_mode)
     # Persist an initial queued status before enqueueing so the UI can render immediately.
     _write_queued_status(repo, job_id, parse_mode=parse_mode)
 
@@ -168,7 +179,9 @@ def start_job(job_id: str, requested_mode: Optional[str] = None, requested_parse
     base_mode = _normalize_requested_mode(base_mode, field_name="requested_mode")
     base_parser = requested_parser or meta.get("requested_parser") or "auto"
     base_parser = _normalize_requested_parser(base_parser, field_name="requested_parser")
-    parse_mode = resolve_parse_mode(str(input_pdf), base_mode)
+    parse_mode = base_mode
+    if parse_mode != "auto":
+        parse_mode = resolve_parse_mode(str(input_pdf), base_mode)
     meta["requested_parser"] = base_parser
     meta["requested_mode"] = base_mode
     repo.write_json(repo.path(job_id, "meta.json"), meta)
@@ -559,6 +572,37 @@ def update_page_rows(job_id: str, page: str, rows: List[Dict]) -> Dict:
     return {"page": page_name, "rows": rows_by_page.get(page_name, []), "summary": summary}
 
 
+def get_page_notes(job_id: str, page: str) -> Dict[str, Any]:
+    repo = JobsRepository(DATA_DIR)
+    _require_job(repo, job_id)
+
+    page_name = normalize_page_name(page)
+    if not page_name:
+        raise HTTPException(status_code=400, detail="invalid_page")
+
+    parsed_repo = JobTransactionsRepository(DATA_DIR)
+    notes = parsed_repo.get_page_notes(job_id=job_id, page_key=page_name)
+    return {"page": page_name, "notes": notes}
+
+
+def update_page_notes(job_id: str, page: str, notes: str | None) -> Dict[str, Any]:
+    repo = JobsRepository(DATA_DIR)
+    _require_job(repo, job_id)
+
+    page_name = normalize_page_name(page)
+    if not page_name:
+        raise HTTPException(status_code=400, detail="invalid_page")
+
+    lock = _get_job_update_lock(job_id)
+    with lock:
+        parsed_repo = JobTransactionsRepository(DATA_DIR)
+        try:
+            payload = parsed_repo.update_page_notes(job_id=job_id, page_key=page_name, notes=notes)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="page_not_found") from exc
+    return payload
+
+
 def _get_job_update_lock(job_id: str) -> threading.Lock:
     key = str(job_id or "").strip()
     with _JOB_UPDATE_LOCKS_GUARD:
@@ -704,28 +748,6 @@ def process_job(job_id: str, parse_mode: str, task_id: Optional[str] = None) -> 
     meta = repo.read_json(repo.path(job_id, "meta.json"), default={})
     if not isinstance(meta, dict):
         meta = {}
-    if selected_mode not in {"ocr", "google_vision"}:
-        # Text-layer PDFs can be processed in a single worker run from start to finish.
-        result = run_pipeline(root, parse_mode, report=report)
-        parsed_output = _normalize_rows_by_page_for_output(result.get("parsed_rows") or {})
-        bounds_output = result.get("bounds") if isinstance(result.get("bounds"), dict) else {}
-        _persist_job_raw_result(repo, job_id, is_ocr=False, raw_xml=_read_job_text_layer_xml(repo, job_id))
-        _persist_parsed_rows(repo, job_id, parsed_output, bounds_by_page=bounds_output, is_manual_edit=False)
-        rows = _flatten_rows(_load_parsed_rows(repo, job_id, required=True))
-        summary = compute_summary(rows)
-        repo.write_json(repo.path(job_id, "result", "summary.json"), summary)
-
-        done_payload = {
-            "status": "done",
-            "step": "completed",
-            "progress": 100,
-            "parse_mode": result.get("parse_mode", parse_mode),
-            "pages": int(result.get("pages") or len(result.get("parsed_rows") or {})),
-        }
-        if task_id:
-            done_payload["task_id"] = task_id
-        repo.write_status(job_id, done_payload)
-        return done_payload
 
     input_pdf = repo.path(job_id, "input", "document.pdf")
     pages_dir = repo.path(job_id, "pages")
@@ -740,6 +762,13 @@ def process_job(job_id: str, parse_mode: str, task_id: Optional[str] = None) -> 
         # Generate cleaned page images once, then reuse the manifest on retries.
         page_files = prepare_ocr_pages(input_pdf=input_pdf, pages_dir=pages_dir, cleaned_dir=cleaned_dir, report=report)
         _write_pages_manifest(repo, job_id, page_files)
+    page_routing = _prepare_page_routing_inputs(
+        repo=repo,
+        job_id=job_id,
+        input_pdf=input_pdf,
+        page_files=page_files,
+        requested_mode=selected_mode,
+    )
 
     page_status = _load_page_status_map(repo, job_id)
     pending_pages: List[str] = []
@@ -764,10 +793,13 @@ def process_job(job_id: str, parse_mode: str, task_id: Optional[str] = None) -> 
                 active_task_ids.append(task_ref)
             continue
         pending_pages.append(page_name)
+        page_route = str(page_routing.get(page_name) or "ocr")
         page_status[page_name] = {
             "status": "queued",
             "page_index": idx,
             "page_count": len(page_files),
+            "source_type": page_route,
+            "is_digital": page_route == "text",
             "retry_attempt": int(page_payload.get("retry_attempt") or 0),
             "updated_at": now_iso,
         }
@@ -797,7 +829,7 @@ def process_job(job_id: str, parse_mode: str, task_id: Optional[str] = None) -> 
     progress = _compute_page_progress(total=len(page_files), done=done_pages, failed=failed_pages)
     queued_payload: Dict[str, Any] = {
         "status": "processing",
-        "step": "ocr_parsing",
+        "step": "page_parsing",
         "progress": progress,
         "parse_mode": parse_mode,
         "pages_total": len(page_files),
@@ -813,6 +845,87 @@ def process_job(job_id: str, parse_mode: str, task_id: Optional[str] = None) -> 
     return queued_payload
 
 
+def _page_raw_result_path(repo: JobsRepository, job_id: str, page_name: str) -> Path:
+    return repo.path(job_id, "ocr", f"{normalize_page_name(page_name)}.raw.json")
+
+
+def _prepare_page_routing_inputs(
+    *,
+    repo: JobsRepository,
+    job_id: str,
+    input_pdf: Path,
+    page_files: List[str],
+    requested_mode: str,
+) -> Dict[str, str]:
+    page_names = [normalize_page_name(str(page_file).replace(".png", "")) for page_file in page_files]
+    routing = {page_name: "ocr" for page_name in page_names if page_name}
+    if requested_mode not in {"auto", "text", "pdftotext"}:
+        for page_name in page_names:
+            raw_path = _page_raw_result_path(repo, job_id, page_name)
+            if raw_path.exists():
+                existing = repo.read_json(raw_path, default=None)
+                if isinstance(existing, dict) and str(existing.get("source_type") or "").strip().lower() == "text":
+                    raw_path.unlink(missing_ok=True)
+        return routing
+
+    try:
+        layout_pages = extract_pdf_layout_pages(str(input_pdf))
+    except Exception:
+        layout_pages = []
+
+    for idx, page_name in enumerate(page_names, start=1):
+        page_layout = layout_pages[idx - 1] if idx - 1 < len(layout_pages) else {}
+        raw_payload = layout_page_to_json_payload(page_layout if isinstance(page_layout, dict) else {}, page_number=idx)
+        raw_path = _page_raw_result_path(repo, job_id, page_name)
+        if not raw_payload.get("is_digital"):
+            if raw_path.exists():
+                existing = repo.read_json(raw_path, default=None)
+                if isinstance(existing, dict) and str(existing.get("source_type") or "").strip().lower() == "text":
+                    raw_path.unlink(missing_ok=True)
+            continue
+        repo.write_json(raw_path, raw_payload)
+        routing[page_name] = "text"
+    return routing
+
+
+def _parse_text_page_raw_result(
+    raw_payload: Dict[str, Any],
+    *,
+    header_hint: Dict[str, Any] | None = None,
+    last_date_hint: str | None = None,
+    previous_balance_hint=None,
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    words = raw_payload.get("words") if isinstance(raw_payload.get("words"), list) else []
+    page_w = float(raw_payload.get("width") or 1.0)
+    page_h = float(raw_payload.get("height") or 1.0)
+    text = str(raw_payload.get("text") or "")
+    profile = detect_bank_profile(text)
+    page_rows, page_bounds, parser_diag = parse_page_with_profile_fallback(
+        words,
+        page_w,
+        page_h,
+        profile,
+        header_hint=header_hint,
+        last_date_hint=last_date_hint,
+    )
+    filtered_rows, filtered_bounds = _filter_rows_and_bounds(page_rows, page_bounds, profile)
+    filtered_rows = _repair_page_flow_columns(filtered_rows, previous_balance_hint=previous_balance_hint)
+    diag = {
+        "source_type": "text",
+        "ocr_backend": "pdftotext",
+        "bank_profile": profile.name,
+        "rows_parsed": len(filtered_rows),
+        "profile_detected": parser_diag.get("profile_detected", profile.name),
+        "profile_selected": parser_diag.get("profile_selected", profile.name),
+        "fallback_applied": bool(parser_diag.get("fallback_applied", False)),
+        "header_detected": bool(parser_diag.get("header_detected", False)),
+        "header_hint_used": bool(parser_diag.get("header_hint_used", False)),
+    }
+    if isinstance(parser_diag.get("header_anchors"), dict):
+        diag["header_anchors"] = parser_diag["header_anchors"]
+    return filtered_rows, filtered_bounds, diag
+
+
 def process_job_page(
     job_id: str,
     parse_mode: str,
@@ -821,7 +934,7 @@ def process_job_page(
     page_count: int,
     task_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """OCR one cleaned page image and persist its intermediate fragment output."""
+    """Process one page using embedded text when available, else OCR the page image."""
     repo = JobsRepository(DATA_DIR)
     _require_job(repo, job_id)
     cleaned_dir = repo.path(job_id, "cleaned")
@@ -855,12 +968,17 @@ def process_job_page(
             target["updated_at"] = dt.datetime.utcnow().isoformat() + "Z"
             current[page_name] = target
 
-    page_name, page_rows, page_bounds, page_diag = process_ocr_page(
-        page_file=page_file,
-        cleaned_dir=cleaned_dir,
-        ocr_dir=ocr_dir,
-        rate_limit_heartbeat=_heartbeat,
-    )
+    raw_result_path = _page_raw_result_path(repo, job_id, page_name)
+    raw_result = repo.read_json(raw_result_path, default=None) if raw_result_path.exists() else None
+    if isinstance(raw_result, dict) and str(raw_result.get("source_type") or "").strip().lower() == "text":
+        page_rows, page_bounds, page_diag = _parse_text_page_raw_result(raw_result)
+    else:
+        page_name, page_rows, page_bounds, page_diag = process_ocr_page(
+            page_file=page_file,
+            cleaned_dir=cleaned_dir,
+            ocr_dir=ocr_dir,
+            rate_limit_heartbeat=_heartbeat,
+        )
     _write_page_fragment(repo, job_id, page_name, page_rows=page_rows, page_bounds=page_bounds, page_diag=page_diag)
 
     with _edit_page_status_map(repo, job_id) as page_status:
@@ -952,8 +1070,8 @@ def finalize_job_processing(job_id: str, parse_mode: str, task_id: Optional[str]
     bounds_output: Dict[str, List[Dict]] = {}
     diagnostics: Dict[str, Dict] = {
         "job": {
-            "source_type": "ocr",
-            "ocr_backend": "openai_vision",
+            "source_type": "unknown",
+            "ocr_backend": None,
             "parse_mode": parse_mode,
         },
         "pages": {},
@@ -977,9 +1095,44 @@ def finalize_job_processing(job_id: str, parse_mode: str, task_id: Optional[str]
             error = "page_not_completed"
         failed_list.append({"page": page_name, "error": error})
 
+    parsed_output, bounds_output, diagnostics["pages"] = _rebuild_ocr_outputs_from_saved_artifacts(
+        repo=repo,
+        job_id=job_id,
+        page_files=page_files,
+        parsed_output=parsed_output,
+        bounds_output=bounds_output,
+        page_diagnostics=diagnostics["pages"],
+    )
+    page_source_types = {
+        str((payload or {}).get("source_type") or "").strip().lower()
+        for payload in diagnostics["pages"].values()
+        if isinstance(payload, dict)
+    }
+    page_source_types.discard("")
+    if len(page_source_types) > 1:
+        diagnostics["job"]["source_type"] = "mixed"
+    elif page_source_types:
+        diagnostics["job"]["source_type"] = next(iter(page_source_types))
+    else:
+        diagnostics["job"]["source_type"] = "unknown"
+
+    ocr_backends = {
+        str((payload or {}).get("ocr_backend") or "").strip().lower()
+        for payload in diagnostics["pages"].values()
+        if isinstance(payload, dict) and str((payload or {}).get("source_type") or "").strip().lower() == "ocr"
+    }
+    ocr_backends.discard("")
+    if ocr_backends:
+        diagnostics["job"]["ocr_backend"] = ",".join(sorted(ocr_backends))
+
     result_dir = repo.path(job_id, "result")
     parsed_output = _normalize_rows_by_page_for_output(parsed_output)
-    _persist_job_raw_result(repo, job_id, is_ocr=True, raw_json=_collect_ocr_raw_payload(repo, job_id, page_files))
+    has_ocr_pages = any(
+        str((payload or {}).get("source_type") or "").strip().lower() == "ocr"
+        for payload in diagnostics["pages"].values()
+        if isinstance(payload, dict)
+    )
+    _persist_job_raw_result(repo, job_id, is_ocr=has_ocr_pages, raw_json=_collect_ocr_raw_payload(repo, job_id, page_files))
     _persist_parsed_rows(repo, job_id, parsed_output, bounds_by_page=bounds_output, is_manual_edit=False)
     repo.write_json(result_dir / "parsed_rows.json", parsed_output)
     repo.write_json(result_dir / "bounds.json", bounds_output)
@@ -1017,6 +1170,105 @@ def finalize_job_processing(job_id: str, parse_mode: str, task_id: Optional[str]
     return final_payload
 
 
+def _rebuild_ocr_outputs_from_saved_artifacts(
+    *,
+    repo: JobsRepository,
+    job_id: str,
+    page_files: List[str],
+    parsed_output: Dict[str, List[Dict]],
+    bounds_output: Dict[str, List[Dict]],
+    page_diagnostics: Dict[str, Dict[str, Any]],
+) -> tuple[Dict[str, List[Dict]], Dict[str, List[Dict]], Dict[str, Dict[str, Any]]]:
+    cleaned_dir = repo.path(job_id, "cleaned")
+    ocr_dir = repo.path(job_id, "ocr")
+
+    rebuilt_rows = dict(parsed_output)
+    rebuilt_bounds = dict(bounds_output)
+    rebuilt_diags = {str(key): dict(value or {}) for key, value in page_diagnostics.items()}
+
+    header_hint: Dict[str, Any] | None = None
+    last_date_hint: str = ""
+    last_balance_hint = None
+
+    for page_file in page_files:
+        page_name = str(page_file).replace(".png", "")
+        raw_result_path = _page_raw_result_path(repo, job_id, page_name)
+        raw_result = repo.read_json(raw_result_path, default=None) if raw_result_path.exists() else None
+        ocr_path = ocr_dir / f"{page_name}.json"
+        page_path = cleaned_dir / page_file
+
+        text_raw = raw_result if isinstance(raw_result, dict) and str(raw_result.get("source_type") or "").strip().lower() == "text" else None
+        ocr_raw = raw_result if isinstance(raw_result, dict) and str(raw_result.get("source_type") or "").strip().lower() == "ocr" else None
+        if text_raw:
+            filtered_rows, filtered_bounds, page_diag = _parse_text_page_raw_result(
+                text_raw,
+                header_hint=header_hint,
+                last_date_hint=last_date_hint or None,
+                previous_balance_hint=last_balance_hint,
+            )
+            rebuilt_rows[page_name] = filtered_rows
+            rebuilt_bounds[page_name] = filtered_bounds
+            rebuilt_diags[page_name] = page_diag
+        else:
+            ocr_items = None
+            if isinstance(ocr_raw, dict):
+                payload_items = ocr_raw.get("ocr_items")
+                if isinstance(payload_items, list):
+                    ocr_items = payload_items
+            if ocr_items is None:
+                ocr_items = repo.read_json(ocr_path, default=None) if ocr_path.exists() else None
+            can_reparse = isinstance(ocr_items, list) and ocr_items and page_path.exists()
+            if can_reparse:
+                page_h, page_w = _image_size(page_path)
+                text = " ".join((item.get("text") or "") for item in ocr_items if isinstance(item, dict))
+                profile = detect_bank_profile(text)
+                page_rows, page_bounds, parser_diag = parse_page_with_profile_fallback(
+                    _ocr_items_to_words(ocr_items),
+                    page_w,
+                    page_h,
+                    profile,
+                    header_hint=header_hint,
+                    last_date_hint=last_date_hint or None,
+                )
+                filtered_rows, filtered_bounds = _filter_rows_and_bounds(page_rows, page_bounds, profile)
+                filtered_rows = _repair_page_flow_columns(filtered_rows, previous_balance_hint=last_balance_hint)
+                rebuilt_rows[page_name] = filtered_rows
+                rebuilt_bounds[page_name] = filtered_bounds
+
+                page_diag = {
+                    "source_type": "ocr",
+                    "ocr_backend": str((ocr_raw or {}).get("provider") or "google_vision"),
+                    "bank_profile": profile.name,
+                    "rows_parsed": len(filtered_rows),
+                    "profile_detected": parser_diag.get("profile_detected", profile.name),
+                    "profile_selected": parser_diag.get("profile_selected", profile.name),
+                    "fallback_applied": bool(parser_diag.get("fallback_applied", False)),
+                    "header_detected": bool(parser_diag.get("header_detected", False)),
+                    "header_hint_used": bool(parser_diag.get("header_hint_used", False)),
+                }
+                if isinstance(parser_diag.get("header_anchors"), dict):
+                    page_diag["header_anchors"] = parser_diag["header_anchors"]
+                rebuilt_diags[page_name] = page_diag
+            else:
+                existing_diag = dict(rebuilt_diags.get(page_name) or {})
+                existing_rows = rebuilt_rows.get(page_name) or []
+                if existing_diag:
+                    rebuilt_diags[page_name] = existing_diag
+
+        current_diag = rebuilt_diags.get(page_name) or {}
+        anchors = current_diag.get("header_anchors")
+        if isinstance(anchors, dict) and anchors:
+            header_hint = dict(anchors)
+        page_last_date = _last_row_date(rebuilt_rows.get(page_name) or [])
+        if page_last_date:
+            last_date_hint = page_last_date
+        page_last_balance = _last_row_balance(rebuilt_rows.get(page_name) or [])
+        if page_last_balance is not None:
+            last_balance_hint = page_last_balance
+
+    return rebuilt_rows, rebuilt_bounds, rebuilt_diags
+
+
 def _read_job_text_layer_xml(repo: JobsRepository, job_id: str) -> str | None:
     input_pdf = repo.path(job_id, "input", "document.pdf")
     if not input_pdf.exists():
@@ -1032,6 +1284,10 @@ def _collect_ocr_raw_payload(repo: JobsRepository, job_id: str, page_files: list
     for page_file in page_files:
         page_name = normalize_page_name(str(page_file).replace(".png", ""))
         page_payload: dict[str, Any] = {}
+
+        raw_path = _page_raw_result_path(repo, job_id, page_name)
+        if raw_path.exists():
+            page_payload["raw_result"] = repo.read_json(raw_path, default={})
 
         ocr_path = repo.path(job_id, "ocr", f"{page_name}.json")
         if ocr_path.exists():
@@ -1459,12 +1715,55 @@ def _persist_parsed_rows(
     is_manual_edit: bool,
 ) -> None:
     parsed_repo = JobTransactionsRepository(DATA_DIR)
+    existing_page_metadata = parsed_repo.get_page_metadata_by_job(job_id)
+    page_metadata_by_page = _build_page_metadata_by_page(repo, job_id, rows_by_page)
+    for page_name, metadata in page_metadata_by_page.items():
+        existing = existing_page_metadata.get(page_name) or {}
+        if metadata.get("notes") is None and existing.get("notes") is not None:
+            metadata["notes"] = existing.get("notes")
     parsed_repo.replace_job_rows(
         job_id=job_id,
         rows_by_page=rows_by_page,
         bounds_by_page=bounds_by_page or {},
+        page_metadata_by_page=page_metadata_by_page,
         is_manual_edit=is_manual_edit,
     )
+
+
+def _build_page_metadata_by_page(
+    repo: JobsRepository,
+    job_id: str,
+    rows_by_page: Dict[str, List[Dict]],
+) -> Dict[str, Dict[str, Any]]:
+    manifest = _load_pages_manifest(repo, job_id)
+    manifest_pages = manifest.get("pages") if isinstance(manifest.get("pages"), list) else []
+    page_names = {normalize_page_name(name) for name in manifest_pages if normalize_page_name(name)}
+    page_names.update(normalize_page_name(name) for name in (rows_by_page or {}).keys() if normalize_page_name(name))
+
+    metadata: Dict[str, Dict[str, Any]] = {}
+    for page_name in sorted(page_names):
+        raw_result = None
+        for suffix in (".raw.json", ".openai_raw.json", ".google_vision_raw.json", ".json"):
+            path = repo.path(job_id, "ocr", f"{page_name}{suffix}")
+            if not path.exists():
+                continue
+            payload = repo.read_json(path, default=None)
+            if isinstance(payload, (dict, list)):
+                raw_result = payload
+                break
+        page_number = int(page_name.split("_", 1)[1]) if page_name.startswith("page_") and page_name.split("_", 1)[1].isdigit() else 0
+        is_digital = False
+        if isinstance(raw_result, dict):
+            source_type = str(raw_result.get("source_type") or "").strip().lower()
+            if source_type == "text":
+                is_digital = True
+        metadata[page_name] = {
+            "page_number": page_number,
+            "is_digital": is_digital,
+            "raw_result": raw_result,
+            "notes": None,
+        }
+    return metadata
 
 
 def _load_parsed_rows(repo: JobsRepository, job_id: str, required: bool = False) -> Dict[str, List[Dict]]:

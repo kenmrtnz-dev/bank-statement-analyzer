@@ -17,10 +17,10 @@ from typing import Any, Callable, Dict
 
 from sqlalchemy import Text, cast, create_engine, delete, func, inspect, or_, select, text
 from sqlalchemy.engine import Engine
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.exc import OperationalError
 
-from app.infra.db.models import BankCodeFlagRecord, Base, JobRecord, JobResultRawRecord, JobTransactionRecord
+from app.infra.db.models import BankCodeFlagRecord, Base, JobPageRecord, JobRecord, JobResultRawRecord, TransactionRecord
 from app.settings import load_settings
 
 _DB_ENGINE_CACHE: dict[str, Engine] = {}
@@ -183,57 +183,61 @@ def _get_db_engine(data_dir: str | Path) -> Engine:
         return engine
 
 
-def ensure_job_transactions_schema(data_dir: str | Path) -> None:
-    """Create the job-transactions table when schema auto-creation is enabled."""
+def ensure_job_pages_schema(data_dir: str | Path) -> None:
+    """Create the job_pages table when schema auto-creation is enabled."""
     if not _env_bool("DB_AUTO_CREATE_SCHEMA", True):
         return
     ensure_jobs_schema(data_dir)
 
     def _apply(url: str, engine: Engine) -> None:
-        key = f"{url}#job_transactions"
+        key = f"{url}#job_pages"
         with _DB_ENGINE_CACHE_GUARD:
             if key in _DB_SCHEMA_READY:
                 return
         inspector = inspect(engine)
-        expected_columns = set(JobTransactionRecord.__table__.c.keys())
-        additive_columns = {
-            "is_flagged": "ALTER TABLE job_transactions ADD COLUMN is_flagged BOOLEAN NOT NULL DEFAULT FALSE",
-            "is_disbalanced": "ALTER TABLE job_transactions ADD COLUMN is_disbalanced BOOLEAN NOT NULL DEFAULT FALSE",
-            "disbalance_expected_balance": "ALTER TABLE job_transactions ADD COLUMN disbalance_expected_balance NUMERIC(18, 2) NULL",
-            "disbalance_delta": "ALTER TABLE job_transactions ADD COLUMN disbalance_delta NUMERIC(18, 2) NULL",
-        }
-        legacy_columns = {
-            "row_id",
-            "rownumber",
-            "x1",
-            "y1",
-            "x2",
-            "y2",
-            "is_manual_edit",
-        }
-        if "job_transactions" not in inspector.get_table_names():
-            Base.metadata.create_all(engine, tables=[JobTransactionRecord.__table__])
+        if "job_pages" not in inspector.get_table_names():
+            Base.metadata.create_all(engine, tables=[JobPageRecord.__table__])
         else:
-            existing_columns = {column.get("name") for column in inspector.get_columns("job_transactions")}
-            missing_columns = expected_columns - existing_columns
-            if missing_columns:
-                additive_missing = missing_columns & set(additive_columns)
-                if additive_missing and missing_columns == additive_missing:
-                    with engine.begin() as conn:
-                        for column_name in sorted(additive_missing):
-                            conn.execute(text(additive_columns[column_name]))
-                elif legacy_columns.issubset(existing_columns):
-                    _rebuild_legacy_job_transactions_schema(engine)
-                else:
-                    missing = ", ".join(sorted(missing_columns))
-                    raise RuntimeError(
-                        "job_transactions schema is incompatible with the current app. "
-                        f"Missing columns: {missing}. Run ./scripts/migrate.sh."
-                    )
+            existing_columns = {column.get("name") for column in inspector.get_columns("job_pages")}
+            with engine.begin() as conn:
+                if "ocr_result" in existing_columns and "raw_result" not in existing_columns:
+                    conn.execute(text("ALTER TABLE job_pages RENAME COLUMN ocr_result TO raw_result"))
+                    existing_columns.discard("ocr_result")
+                    existing_columns.add("raw_result")
+            if "notes" not in existing_columns:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE job_pages ADD COLUMN notes TEXT NULL"))
+            if "raw_result" not in existing_columns:
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE job_pages ADD COLUMN raw_result JSONB NULL"))
         with _DB_ENGINE_CACHE_GUARD:
             _DB_SCHEMA_READY.add(key)
 
     _run_schema_bootstrap(data_dir, _apply)
+
+
+def ensure_transactions_schema(data_dir: str | Path) -> None:
+    """Create the transactions table when schema auto-creation is enabled."""
+    if not _env_bool("DB_AUTO_CREATE_SCHEMA", True):
+        return
+    ensure_jobs_schema(data_dir)
+    ensure_job_pages_schema(data_dir)
+
+    def _apply(url: str, engine: Engine) -> None:
+        key = f"{url}#transactions"
+        with _DB_ENGINE_CACHE_GUARD:
+            if key in _DB_SCHEMA_READY:
+                return
+        Base.metadata.create_all(engine, tables=[TransactionRecord.__table__])
+        with _DB_ENGINE_CACHE_GUARD:
+            _DB_SCHEMA_READY.add(key)
+
+    _run_schema_bootstrap(data_dir, _apply)
+
+
+def ensure_job_transactions_schema(data_dir: str | Path) -> None:
+    """Backward-compatible alias for the renamed transactions table bootstrap."""
+    ensure_transactions_schema(data_dir)
 
 
 def ensure_job_results_raw_schema(data_dir: str | Path) -> None:
@@ -282,12 +286,13 @@ def ensure_jobs_schema(data_dir: str | Path) -> None:
         return
 
     expected_columns = {
-        "job_id": 'ALTER TABLE jobs ADD COLUMN job_id VARCHAR(36)',
+        "id": 'ALTER TABLE jobs ADD COLUMN id VARCHAR(36)',
         "file_name": "ALTER TABLE jobs ADD COLUMN file_name VARCHAR(512) NOT NULL DEFAULT ''",
         "file_size": "ALTER TABLE jobs ADD COLUMN file_size BIGINT NOT NULL DEFAULT 0",
-        "processing_status": "ALTER TABLE jobs ADD COLUMN processing_status VARCHAR(32) NOT NULL DEFAULT 'queued'",
-        "process_started": "ALTER TABLE jobs ADD COLUMN process_started TIMESTAMPTZ NULL",
-        "process_end": "ALTER TABLE jobs ADD COLUMN process_end TIMESTAMPTZ NULL",
+        "job_status": "ALTER TABLE jobs ADD COLUMN job_status VARCHAR(32) NOT NULL DEFAULT 'queued'",
+        "started_at": "ALTER TABLE jobs ADD COLUMN started_at TIMESTAMPTZ NULL",
+        "ended_at": "ALTER TABLE jobs ADD COLUMN ended_at TIMESTAMPTZ NULL",
+        "pages": "ALTER TABLE jobs ADD COLUMN pages INTEGER NOT NULL DEFAULT 0",
         "is_reversed": "ALTER TABLE jobs ADD COLUMN is_reversed BOOLEAN NOT NULL DEFAULT FALSE",
     }
 
@@ -305,157 +310,22 @@ def ensure_jobs_schema(data_dir: str | Path) -> None:
                 for column_name, ddl in expected_columns.items():
                     if column_name not in existing_columns:
                         conn.execute(text(ddl))
-                if "job_id" in existing_columns:
-                    pk = inspector.get_pk_constraint("jobs") or {}
-                    constrained = pk.get("constrained_columns") or []
-                    if "job_id" not in constrained:
-                        conn.execute(text("ALTER TABLE jobs ADD PRIMARY KEY (job_id)"))
+                if "job_id" in existing_columns and "id" in expected_columns:
+                    conn.execute(text("UPDATE jobs SET id = COALESCE(id, job_id) WHERE id IS NULL"))
+                if "processing_status" in existing_columns and "job_status" in expected_columns:
+                    conn.execute(text("UPDATE jobs SET job_status = COALESCE(NULLIF(job_status, ''), processing_status)"))
+                if "process_started" in existing_columns and "started_at" in expected_columns:
+                    conn.execute(text("UPDATE jobs SET started_at = COALESCE(started_at, process_started)"))
+                if "process_end" in existing_columns and "ended_at" in expected_columns:
+                    conn.execute(text("UPDATE jobs SET ended_at = COALESCE(ended_at, process_end)"))
+                pk = inspector.get_pk_constraint("jobs") or {}
+                constrained = pk.get("constrained_columns") or []
+                if "id" in existing_columns and "id" not in constrained:
+                    conn.execute(text("ALTER TABLE jobs ADD PRIMARY KEY (id)"))
         with _DB_ENGINE_CACHE_GUARD:
             _DB_SCHEMA_READY.add(key)
 
     _run_schema_bootstrap(data_dir, _apply)
-
-
-def _rebuild_legacy_job_transactions_schema(engine: Engine) -> None:
-    """Rewrite the legacy job_transactions table into the current runtime shape."""
-    with engine.begin() as conn:
-        conn.execute(text("DROP TABLE IF EXISTS job_transactions_v2"))
-        conn.execute(
-            text(
-                """
-                CREATE TABLE job_transactions_v2 (
-                    id VARCHAR(36) NOT NULL PRIMARY KEY,
-                    job_id VARCHAR(36) NOT NULL,
-                    page_key VARCHAR(32) NOT NULL,
-                    page_number INTEGER NOT NULL,
-                    row_index INTEGER NOT NULL,
-                    row_number INTEGER NULL,
-                    date VARCHAR(32) NULL,
-                    description TEXT NULL,
-                    debit NUMERIC(18, 2) NULL,
-                    credit NUMERIC(18, 2) NULL,
-                    balance NUMERIC(18, 2) NULL,
-                    row_number_bounds JSONB NULL,
-                    date_bounds JSONB NULL,
-                    debit_bounds JSONB NULL,
-                    credit_bounds JSONB NULL,
-                    balance_bounds JSONB NULL,
-                    row_type VARCHAR(32) NOT NULL,
-                    is_new_row BOOLEAN NOT NULL DEFAULT FALSE,
-                    is_modified BOOLEAN NOT NULL DEFAULT FALSE,
-                    is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
-                    created_at TIMESTAMPTZ NOT NULL,
-                    updated_at TIMESTAMPTZ NOT NULL
-                )
-                """
-            )
-        )
-        conn.execute(
-            text(
-                """
-                INSERT INTO job_transactions_v2 (
-                    id,
-                    job_id,
-                    page_key,
-                    page_number,
-                    row_index,
-                    row_number,
-                    date,
-                    description,
-                    debit,
-                    credit,
-                    balance,
-                    row_number_bounds,
-                    date_bounds,
-                    debit_bounds,
-                    credit_bounds,
-                    balance_bounds,
-                    row_type,
-                    is_new_row,
-                    is_modified,
-                    is_deleted,
-                    created_at,
-                    updated_at
-                )
-                SELECT
-                    legacy.id,
-                    legacy.job_id,
-                    CASE
-                        WHEN legacy.page_key ~ '^page_[0-9]+$' THEN 'page_' || LPAD(SPLIT_PART(legacy.page_key, '_', 2), 3, '0')
-                        WHEN legacy.page_key ~ '^[0-9]+$' THEN 'page_' || LPAD(legacy.page_key, 3, '0')
-                        ELSE legacy.page_key
-                    END AS page_key,
-                    CASE
-                        WHEN legacy.page_key ~ '^page_[0-9]+$' THEN CAST(SPLIT_PART(legacy.page_key, '_', 2) AS INTEGER)
-                        WHEN legacy.page_key ~ '^[0-9]+$' THEN CAST(legacy.page_key AS INTEGER)
-                        ELSE 0
-                    END AS page_number,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY legacy.job_id
-                        ORDER BY
-                            CASE
-                                WHEN legacy.page_key ~ '^page_[0-9]+$' THEN CAST(SPLIT_PART(legacy.page_key, '_', 2) AS INTEGER)
-                                WHEN legacy.page_key ~ '^[0-9]+$' THEN CAST(legacy.page_key AS INTEGER)
-                                ELSE 0
-                            END,
-                            legacy.row_index,
-                            legacy.id
-                    ) AS row_index,
-                    CASE
-                        WHEN legacy.rownumber IS NOT NULL THEN legacy.rownumber
-                        WHEN REGEXP_REPLACE(COALESCE(legacy.row_number, ''), '[^0-9]', '', 'g') <> '' THEN
-                            CAST(REGEXP_REPLACE(legacy.row_number, '[^0-9]', '', 'g') AS INTEGER)
-                        ELSE NULL
-                    END AS row_number,
-                    legacy.date,
-                    legacy.description,
-                    legacy.debit,
-                    legacy.credit,
-                    legacy.balance,
-                    CASE
-                        WHEN legacy.x1 IS NULL OR legacy.y1 IS NULL OR legacy.x2 IS NULL OR legacy.y2 IS NULL THEN NULL
-                        ELSE JSONB_BUILD_OBJECT('x1', legacy.x1, 'y1', legacy.y1, 'x2', legacy.x2, 'y2', legacy.y2)
-                    END AS row_number_bounds,
-                    CASE
-                        WHEN legacy.x1 IS NULL OR legacy.y1 IS NULL OR legacy.x2 IS NULL OR legacy.y2 IS NULL THEN NULL
-                        ELSE JSONB_BUILD_OBJECT('x1', legacy.x1, 'y1', legacy.y1, 'x2', legacy.x2, 'y2', legacy.y2)
-                    END AS date_bounds,
-                    CASE
-                        WHEN legacy.x1 IS NULL OR legacy.y1 IS NULL OR legacy.x2 IS NULL OR legacy.y2 IS NULL THEN NULL
-                        ELSE JSONB_BUILD_OBJECT('x1', legacy.x1, 'y1', legacy.y1, 'x2', legacy.x2, 'y2', legacy.y2)
-                    END AS debit_bounds,
-                    CASE
-                        WHEN legacy.x1 IS NULL OR legacy.y1 IS NULL OR legacy.x2 IS NULL OR legacy.y2 IS NULL THEN NULL
-                        ELSE JSONB_BUILD_OBJECT('x1', legacy.x1, 'y1', legacy.y1, 'x2', legacy.x2, 'y2', legacy.y2)
-                    END AS credit_bounds,
-                    CASE
-                        WHEN legacy.x1 IS NULL OR legacy.y1 IS NULL OR legacy.x2 IS NULL OR legacy.y2 IS NULL THEN NULL
-                        ELSE JSONB_BUILD_OBJECT('x1', legacy.x1, 'y1', legacy.y1, 'x2', legacy.x2, 'y2', legacy.y2)
-                    END AS balance_bounds,
-                    legacy.row_type,
-                    FALSE AS is_new_row,
-                    COALESCE(legacy.is_manual_edit, FALSE) AS is_modified,
-                    FALSE AS is_deleted,
-                    legacy.created_at,
-                    legacy.updated_at
-                FROM job_transactions AS legacy
-                """
-            )
-        )
-        conn.execute(text("DROP INDEX IF EXISTS ix_job_transactions_job_page"))
-        conn.execute(text("DROP INDEX IF EXISTS ix_job_transactions_job_id"))
-        conn.execute(text("DROP TABLE job_transactions"))
-        conn.execute(text("ALTER TABLE job_transactions_v2 RENAME TO job_transactions"))
-        conn.execute(text("CREATE INDEX ix_job_transactions_job_id ON job_transactions (job_id)"))
-        conn.execute(text("CREATE INDEX ix_job_transactions_job_page ON job_transactions (job_id, page_key)"))
-        conn.execute(
-            text(
-                """
-                ALTER TABLE job_transactions
-                ADD CONSTRAINT uq_job_transactions_job_row_index UNIQUE (job_id, row_index)
-                """
-            )
-        )
 
 
 def _to_decimal(value: Any) -> Decimal | None:
@@ -532,6 +402,7 @@ def _consume_bound(state: dict[str, Any], *, row_id: str, row_index: int) -> dic
 _JOB_TX_BOUND_FIELDS = (
     "row_number_bounds",
     "date_bounds",
+    "description_bounds",
     "debit_bounds",
     "credit_bounds",
     "balance_bounds",
@@ -559,6 +430,11 @@ def _output_page_key(page_key: str) -> str:
 
 def _page_number_from_key(page_key: str) -> int:
     return _page_sort_value(page_key)[0]
+
+
+def _page_key_from_number(page_number: int) -> str:
+    value = max(0, int(page_number or 0))
+    return f"page_{value:03}"
 
 
 def _normalize_bound_payload(value: Any) -> dict[str, float] | None:
@@ -785,30 +661,28 @@ class JobTransactionsRepository:
 
     def __init__(self, data_dir: str | Path):
         self.data_dir = Path(data_dir)
-        ensure_job_transactions_schema(self.data_dir)
+        ensure_transactions_schema(self.data_dir)
         ensure_bank_code_flags_schema(self.data_dir)
         self.engine = _get_db_engine(self.data_dir)
 
     def has_rows(self, job_id: str) -> bool:
         with Session(self.engine) as session:
             stmt = (
-                select(JobTransactionRecord.id)
+                select(TransactionRecord.id)
                 .where(
-                    JobTransactionRecord.job_id == str(job_id),
-                    JobTransactionRecord.is_deleted.is_(False),
+                    TransactionRecord.job_id == str(job_id),
+                    TransactionRecord.is_deleted.is_(False),
                 )
                 .limit(1)
             )
             return session.execute(stmt).scalar_one_or_none() is not None
 
     def get_rows_by_job(self, job_id: str) -> Dict[str, list[dict[str, Any]]]:
-        self._sync_flagged_status(job_id)
         records = self._fetch_records(job_id, include_deleted=False)
         rows_by_page, _ = self._records_to_payload(records, include_deleted=False)
         return rows_by_page
 
     def get_bounds_by_job(self, job_id: str) -> Dict[str, list[dict[str, Any]]]:
-        self._sync_flagged_status(job_id)
         records = self._fetch_records(job_id, include_deleted=False)
         _, bounds_by_page = self._records_to_payload(records, include_deleted=False)
         return bounds_by_page
@@ -819,18 +693,26 @@ class JobTransactionsRepository:
         rows_by_page: Dict[str, list[dict[str, Any]]],
         *,
         bounds_by_page: Dict[str, list[dict[str, Any]]] | None = None,
+        page_metadata_by_page: Dict[str, dict[str, Any]] | None = None,
         is_manual_edit: bool = False,
     ) -> None:
-        payloads = self._build_payloads(
+        page_payloads, tx_payloads = self._build_payloads(
             job_id=str(job_id),
             rows_by_page=rows_by_page,
             bounds_by_page=bounds_by_page or {},
+            page_metadata_by_page=page_metadata_by_page or {},
             is_manual_edit=is_manual_edit,
         )
         with Session(self.engine) as session:
             self._ensure_job_record(session, str(job_id))
-            session.execute(delete(JobTransactionRecord).where(JobTransactionRecord.job_id == str(job_id)))
-            session.add_all(JobTransactionRecord(**payload) for payload in payloads)
+            record = session.get(JobRecord, str(job_id))
+            session.execute(delete(TransactionRecord).where(TransactionRecord.job_id == str(job_id)))
+            session.execute(delete(JobPageRecord).where(JobPageRecord.job_id == str(job_id)))
+            session.flush()
+            session.add_all(JobPageRecord(**payload) for payload in page_payloads)
+            session.add_all(TransactionRecord(**payload) for payload in tx_payloads)
+            if record is not None:
+                record.pages = len(page_payloads)
             session.commit()
 
     def replace_page_rows(
@@ -844,6 +726,7 @@ class JobTransactionsRepository:
         output_page_key = _output_page_key(page_key)
         existing_active_rows = self.get_rows_by_job(job_id)
         existing_active_bounds = self.get_bounds_by_job(job_id)
+        existing_page_metadata = self._load_page_metadata_by_job(job_id)
         existing_all_rows, existing_all_bounds = self._records_to_payload(
             self._fetch_records(job_id, include_deleted=True),
             include_deleted=True,
@@ -880,7 +763,6 @@ class JobTransactionsRepository:
                     "credit": row.get("credit"),
                     "balance": row.get("balance"),
                     "row_type": str(row.get("row_type") or "transaction"),
-                    "is_flagged": bool(row.get("is_flagged", False)),
                     "is_new_row": is_new_row,
                     "is_modified": is_modified,
                     "is_deleted": False,
@@ -903,7 +785,6 @@ class JobTransactionsRepository:
                     "credit": existing.get("credit"),
                     "balance": existing.get("balance"),
                     "row_type": str(existing.get("row_type") or "transaction"),
-                    "is_flagged": bool(existing.get("is_flagged", False)),
                     "is_new_row": bool(existing.get("is_new_row")),
                     "is_modified": True,
                     "is_deleted": True,
@@ -917,13 +798,15 @@ class JobTransactionsRepository:
             job_id=job_id,
             rows_by_page=existing_all_rows,
             bounds_by_page=existing_all_bounds,
+            page_metadata_by_page=existing_page_metadata,
             is_manual_edit=is_manual_edit,
         )
 
     def clear_all(self) -> int:
         with Session(self.engine) as session:
-            count = session.execute(select(func.count()).select_from(JobTransactionRecord)).scalar_one()
-            session.execute(delete(JobTransactionRecord))
+            count = session.execute(select(func.count()).select_from(TransactionRecord)).scalar_one()
+            session.execute(delete(TransactionRecord))
+            session.execute(delete(JobPageRecord))
             session.commit()
             return int(count or 0)
 
@@ -943,33 +826,39 @@ class JobTransactionsRepository:
         filters = []
         job_value = str(job_id or "").strip()
         if job_value:
-            filters.append(JobTransactionRecord.job_id == job_value)
+            filters.append(TransactionRecord.job_id == job_value)
 
         page_value = str(page_key or "").strip()
         if page_value:
-            filters.append(JobTransactionRecord.page_key == _output_page_key(page_value))
+            filters.append(JobPageRecord.page_number == _page_number_from_key(page_value))
 
         search_value = str(search or "").strip().lower()
         if search_value:
             pattern = f"%{search_value}%"
             filters.append(
                 or_(
-                    func.lower(JobTransactionRecord.job_id).like(pattern),
-                    func.lower(JobTransactionRecord.page_key).like(pattern),
-                    cast(JobTransactionRecord.row_number, Text).like(pattern),
-                    func.lower(JobTransactionRecord.date).like(pattern),
-                    func.lower(JobTransactionRecord.description).like(pattern),
+                    func.lower(TransactionRecord.job_id).like(pattern),
+                    cast(JobPageRecord.page_number, Text).like(pattern),
+                    cast(TransactionRecord.row_number, Text).like(pattern),
+                    func.lower(TransactionRecord.date).like(pattern),
+                    func.lower(TransactionRecord.description).like(pattern),
                 )
             )
 
         with Session(self.engine) as session:
-            self._sync_flagged_status(session=session, job_id=job_value or None)
-            count_stmt = select(func.count()).select_from(JobTransactionRecord)
-            row_stmt = select(JobTransactionRecord).order_by(
-                JobTransactionRecord.updated_at.desc(),
-                JobTransactionRecord.job_id.desc(),
-                JobTransactionRecord.page_key.asc(),
-                JobTransactionRecord.row_index.asc(),
+            count_stmt = select(func.count()).select_from(TransactionRecord).join(
+                JobPageRecord, TransactionRecord.page_id == JobPageRecord.id
+            )
+            row_stmt = (
+                select(TransactionRecord)
+                .join(JobPageRecord, TransactionRecord.page_id == JobPageRecord.id)
+                .options(joinedload(TransactionRecord.page))
+                .order_by(
+                    TransactionRecord.updated_at.desc(),
+                    TransactionRecord.job_id.desc(),
+                    JobPageRecord.page_number.asc(),
+                    TransactionRecord.row_index.asc(),
+                )
             )
             if filters:
                 count_stmt = count_stmt.where(*filters)
@@ -979,7 +868,8 @@ class JobTransactionsRepository:
             records = session.execute(row_stmt.offset(offset).limit(safe_limit)).scalars().all()
 
         total_pages = max(1, (total_rows + safe_limit - 1) // safe_limit) if total_rows else 1
-        rows = [self._serialize_record(record) for record in records]
+        extras_by_id = self._compute_record_extras(records)
+        rows = [self._serialize_record(record, extras_by_id.get(str(record.id), {})) for record in records]
         return {
             "rows": rows,
             "pagination": {
@@ -1003,16 +893,36 @@ class JobTransactionsRepository:
         job_id: str,
         rows_by_page: Dict[str, list[dict[str, Any]]],
         bounds_by_page: Dict[str, list[dict[str, Any]]],
+        page_metadata_by_page: Dict[str, dict[str, Any]],
         is_manual_edit: bool,
-    ) -> list[dict[str, Any]]:
-        now = dt.datetime.utcnow()
-        payloads: list[dict[str, Any]] = []
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        now = dt.datetime.now(dt.timezone.utc)
+        page_payloads: list[dict[str, Any]] = []
+        tx_payloads: list[dict[str, Any]] = []
         global_row_index = 0
-        flag_codes = self._load_flag_codes()
-        for page_key in sorted((rows_by_page or {}).keys(), key=_page_sort_value):
+        canonical_page_metadata: dict[str, dict[str, Any]] = {}
+        for key, value in (page_metadata_by_page or {}).items():
+            canonical_page_metadata[_output_page_key(key)] = dict(value or {})
+
+        page_keys = set(canonical_page_metadata)
+        page_keys.update(_output_page_key(key) for key in (rows_by_page or {}).keys())
+
+        for page_key in sorted(page_keys, key=_page_sort_value):
             rows = _compute_disbalance_fields(rows_by_page.get(page_key) or [])
             bounds_state = _prepare_bounds_state(bounds_by_page.get(page_key))
-            canonical_page_key = _output_page_key(page_key)
+            metadata = canonical_page_metadata.get(page_key) or {}
+            page_number = _page_number_from_key(page_key)
+            page_id = str(metadata.get("id") or uuid.uuid4())
+            page_payloads.append(
+                {
+                    "id": page_id,
+                    "job_id": str(job_id),
+                    "page_number": page_number,
+                    "is_digital": bool(metadata.get("is_digital", False)),
+                    "raw_result": metadata.get("raw_result") if isinstance(metadata.get("raw_result"), (dict, list)) else None,
+                    "notes": str(metadata.get("notes")) if metadata.get("notes") is not None else None,
+                }
+            )
             for row_index, row in enumerate(rows, start=1):
                 if not isinstance(row, dict):
                     continue
@@ -1020,12 +930,11 @@ class JobTransactionsRepository:
                 bound = _consume_bound(bounds_state, row_id=row_id, row_index=row_index)
                 expanded_bounds = _expand_bound_payload(bound)
                 global_row_index += 1
-                payloads.append(
+                tx_payloads.append(
                     {
                         "id": str(uuid.uuid4()),
-                        "job_id": job_id,
-                        "page_key": canonical_page_key,
-                        "page_number": _page_number_from_key(canonical_page_key),
+                        "job_id": str(job_id),
+                        "page_id": page_id,
                         "row_index": int(global_row_index),
                         "row_number": _normalize_row_number_value(row.get("row_number"), fallback=row.get("rownumber")),
                         "date": str(row.get("date") or ""),
@@ -1035,14 +944,11 @@ class JobTransactionsRepository:
                         "balance": _to_decimal(row.get("balance")),
                         "row_number_bounds": expanded_bounds["row_number_bounds"],
                         "date_bounds": expanded_bounds["date_bounds"],
+                        "description_bounds": expanded_bounds["description_bounds"],
                         "debit_bounds": expanded_bounds["debit_bounds"],
                         "credit_bounds": expanded_bounds["credit_bounds"],
                         "balance_bounds": expanded_bounds["balance_bounds"],
                         "row_type": str(row.get("row_type") or "transaction"),
-                        "is_flagged": _compute_is_flagged(row.get("description"), flag_codes),
-                        "is_disbalanced": bool(row.get("is_disbalanced", False)),
-                        "disbalance_expected_balance": _to_decimal(row.get("disbalance_expected_balance")),
-                        "disbalance_delta": _to_decimal(row.get("disbalance_delta")),
                         "is_new_row": bool(row.get("is_new_row", False)),
                         "is_modified": bool(row.get("is_modified", is_manual_edit)),
                         "is_deleted": bool(row.get("is_deleted", False)),
@@ -1050,7 +956,7 @@ class JobTransactionsRepository:
                         "updated_at": now,
                     }
                 )
-        return payloads
+        return page_payloads, tx_payloads
 
     @staticmethod
     def _ensure_job_record(session: Session, job_id: str) -> None:
@@ -1060,32 +966,35 @@ class JobTransactionsRepository:
         now = dt.datetime.now(dt.timezone.utc)
         session.add(
             JobRecord(
-                job_id=str(job_id),
+                id=str(job_id),
                 file_name=f"{job_id}.pdf",
                 file_size=0,
-                processing_status="done",
-                process_started=now,
-                process_end=now,
+                job_status="done",
+                started_at=now,
+                ended_at=now,
+                pages=0,
                 is_reversed=False,
             )
         )
 
-    def _serialize_record(self, record: JobTransactionRecord) -> dict[str, Any]:
+    def _serialize_record(self, record: TransactionRecord, extras: dict[str, Any]) -> dict[str, Any]:
         updated_at = record.updated_at.isoformat() if record.updated_at else None
         merged_bounds = _merge_bound_payloads(
             record.row_number_bounds,
             record.date_bounds,
+            record.description_bounds,
             record.debit_bounds,
             record.credit_bounds,
             record.balance_bounds,
         )
+        page_number = int(extras.get("page_number") or (record.page.page_number if record.page else 0))
         return {
             "id": str(record.id),
             "job_id": str(record.job_id),
-            "page_key": _output_page_key(record.page_key),
-            "page_number": int(record.page_number),
+            "page_key": _page_key_from_number(page_number),
+            "page_number": page_number,
             "row_index": int(record.row_index),
-            "row_id": f"{int(record.row_index):03}",
+            "row_id": str(extras.get("row_id") or f"{int(record.row_index):03}"),
             "rownumber": record.row_number,
             "row_number": str(record.row_number or ""),
             "date": str(record.date or ""),
@@ -1094,13 +1003,14 @@ class JobTransactionsRepository:
             "credit": _to_float(record.credit),
             "balance": _to_float(record.balance),
             "row_type": str(record.row_type or "transaction"),
-            "is_flagged": bool(record.is_flagged),
-            "is_disbalanced": bool(record.is_disbalanced),
-            "disbalance_expected_balance": _to_float(record.disbalance_expected_balance),
-            "disbalance_delta": _to_float(record.disbalance_delta),
+            "is_flagged": bool(extras.get("is_flagged", False)),
+            "is_disbalanced": bool(extras.get("is_disbalanced", False)),
+            "disbalance_expected_balance": _to_float(extras.get("disbalance_expected_balance")),
+            "disbalance_delta": _to_float(extras.get("disbalance_delta")),
             "bounds": merged_bounds,
             "row_number_bounds": record.row_number_bounds,
             "date_bounds": record.date_bounds,
+            "description_bounds": record.description_bounds,
             "debit_bounds": record.debit_bounds,
             "credit_bounds": record.credit_bounds,
             "balance_bounds": record.balance_bounds,
@@ -1110,34 +1020,37 @@ class JobTransactionsRepository:
             "updated_at": updated_at,
         }
 
-    def _fetch_records(self, job_id: str, *, include_deleted: bool) -> list[JobTransactionRecord]:
+    def _fetch_records(self, job_id: str, *, include_deleted: bool) -> list[TransactionRecord]:
         with Session(self.engine) as session:
             stmt = (
-                select(JobTransactionRecord)
-                .where(JobTransactionRecord.job_id == str(job_id))
+                select(TransactionRecord)
+                .join(JobPageRecord, TransactionRecord.page_id == JobPageRecord.id)
+                .options(joinedload(TransactionRecord.page))
+                .where(TransactionRecord.job_id == str(job_id))
                 .order_by(
-                    JobTransactionRecord.page_number.asc(),
-                    JobTransactionRecord.row_index.asc(),
-                    JobTransactionRecord.updated_at.asc(),
+                    JobPageRecord.page_number.asc(),
+                    TransactionRecord.row_index.asc(),
+                    TransactionRecord.updated_at.asc(),
                 )
             )
             if not include_deleted:
-                stmt = stmt.where(JobTransactionRecord.is_deleted.is_(False))
+                stmt = stmt.where(TransactionRecord.is_deleted.is_(False))
             return session.execute(stmt).scalars().all()
 
     def _records_to_payload(
         self,
-        records: list[JobTransactionRecord],
+        records: list[TransactionRecord],
         *,
         include_deleted: bool,
     ) -> tuple[Dict[str, list[dict[str, Any]]], Dict[str, list[dict[str, Any]]]]:
-        rows_by_page: Dict[str, list[dict[str, Any]]] = {}
+        raw_rows_by_page: Dict[str, list[dict[str, Any]]] = {}
         bounds_by_page: Dict[str, list[dict[str, Any]]] = {}
         page_counters: dict[str, int] = {}
         for record in records:
             if record.is_deleted and not include_deleted:
                 continue
-            page_key = _output_page_key(record.page_key)
+            page_number = int(record.page.page_number if record.page else 0)
+            page_key = _page_key_from_number(page_number)
             page_counters[page_key] = page_counters.get(page_key, 0) + 1
             row_id = f"{page_counters[page_key]:03}"
             row_payload = {
@@ -1150,19 +1063,16 @@ class JobTransactionsRepository:
                 "credit": _to_float(record.credit),
                 "balance": _to_float(record.balance),
                 "row_type": str(record.row_type or "transaction"),
-                "is_flagged": bool(record.is_flagged),
-                "is_disbalanced": bool(record.is_disbalanced),
-                "disbalance_expected_balance": _to_float(record.disbalance_expected_balance),
-                "disbalance_delta": _to_float(record.disbalance_delta),
                 "is_new_row": bool(record.is_new_row),
                 "is_modified": bool(record.is_modified),
                 "is_deleted": bool(record.is_deleted),
             }
-            rows_by_page.setdefault(page_key, []).append(row_payload)
+            raw_rows_by_page.setdefault(page_key, []).append(row_payload)
 
             merged_bounds = _merge_bound_payloads(
                 record.row_number_bounds,
                 record.date_bounds,
+                record.description_bounds,
                 record.debit_bounds,
                 record.credit_bounds,
                 record.balance_bounds,
@@ -1179,12 +1089,20 @@ class JobTransactionsRepository:
                 "y2": merged_bounds["y2"] if merged_bounds else None,
                 "row_number_bounds": record.row_number_bounds,
                 "date_bounds": record.date_bounds,
+                "description_bounds": record.description_bounds,
                 "debit_bounds": record.debit_bounds,
                 "credit_bounds": record.credit_bounds,
                 "balance_bounds": record.balance_bounds,
             }
             bounds_by_page.setdefault(page_key, []).append(bounds_payload)
-        return rows_by_page, bounds_by_page
+        enriched_rows_by_page: Dict[str, list[dict[str, Any]]] = {}
+        flag_codes = self._load_flag_codes()
+        for page_key, rows in raw_rows_by_page.items():
+            enriched = _compute_disbalance_fields(rows)
+            for row in enriched:
+                row["is_flagged"] = _compute_is_flagged(row.get("description"), flag_codes)
+            enriched_rows_by_page[page_key] = enriched
+        return enriched_rows_by_page, bounds_by_page
 
     def _load_flag_codes(self) -> set[str]:
         with Session(self.engine) as session:
@@ -1192,49 +1110,122 @@ class JobTransactionsRepository:
             rows = session.execute(stmt).scalars().all()
         return {_normalize_bank_flag_code(value) for value in rows if _normalize_bank_flag_code(value)}
 
+    def _load_page_metadata_by_job(self, job_id: str) -> dict[str, dict[str, Any]]:
+        with Session(self.engine) as session:
+            stmt = select(JobPageRecord).where(JobPageRecord.job_id == str(job_id)).order_by(JobPageRecord.page_number.asc())
+            records = session.execute(stmt).scalars().all()
+        return {
+            _page_key_from_number(int(record.page_number)): {
+                "id": str(record.id),
+                "page_number": int(record.page_number),
+                "is_digital": bool(record.is_digital),
+                "raw_result": record.raw_result,
+                "notes": record.notes,
+            }
+            for record in records
+        }
+
+    def get_page_metadata_by_job(self, job_id: str) -> dict[str, dict[str, Any]]:
+        return self._load_page_metadata_by_job(job_id)
+
+    def get_page_notes(self, job_id: str, page_key: str) -> str | None:
+        page_number = _page_number_from_key(page_key)
+        with Session(self.engine) as session:
+            stmt = (
+                select(JobPageRecord.notes)
+                .where(
+                    JobPageRecord.job_id == str(job_id),
+                    JobPageRecord.page_number == int(page_number),
+                )
+                .limit(1)
+            )
+            value = session.execute(stmt).scalar_one_or_none()
+        if value is None:
+            return None
+        text_value = str(value).strip()
+        return text_value or None
+
+    def update_page_notes(self, job_id: str, page_key: str, notes: str | None) -> dict[str, Any]:
+        page_number = _page_number_from_key(page_key)
+        if page_number <= 0:
+            raise KeyError(page_key)
+        note_value = str(notes or "").strip() or None
+        with Session(self.engine) as session:
+            self._ensure_job_record(session, str(job_id))
+            stmt = (
+                select(JobPageRecord)
+                .where(
+                    JobPageRecord.job_id == str(job_id),
+                    JobPageRecord.page_number == int(page_number),
+                )
+                .limit(1)
+            )
+            record = session.execute(stmt).scalar_one_or_none()
+            if record is None:
+                record = JobPageRecord(
+                    id=str(uuid.uuid4()),
+                    job_id=str(job_id),
+                    page_number=int(page_number),
+                    is_digital=False,
+                    raw_result=None,
+                    notes=note_value,
+                )
+                session.add(record)
+            else:
+                record.notes = note_value
+            session.commit()
+            return {
+                "page": _page_key_from_number(int(page_number)),
+                "page_number": int(page_number),
+                "notes": record.notes,
+            }
+
+    def _compute_record_extras(self, records: list[TransactionRecord]) -> dict[str, dict[str, Any]]:
+        extras_by_id: dict[str, dict[str, Any]] = {}
+        grouped: dict[str, list[tuple[TransactionRecord, dict[str, Any]]]] = {}
+        page_counters: dict[str, int] = {}
+        for record in records:
+            page_number = int(record.page.page_number if record.page else 0)
+            page_key = _page_key_from_number(page_number)
+            page_counters[page_key] = page_counters.get(page_key, 0) + 1
+            row_payload = {
+                "row_id": f"{page_counters[page_key]:03}",
+                "rownumber": record.row_number,
+                "row_number": str(record.row_number or ""),
+                "date": str(record.date or ""),
+                "description": str(record.description or ""),
+                "debit": _to_float(record.debit),
+                "credit": _to_float(record.credit),
+                "balance": _to_float(record.balance),
+                "row_type": str(record.row_type or "transaction"),
+                "is_new_row": bool(record.is_new_row),
+                "is_modified": bool(record.is_modified),
+                "is_deleted": bool(record.is_deleted),
+            }
+            grouped.setdefault(page_key, []).append((record, row_payload))
+
+        flag_codes = self._load_flag_codes()
+        for page_key, items in grouped.items():
+            computed_rows = _compute_disbalance_fields([payload for _, payload in items])
+            page_number = _page_number_from_key(page_key)
+            for (record, row_payload), computed in zip(items, computed_rows):
+                extras_by_id[str(record.id)] = {
+                    "page_number": page_number,
+                    "row_id": row_payload["row_id"],
+                    "is_flagged": _compute_is_flagged(computed.get("description"), flag_codes),
+                    "is_disbalanced": bool(computed.get("is_disbalanced", False)),
+                    "disbalance_expected_balance": computed.get("disbalance_expected_balance"),
+                    "disbalance_delta": computed.get("disbalance_delta"),
+                }
+        return extras_by_id
+
     def _sync_flagged_status(
         self,
         job_id: str | None = None,
         *,
         session: Session | None = None,
     ) -> None:
-        own_session = session is None
-        active_session = session or Session(self.engine)
-        try:
-            flag_codes = self._load_flag_codes()
-            if not flag_codes:
-                stmt = select(JobTransactionRecord).where(JobTransactionRecord.is_flagged.is_(True))
-                if job_id:
-                    stmt = stmt.where(JobTransactionRecord.job_id == str(job_id))
-                records = active_session.execute(stmt).scalars().all()
-                changed = False
-                now = dt.datetime.now(dt.timezone.utc)
-                for record in records:
-                    record.is_flagged = False
-                    record.updated_at = now
-                    changed = True
-                if changed and own_session:
-                    active_session.commit()
-                return
-
-            stmt = select(JobTransactionRecord)
-            if job_id:
-                stmt = stmt.where(JobTransactionRecord.job_id == str(job_id))
-            records = active_session.execute(stmt).scalars().all()
-            changed = False
-            now = dt.datetime.now(dt.timezone.utc)
-            for record in records:
-                next_flagged = _compute_is_flagged(record.description, flag_codes)
-                if bool(record.is_flagged) == next_flagged:
-                    continue
-                record.is_flagged = next_flagged
-                record.updated_at = now
-                changed = True
-            if changed and own_session:
-                active_session.commit()
-        finally:
-            if own_session:
-                active_session.close()
+        return None
 
 
 def _parse_iso_datetime(value: Any) -> dt.datetime | None:
@@ -1267,7 +1258,14 @@ class JobStateRepository:
             file_size = max(0, int(raw_file_size or 0))
         except (TypeError, ValueError):
             file_size = 0
-        processing_status = str(payload_status.get("status") or "queued").strip().lower() or "queued"
+        job_status = str(payload_status.get("status") or "queued").strip().lower() or "queued"
+        raw_pages = payload_status.get("pages_total")
+        if raw_pages is None:
+            raw_pages = payload_status.get("pages")
+        try:
+            page_count = max(0, int(raw_pages or 0))
+        except (TypeError, ValueError):
+            page_count = 0
         is_reversed = bool(payload_meta.get("is_reversed", False))
         status_updated_at = _parse_iso_datetime(payload_status.get("updated_at"))
         explicit_cancelled_at = _parse_iso_datetime(payload_status.get("cancelled_at"))
@@ -1277,27 +1275,29 @@ class JobStateRepository:
             record = session.get(JobRecord, str(job_id))
             if record is None:
                 record = JobRecord(
-                    job_id=str(job_id),
+                    id=str(job_id),
                     file_name=file_name,
                     file_size=file_size,
-                    processing_status=processing_status,
-                    process_started=None,
-                    process_end=None,
+                    job_status=job_status,
+                    started_at=None,
+                    ended_at=None,
+                    pages=page_count,
                     is_reversed=is_reversed,
                 )
                 session.add(record)
             else:
                 record.file_name = file_name
                 record.file_size = file_size
-                record.processing_status = processing_status
+                record.job_status = job_status
+                record.pages = page_count
                 record.is_reversed = is_reversed
 
-            if record.process_started is None and processing_status in {"queued", "processing", "done", "done_with_warnings", "failed", "cancelled"}:
-                record.process_started = status_updated_at or now_utc
-            if processing_status in {"done", "done_with_warnings", "failed", "cancelled"}:
-                record.process_end = explicit_cancelled_at or status_updated_at or now_utc
-            elif processing_status in {"queued", "processing"}:
-                record.process_end = None
+            if record.started_at is None and job_status in {"queued", "processing", "done", "done_with_warnings", "failed", "cancelled"}:
+                record.started_at = status_updated_at or now_utc
+            if job_status in {"done", "done_with_warnings", "failed", "cancelled"}:
+                record.ended_at = explicit_cancelled_at or status_updated_at or now_utc
+            elif job_status in {"queued", "processing"}:
+                record.ended_at = None
             session.commit()
 
     def set_reversed(self, *, job_id: str, is_reversed: bool) -> dict[str, Any]:
@@ -1326,12 +1326,17 @@ class JobStateRepository:
     @staticmethod
     def serialize(record: JobRecord) -> dict[str, Any]:
         return {
-            "job_id": str(record.job_id),
+            "id": str(record.id),
+            "job_id": str(record.id),
             "file_name": str(record.file_name or ""),
             "file_size": int(record.file_size or 0),
-            "processing_status": str(record.processing_status or ""),
-            "process_started": record.process_started.isoformat() if record.process_started else None,
-            "process_end": record.process_end.isoformat() if record.process_end else None,
+            "job_status": str(record.job_status or ""),
+            "processing_status": str(record.job_status or ""),
+            "started_at": record.started_at.isoformat() if record.started_at else None,
+            "ended_at": record.ended_at.isoformat() if record.ended_at else None,
+            "process_started": record.started_at.isoformat() if record.started_at else None,
+            "process_end": record.ended_at.isoformat() if record.ended_at else None,
+            "pages": int(record.pages or 0),
             "is_reversed": bool(record.is_reversed),
         }
 
@@ -1449,6 +1454,9 @@ __all__ = [
     "JobTransactionsRepository",
     "JobsRepository",
     "ensure_bank_code_flags_schema",
+    "ensure_job_pages_schema",
     "ensure_job_results_raw_schema",
     "ensure_job_transactions_schema",
+    "ensure_jobs_schema",
+    "ensure_transactions_schema",
 ]

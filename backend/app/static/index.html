@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Bank Statement Analyzer</title>
-    <link rel="stylesheet" href="/static/ui.css?v=20260316h" />
+    <link rel="stylesheet" href="/static/ui.css?v=20260318b" />
   </head>
   <body>
     <main class="app-shell">
@@ -259,6 +259,11 @@
                       <option value="generic">Generic Parser</option>
                     </select>
                   </div>
+                  <button id="pageNotesBtn" type="button" class="parsed-header-action parsed-header-icon-btn" disabled aria-label="Page notes" title="Page notes">
+                    <svg class="parsed-header-icon" aria-hidden="true" viewBox="0 0 24 24" focusable="false">
+                      <path d="M16 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2Zm0 16H5V5h11v14Zm3-12h2v10c0 1.1-.9 2-2 2h-1v-2h1V7ZM7 7h7v2H7V7Zm0 4h7v2H7v-2Zm0 4h5v2H7v-2Z" />
+                    </svg>
+                  </button>
                   <button id="reverseRowsBtn" type="button" class="parsed-header-action" disabled>Reverse Order</button>
                   <div class="parsed-header-meta">
                     <div class="parsed-row-legend" aria-label="Parsed row colors">
@@ -312,6 +317,24 @@
       </section>
     </main>
 
-    <script src="/static/ui.js?v=20260316u"></script>
+    <div id="pageNotesModal" class="ui-modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="pageNotesTitle">
+      <div class="ui-modal-card">
+        <div class="ui-modal-head">
+          <div>
+            <h3 id="pageNotesTitle">Page Notes</h3>
+            <p id="pageNotesSubtitle" class="ui-modal-subtitle">Add remarks for this page.</p>
+          </div>
+          <button id="pageNotesCloseBtn" type="button" class="ui-modal-close" aria-label="Close notes dialog">x</button>
+        </div>
+        <label class="ui-modal-field" for="pageNotesInput">Notes</label>
+        <textarea id="pageNotesInput" class="ui-modal-textarea" rows="7" placeholder="Write remarks for this page..."></textarea>
+        <div class="ui-modal-actions">
+          <button id="pageNotesCancelBtn" type="button" class="button-link ghost">Cancel</button>
+          <button id="pageNotesSaveBtn" type="button">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="/static/ui.js?v=20260318a"></script>
   </body>
 </html>

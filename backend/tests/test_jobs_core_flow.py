@@ -13,8 +13,11 @@ def _fetch_job_transactions(job_id: str):
         with engine.connect() as conn:
             return conn.execute(
                 text(
-                    "SELECT description, credit, (date_bounds ->> 'x1')::numeric FROM job_transactions "
-                    "WHERE job_id = :job_id ORDER BY row_index"
+                    "SELECT tx.description, tx.credit, (tx.date_bounds ->> 'x1')::numeric "
+                    "FROM transactions AS tx "
+                    "JOIN job_pages AS pages ON pages.id = tx.page_id "
+                    "WHERE tx.job_id = :job_id "
+                    "ORDER BY pages.page_number, tx.row_index"
                 ),
                 {"job_id": job_id},
             ).fetchall()
@@ -28,11 +31,31 @@ def _fetch_updated_job_transactions(job_id: str):
         with engine.connect() as conn:
             return conn.execute(
                 text(
-                    "SELECT description, debit, credit, balance, (date_bounds ->> 'x1')::numeric FROM job_transactions "
-                    "WHERE job_id = :job_id ORDER BY row_index"
+                    "SELECT tx.description, tx.debit, tx.credit, tx.balance, (tx.date_bounds ->> 'x1')::numeric "
+                    "FROM transactions AS tx "
+                    "JOIN job_pages AS pages ON pages.id = tx.page_id "
+                    "WHERE tx.job_id = :job_id "
+                    "ORDER BY pages.page_number, tx.row_index"
                 ),
                 {"job_id": job_id},
             ).fetchall()
+    finally:
+        engine.dispose()
+
+
+def _fetch_job_page_notes(job_id: str, page_number: int):
+    engine = create_engine(str(os.environ["DATABASE_URL"]), future=True)
+    try:
+        with engine.connect() as conn:
+            return conn.execute(
+                text(
+                    "SELECT notes "
+                    "FROM job_pages "
+                    "WHERE job_id = :job_id AND page_number = :page_number "
+                    "LIMIT 1"
+                ),
+                {"job_id": job_id, "page_number": page_number},
+            ).scalar_one_or_none()
     finally:
         engine.dispose()
 
@@ -70,18 +93,51 @@ def test_job_flow_with_mocked_pipeline(client, monkeypatch):
         jobs_service.process_job(job_id=job_id, parse_mode=parse_mode, task_id="inline-task-1")
         return "inline-task-1"
 
-    def _fake_resolve_mode(_pdf_path, _requested):
-        return "text"
+    def _prepare_pages(*, input_pdf, pages_dir, cleaned_dir, report):
+        pages_dir.mkdir(parents=True, exist_ok=True)
+        cleaned_dir.mkdir(parents=True, exist_ok=True)
+        (pages_dir / "page_001.png").write_bytes(b"png")
+        (cleaned_dir / "page_001.png").write_bytes(b"png")
+        return ["page_001.png"]
 
-    def _fake_pipeline(job_dir, parse_mode, report):
-        root = Path(job_dir)
-        result_dir = root / "result"
-        ocr_dir = root / "ocr"
-        result_dir.mkdir(parents=True, exist_ok=True)
-        ocr_dir.mkdir(parents=True, exist_ok=True)
+    def _prepare_page_routing_inputs(*, repo, job_id, input_pdf, page_files, requested_mode):
+        repo.write_json(
+            jobs_service._page_raw_result_path(repo, job_id, "page_001"),
+            {
+                "provider": "pdftotext",
+                "source_type": "text",
+                "page_number": 1,
+                "width": 1000.0,
+                "height": 1400.0,
+                "text": "Deposit",
+                "words": [{"text": "Deposit", "x1": 100.0, "y1": 200.0, "x2": 900.0, "y2": 250.0}],
+                "is_digital": True,
+            },
+        )
+        return {"page_001": "text"}
 
-        parsed = {
-            "page_001": [
+    def _enqueue_page_job(job_id: str, parse_mode: str, page_name: str, page_index: int, page_count: int) -> str:
+        task_id = f"task-{page_name}"
+        jobs_service.process_job_page(
+            job_id=job_id,
+            parse_mode=parse_mode,
+            page_name=page_name,
+            page_index=page_index,
+            page_count=page_count,
+            task_id=task_id,
+        )
+        return task_id
+
+    def _enqueue_finalize_job(job_id: str, parse_mode: str) -> str:
+        jobs_service.finalize_job_processing(job_id=job_id, parse_mode=parse_mode, task_id="finalize-task")
+        return "finalize-task"
+
+    monkeypatch.setattr(jobs_service, "detect_bank_profile", lambda _text: type("Profile", (), {"name": "GENERIC"})())
+    monkeypatch.setattr(
+        jobs_service,
+        "parse_page_with_profile_fallback",
+        lambda *_args, **_kwargs: (
+            [
                 {
                     "row_id": "001",
                     "date": "2026-02-01",
@@ -89,43 +145,21 @@ def test_job_flow_with_mocked_pipeline(client, monkeypatch):
                     "debit": None,
                     "credit": "1000.00",
                     "balance": "1000.00",
+                    "row_type": "transaction",
                 }
-            ]
-        }
-        bounds = {
-            "page_001": [
-                {
-                    "row_id": "001",
-                    "x1": 0.1,
-                    "y1": 0.2,
-                    "x2": 0.9,
-                    "y2": 0.25,
-                }
-            ]
-        }
-        diagnostics = {"job": {"parse_mode": parse_mode}, "pages": {"page_001": {"rows_parsed": 1}}}
-
-        with open(result_dir / "parsed_rows.json", "w", encoding="utf-8") as handle:
-            json.dump(parsed, handle)
-        with open(result_dir / "bounds.json", "w", encoding="utf-8") as handle:
-            json.dump(bounds, handle)
-        with open(result_dir / "parse_diagnostics.json", "w", encoding="utf-8") as handle:
-            json.dump(diagnostics, handle)
-        with open(ocr_dir / "page_001.json", "w", encoding="utf-8") as handle:
-            json.dump([], handle)
-
-        report("processing", "mocked", 80)
-        return {
-            "parse_mode": parse_mode,
-            "pages": 1,
-            "parsed_rows": parsed,
-            "bounds": bounds,
-            "diagnostics": diagnostics,
-        }
+            ],
+            [{"row_id": "001", "x1": 0.1, "y1": 0.2, "x2": 0.9, "y2": 0.25}],
+            {"profile_detected": "GENERIC", "profile_selected": "GENERIC", "rows_parsed": 1},
+        ),
+    )
+    monkeypatch.setattr(jobs_service, "_filter_rows_and_bounds", lambda rows, bounds, _profile: (rows, bounds))
+    monkeypatch.setattr(jobs_service, "_repair_page_flow_columns", lambda rows, previous_balance_hint=None: rows)
 
     monkeypatch.setattr(jobs_service, "_enqueue_job", _run_inline_enqueue)
-    monkeypatch.setattr(jobs_service, "resolve_parse_mode", _fake_resolve_mode)
-    monkeypatch.setattr(jobs_service, "run_pipeline", _fake_pipeline)
+    monkeypatch.setattr(jobs_service, "prepare_ocr_pages", _prepare_pages)
+    monkeypatch.setattr(jobs_service, "_prepare_page_routing_inputs", _prepare_page_routing_inputs)
+    monkeypatch.setattr(jobs_service, "_enqueue_page_job", _enqueue_page_job)
+    monkeypatch.setattr(jobs_service, "_enqueue_finalize_job", _enqueue_finalize_job)
 
     create = client.post(
         "/jobs",
@@ -141,6 +175,8 @@ def test_job_flow_with_mocked_pipeline(client, monkeypatch):
     assert started.status_code == 200
     assert started.json().get("started") is True
 
+    jobs_service.finalize_job_processing(job_id=job_id, parse_mode="auto", task_id="finalize-task-manual")
+
     status = client.get(f"/jobs/{job_id}")
     assert status.status_code == 200
     assert status.json().get("status") == "done"
@@ -152,6 +188,18 @@ def test_job_flow_with_mocked_pipeline(client, monkeypatch):
     parsed = client.get(f"/jobs/{job_id}/parsed")
     assert parsed.status_code == 200
     assert parsed.json()["page_001"][0]["description"] == "Deposit"
+
+    notes_before = client.get(f"/jobs/{job_id}/pages/page_001/notes")
+    assert notes_before.status_code == 200
+    assert notes_before.json() == {"page": "page_001", "notes": None}
+
+    notes_update = client.put(
+        f"/jobs/{job_id}/pages/page_001/notes",
+        json={"notes": "Needs clarification on this page"},
+    )
+    assert notes_update.status_code == 200
+    assert notes_update.json()["notes"] == "Needs clarification on this page"
+    assert _fetch_job_page_notes(job_id, 1) == "Needs clarification on this page"
 
     stored = _fetch_job_transactions(job_id)
     assert stored == [("Deposit", Decimal("1000.00"), Decimal("0.100000"))]
@@ -176,6 +224,9 @@ def test_job_flow_with_mocked_pipeline(client, monkeypatch):
     parsed_after_update = client.get(f"/jobs/{job_id}/parsed")
     assert parsed_after_update.status_code == 200
     assert parsed_after_update.json()["page_001"][0]["description"] == "Edited Deposit"
+    notes_after_update = client.get(f"/jobs/{job_id}/pages/page_001/notes")
+    assert notes_after_update.status_code == 200
+    assert notes_after_update.json()["notes"] == "Needs clarification on this page"
 
     stored_after_update = _fetch_updated_job_transactions(job_id)
     assert stored_after_update == [("Edited Deposit", Decimal("50.00"), None, Decimal("950.00"), Decimal("0.100000"))]
@@ -191,6 +242,7 @@ def test_job_flow_with_mocked_pipeline(client, monkeypatch):
     diagnostics = client.get(f"/jobs/{job_id}/parse-diagnostics")
     assert diagnostics.status_code == 200
     assert diagnostics.json().get("pages", {}).get("page_001", {}).get("rows_parsed") == 1
+    assert diagnostics.json().get("pages", {}).get("page_001", {}).get("source_type") == "text"
 
     export_pdf = client.get(f"/jobs/{job_id}/export/pdf")
     assert export_pdf.status_code == 200

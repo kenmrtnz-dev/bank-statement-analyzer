@@ -184,6 +184,7 @@ def _run_text_pipeline(
                 ocr_router=ocr_router,
                 header_hint=last_header_hint,
                 last_date_hint=last_date_hint or None,
+                previous_balance_hint=last_balance_hint,
             )
             filtered_rows, filtered_bounds = _dedupe_page_overlap(
                 previous_rows=previous_page_rows,
@@ -231,6 +232,7 @@ def _run_text_pipeline(
             last_date_hint=last_date_hint or None,
         )
         filtered_rows, filtered_bounds = _filter_rows_and_bounds(page_rows, page_bounds, profile)
+        filtered_rows = _repair_page_flow_columns(filtered_rows, previous_balance_hint=last_balance_hint)
         filtered_rows, filtered_bounds = _dedupe_page_overlap(
             previous_rows=previous_page_rows,
             current_rows=filtered_rows,
@@ -308,6 +310,7 @@ def _run_ocr_pipeline(
                 ocr_router=ocr_router,
                 header_hint=header_hints_by_profile.get("last"),
                 last_date_hint=last_date_hint or None,
+                previous_balance_hint=last_balance_hint,
             )
             parsed_output[page_name] = page_rows
             bounds_output[page_name] = page_bounds
@@ -362,6 +365,7 @@ def process_ocr_page(
     rate_limit_heartbeat=None,
     header_hint: Dict | None = None,
     last_date_hint: str | None = None,
+    previous_balance_hint=None,
 ) -> tuple[str, List[Dict], List[Dict], Dict]:
     page_name = page_file.replace(".png", "")
     page_path = cleaned_dir / page_file
@@ -383,7 +387,18 @@ def process_ocr_page(
                 last_date_hint=last_date_hint or "",
             )
             if ai_rows:
+                ai_rows = _repair_page_flow_columns(ai_rows, previous_balance_hint=previous_balance_hint)
                 _write_json_atomic(ocr_dir / f"{page_name}.json", [])
+                _write_json_atomic(
+                    ocr_dir / f"{page_name}.raw.json",
+                    {
+                        "provider": ocr_router.engine_name,
+                        "source_type": "ocr",
+                        "page": page_name,
+                        "structured_rows": structured.get("rows") or [],
+                        "ocr_items": [],
+                    },
+                )
                 diag = {
                     "source_type": "ocr",
                     "ocr_backend": ocr_router.engine_name,
@@ -398,6 +413,16 @@ def process_ocr_page(
 
     ocr_items = ocr_router.ocr_page(page_path)
     _write_json_atomic(ocr_dir / f"{page_name}.json", ocr_items)
+    _write_json_atomic(
+        ocr_dir / f"{page_name}.raw.json",
+        {
+            "provider": ocr_router.engine_name,
+            "source_type": "ocr",
+            "page": page_name,
+            "text": " ".join((item.get("text") or "") for item in ocr_items if isinstance(item, dict)),
+            "ocr_items": ocr_items,
+        },
+    )
     if ocr_router.engine_name == "openai_vision" and ocr_router.openai_client is not None:
         raw_openai = ocr_router.openai_client.consume_last_openai_response()
         if raw_openai is not None:
@@ -416,6 +441,7 @@ def process_ocr_page(
         last_date_hint=last_date_hint,
     )
     filtered_rows, filtered_bounds = _filter_rows_and_bounds(page_rows, page_bounds, profile)
+    filtered_rows = _repair_page_flow_columns(filtered_rows, previous_balance_hint=previous_balance_hint)
     diag = {
         "source_type": "ocr",
         "ocr_backend": ocr_router.engine_name,

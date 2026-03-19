@@ -346,6 +346,20 @@ def parse_words_page(
             return rows, bounds, diagnostics
 
     if attempted_bounded_parse:
+        suspicious_late_header = bool(detected_header) and float(detected_header.get("y") or 0.0) >= (page_height * 0.6)
+        if suspicious_late_header:
+            fallback_rows, fallback_bounds = _parse_rows_without_header(
+                grouped,
+                page_width,
+                page_height,
+                profile,
+                last_date_hint=last_date_hint,
+            )
+            if fallback_rows:
+                diagnostics["fallback_mode"] = diagnostics.get("fallback_mode") or "bounded_parse_to_line_parse"
+                diagnostics["row_candidates"] = max(int(diagnostics.get("row_candidates") or 0), len(grouped))
+                return fallback_rows, fallback_bounds, diagnostics
+
         diagnostics["fallback_mode"] = diagnostics.get("fallback_mode") or "bounded_parse_no_rows"
         return rows, bounds, diagnostics
 

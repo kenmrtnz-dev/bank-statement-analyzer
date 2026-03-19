@@ -22,6 +22,7 @@ from app.jobs.service import (
     get_ocr_openai_raw_page,
     get_parse_diagnostics,
     get_page_bounds,
+    get_page_notes,
     get_page_rows,
     get_pages_status,
     get_preview_path,
@@ -30,6 +31,7 @@ from app.jobs.service import (
     list_cleaned_pages,
     set_job_reversed,
     start_job,
+    update_page_notes,
     update_page_rows,
 )
 
@@ -151,6 +153,16 @@ def get_all_bounds_endpoint(job_id: uuid.UUID):
 @router.get("/jobs/{job_id}/parsed/{page}")
 def get_parsed_page_endpoint(job_id: uuid.UUID, page: str):
     return get_page_rows(str(job_id), page)
+
+
+@router.get("/jobs/{job_id}/pages/{page}/notes")
+def get_page_notes_endpoint(job_id: uuid.UUID, page: str):
+    return get_page_notes(str(job_id), page)
+
+
+@router.put("/jobs/{job_id}/pages/{page}/notes")
+def update_page_notes_endpoint(job_id: uuid.UUID, page: str, payload: dict[str, Any]):
+    return update_page_notes(str(job_id), page, payload.get("notes"))
 
 
 @router.put("/jobs/{job_id}/parsed/{page}")

@@ -22,24 +22,29 @@ finally:
 app_tables = {
     "bank_code_flags",
     "job_results_raw",
-    "job_transactions",
+    "job_pages",
     "jobs",
+    "job_transactions",
     "submission_pages",
     "transactions",
 }
 
 if "alembic_version" in table_names or not table_names.intersection(app_tables):
     print("upgrade")
+elif "job_transactions" in table_names or "submission_pages" in table_names or "job_pages" not in table_names:
+    print("upgrade")
 else:
     from app.jobs.repository import (
         ensure_bank_code_flags_schema,
+        ensure_job_pages_schema,
         ensure_job_results_raw_schema,
-        ensure_job_transactions_schema,
         ensure_jobs_schema,
+        ensure_transactions_schema,
     )
 
     ensure_jobs_schema(DATA_DIR)
-    ensure_job_transactions_schema(DATA_DIR)
+    ensure_job_pages_schema(DATA_DIR)
+    ensure_transactions_schema(DATA_DIR)
     ensure_job_results_raw_schema(DATA_DIR)
     ensure_bank_code_flags_schema(DATA_DIR)
     print("stamp")

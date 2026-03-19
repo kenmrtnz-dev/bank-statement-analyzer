@@ -1,7 +1,7 @@
 import re
 import subprocess
 import xml.etree.ElementTree as ET
-from typing import Dict, List
+from typing import Any, Dict, List
 
 
 def extract_pdf_layout_xml(pdf_path: str) -> str:
@@ -85,3 +85,43 @@ def extract_pdf_layout_pages(pdf_path: str) -> List[Dict]:
         })
 
     return pages
+
+
+def layout_page_to_json_payload(page_layout: Dict[str, Any], *, page_number: int) -> Dict[str, Any]:
+    """Convert one pdftotext page-layout payload into a JSON-safe page raw-result object."""
+    width = float(page_layout.get("width") or 1.0)
+    height = float(page_layout.get("height") or 1.0)
+    raw_words = page_layout.get("words") if isinstance(page_layout.get("words"), list) else []
+    words: list[dict[str, Any]] = []
+    text_parts: list[str] = []
+
+    for item in raw_words:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or "").strip()
+        if not text:
+            continue
+        word_payload = {
+            "text": text,
+            "x1": float(item.get("x1") or 0.0),
+            "y1": float(item.get("y1") or 0.0),
+            "x2": float(item.get("x2") or width),
+            "y2": float(item.get("y2") or 0.0),
+        }
+        words.append(word_payload)
+        text_parts.append(text)
+
+    text = str(page_layout.get("text") or "").strip()
+    if not text and text_parts:
+        text = " ".join(text_parts)
+
+    return {
+        "provider": "pdftotext",
+        "source_type": "text",
+        "page_number": int(page_number),
+        "width": width,
+        "height": height,
+        "text": text,
+        "words": words,
+        "is_digital": bool(text or words),
+    }

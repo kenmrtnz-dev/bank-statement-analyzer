@@ -1,3 +1,4 @@
+from app import statement_parser
 from app.bank_profiles import PROFILES, detect_bank_profile
 from app.statement_parser import parse_page_with_profile_fallback
 
@@ -474,3 +475,41 @@ def test_headerless_parser_drops_balance_forwarded_rows():
     assert rows[0]["description"] == "TRANSFER"
     assert rows[0]["debit"] == "500.00"
     assert rows[0]["balance"] == "8500.00"
+
+
+def test_bounded_parse_falls_back_to_line_parse_when_detected_header_yields_no_rows(monkeypatch):
+    profile = PROFILES["RCBC"]
+    grouped_lines = [{"words": [{"text": "dummy", "x1": 0, "y1": 0, "x2": 1, "y2": 1}], "cy": 10.0}]
+    detected_header = {"y": 999.0, "date": 40.0, "debit": 470.0, "credit": 560.0, "balance": 700.0}
+    recovered_rows = [
+        {
+            "row_id": "001",
+            "date": "2025-11-14",
+            "description": "Fund Transfer - Instapay 204739",
+            "debit": "50000.00",
+            "credit": None,
+            "balance": "1173619.03",
+        }
+    ]
+    recovered_bounds = [{"row_id": "001"}]
+
+    monkeypatch.setattr(statement_parser, "_group_words_by_line", lambda words: grouped_lines)
+    monkeypatch.setattr(statement_parser, "_find_header_anchors", lambda grouped, active_profile: detected_header)
+    monkeypatch.setattr(statement_parser, "_parse_grouped_lines_with_header", lambda **kwargs: ([], []))
+    monkeypatch.setattr(
+        statement_parser,
+        "_parse_rows_without_header",
+        lambda grouped, page_width, page_height, active_profile, last_date_hint=None: (recovered_rows, recovered_bounds),
+    )
+
+    rows, bounds, diag = statement_parser.parse_words_page(
+        words=[{"text": "ignored", "x1": 0, "y1": 0, "x2": 1, "y2": 1}],
+        page_width=800.0,
+        page_height=1000.0,
+        profile=profile,
+    )
+
+    assert rows == recovered_rows
+    assert bounds == recovered_bounds
+    assert diag.get("header_detected") is True
+    assert diag.get("fallback_mode") == "bounded_parse_to_line_parse"
