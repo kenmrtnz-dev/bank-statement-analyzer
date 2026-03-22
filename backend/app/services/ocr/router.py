@@ -3,10 +3,12 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from pypdf import PdfReader
 
+from app.services.ocr.apple_vision import AppleVisionOCR
+from app.services.ocr.google_vision import GoogleVisionOCR
 from app.services.ocr.openai_vision import OpenAIVisionOCR
 
 DEFAULT_DIGITAL_TEXT_THRESHOLD = 300
@@ -30,10 +32,11 @@ class DocumentTextProfile:
 @dataclass
 class ScannedOCRRouter:
     engine_name: str
-    openai_client: OpenAIVisionOCR
+    client: Any
+    openai_client: OpenAIVisionOCR | None = None
 
     def ocr_page(self, image_path: str | Path) -> List[Dict]:
-        return self.openai_client.extract_ocr_items(image_path)
+        return self.client.extract_ocr_items(image_path)
 
 
 def detect_document_text_profile(
@@ -71,13 +74,15 @@ def detect_document_text_profile(
 
 def resolve_document_parse_mode(input_pdf: str | Path, requested_mode: str | None) -> str:
     mode = str(requested_mode or "").strip().lower()
-    if mode in {"text", "ocr"}:
-        return mode
+    if mode in {"ocr", "google_vision"}:
+        return "google_vision"
+    if mode in {"text", "pdftotext"}:
+        return "pdftotext"
 
     profile = detect_document_text_profile(input_pdf, chars_threshold=DEFAULT_DIGITAL_TEXT_THRESHOLD)
     if profile.is_digital:
-        return "text"
-    return "ocr"
+        return "pdftotext"
+    return "google_vision"
 
 
 def scanned_render_dpi() -> int:
@@ -86,8 +91,19 @@ def scanned_render_dpi() -> int:
 
 
 def build_scanned_ocr_router(page_count: int) -> ScannedOCRRouter:
-    openai_client = OpenAIVisionOCR.from_env()
-    return ScannedOCRRouter(
-        engine_name="openai_vision",
-        openai_client=openai_client,
-    )
+    try:
+        google_vision_client = GoogleVisionOCR.from_env()
+        return ScannedOCRRouter(
+            engine_name="google_vision",
+            client=google_vision_client,
+            openai_client=None,
+        )
+    except Exception as google_error:
+        if AppleVisionOCR.is_available():
+            local_client = AppleVisionOCR.from_env()
+            return ScannedOCRRouter(
+                engine_name="apple_vision",
+                client=local_client,
+                openai_client=None,
+            )
+        raise google_error

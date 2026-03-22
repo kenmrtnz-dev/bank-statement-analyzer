@@ -20,44 +20,60 @@ Minimal bank-statement workflow:
 - `admin`: can clear stored jobs/files and create evaluator accounts
 - `evaluator`: can upload/process/review/export jobs
 
-## Architecture (Current)
+## Architecture
 ```text
+frontend/
+  e2e/
+storage/
 backend/
   app/
     main.py
+    admin/
+      router.py
+      service.py
+    auth/
+      router.py
+      service.py
+      deps.py
+    crm/
+      router.py
+      service.py
+    jobs/
+      router.py
+      service.py
+      repository.py
+      schemas.py
+    ocr/
+      pipeline.py
+      image_tools.py
+    parser/
+      pipeline.py
+      extractors/google_vision.py
+      templates/*.json
     api/
       routers/
         ui.py
-    modules/
-      auth/
-        router.py
-        service.py
-        deps.py
-      admin/
-        router.py
-        service.py
-      jobs/
-        router.py
-        service.py
-        repository.py
-        schemas.py
-      ocr/
-        pipeline.py
-        image_tools.py
-      worker/
-        celery_app.py
-        tasks.py
+    worker/
+      celery_app.py
+      tasks.py
     bank_profiles.py
     statement_parser.py
     pdf_text_extract.py
-    ocr_engine.py
     image_cleaner.py
+scripts/
+  migrate.sh
+  run-api.sh
+  run-worker.sh
 ```
 
+`backend/app/static/*` is the production UI served by FastAPI. `frontend/` is Playwright E2E tooling only.
+
 ## API
-- `POST /jobs` (multipart: `file`, optional `mode=auto|text|ocr`, optional `auto_start=true|false`)
+- `POST /jobs` (multipart: `file`, optional `mode=auto|text|ocr|pdftotext|google_vision`, optional `auto_start=true|false`)
 - `POST /jobs/draft` (upload only, no processing)
 - `POST /jobs/{job_id}/start`
+- `POST /jobs/{job_id}/cancel` (cancel queued/in-flight processing, keep stored job files)
+- `DELETE /jobs/{job_id}` (same as cancel)
 - `GET /jobs/{job_id}`
 - `GET /jobs/{job_id}/parsed`
 - `GET /jobs/{job_id}/parsed/{page}`
@@ -80,41 +96,69 @@ backend/
 - `POST /admin/evaluators` (admin only)
 - `POST /admin/clear-store` (admin only)
 
-Default admin credentials (override via env):
+Default admin credentials when `SEED_DEFAULT_USERS=true`:
 - `ADMIN_USERNAME=admin`
 - `ADMIN_PASSWORD=admin123`
 
-## Run
-From `/Users/kenito/Desktop/bank-statement-analyzer/backend`:
+## Repo-Root Run
+Create a virtualenv from repo root, install the package, then use the provided scripts:
 
 ```bash
-uvicorn app.main:app --reload
+python -m venv .venv
+. .venv/bin/activate
+pip install .[dev]
 ```
 
-Ensure Redis is running (for example: `docker compose up redis` from repo root), then in another shell run a Celery worker:
+Apply schema migrations from repo root:
 
 ```bash
-celery -A app.worker.celery_app.celery worker \
-  --loglevel=INFO \
-  --pool=prefork \
-  --concurrency=${CELERY_CONCURRENCY:-4} \
-  --max-tasks-per-child=${CELERY_MAX_TASKS_PER_CHILD:-25}
+./scripts/migrate.sh
+```
+
+Start the API from repo root:
+
+```bash
+./scripts/run-api.sh
+```
+
+In another shell, start the Celery worker:
+
+```bash
+./scripts/run-worker.sh
 ```
 
 Open:
 - [http://localhost:8000](http://localhost:8000)
 - [http://localhost:8000/health](http://localhost:8000/health)
 
-## Notes
+For containerized single-machine runs:
+
+```bash
+docker compose up --build
+```
+
+The compose stack now runs a one-shot `migrate` service before `api` and `worker` start, so schema upgrades happen as part of deploy startup instead of during image build.
+
+For local hot reload on top of the production-like compose file:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+```
+
+## Deployment Notes
 - Jobs are queued to Redis and executed by Celery workers.
+- API and worker must share the same `DATA_DIR`.
+- Production is single-machine/local-disk oriented. Separate API and worker machines without shared storage are out of scope.
+- `DATABASE_URL` is required for the API, worker, and Alembic.
+- In production, set `APP_ENV=prod`, `DB_AUTO_CREATE_SCHEMA=false`, `SEED_DEFAULT_USERS=false`, and a real `JWT_SECRET`.
 - Retry/backoff knobs are configurable via `CELERY_TASK_MAX_RETRIES`, `CELERY_TASK_RETRY_BACKOFF_SECONDS`, and related `CELERY_TASK_*` env vars.
-- OCR backend for scanned documents is OpenAI Vision OCR.
-- Data is stored in `${DATA_DIR:-./data}/jobs/<job_id>/...`.
-- Scanned PDFs route to OpenAI Vision OCR:
-  - `OPENAI_API_KEY`
-  - `OPENAI_OCR_USE_STRUCTURED_ROWS=true` (use OpenAI to return row fields + bounds directly)
-  - `MAX_OPENAI_PAGES_PER_DOC=50`
-  - `OPENAI_TIMEOUT_SECONDS=60`
+- `mode=pdftotext` forces the modern text-layer pipeline.
+- `mode=google_vision` forces the modern OCR pipeline.
+- Data is stored in `${DATA_DIR:-<repo>/storage}/jobs/<job_id>/...`.
+- Scanned PDFs route to Google Vision OCR:
+  - `GOOGLE_VISION_API_KEY` (or `GOOGLE_APPLICATION_CREDENTIALS`)
+  - `GOOGLE_VISION_BATCH_SIZE=5`
+  - `GOOGLE_VISION_PDF_DPI=120`
 - EspoCRM evaluator file table requires:
   - `ESPOCRM_API_KEY`
   - Optional: `ESPOCRM_BASE_URL` (defaults to `https://staging-crm.discoverycsc.com/api/v1`)

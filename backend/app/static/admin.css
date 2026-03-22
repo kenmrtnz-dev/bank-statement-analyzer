@@ -39,7 +39,8 @@ body {
 
 button,
 input,
-textarea {
+textarea,
+select {
   font: inherit;
 }
 
@@ -69,7 +70,8 @@ button:disabled {
 }
 
 input,
-textarea {
+textarea,
+select {
   width: 100%;
   border-radius: 12px;
   border: 1px solid var(--line);
@@ -83,6 +85,10 @@ input {
   min-height: 42px;
 }
 
+select {
+  min-height: 42px;
+}
+
 textarea {
   min-height: 88px;
   resize: vertical;
@@ -90,7 +96,8 @@ textarea {
 }
 
 input:focus,
-textarea:focus {
+textarea:focus,
+select:focus {
   outline: none;
   border-color: #c8cdfc;
   box-shadow: 0 0 0 4px rgba(80, 70, 229, 0.08);
@@ -599,6 +606,13 @@ label {
   gap: 8px;
 }
 
+#jobsFilterForm {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 8px;
+}
+
 .bank-codes-table-wrap,
 .transactions-admin-table-wrap {
   border: 1px solid var(--line);
@@ -685,6 +699,88 @@ label {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 10px;
+}
+
+.jobs-filters {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.subtle-id {
+  margin-top: 3px;
+  font-size: 11px;
+  color: #7c86a0;
+  line-height: 1.35;
+  word-break: break-word;
+}
+
+.jobs-admin-table {
+  min-width: 1060px;
+}
+
+.jobs-status-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  border-radius: 999px;
+  border: 1px solid #d8dced;
+  background: #f6f8ff;
+  color: #4f5978;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 0 8px;
+}
+
+.jobs-status-queued {
+  border-color: #d8dced;
+  background: #f4f6ff;
+}
+
+.jobs-status-processing {
+  border-color: #bfdbff;
+  background: #ebf4ff;
+  color: #2f568d;
+}
+
+.jobs-status-done,
+.jobs-status-done_with_warnings {
+  border-color: #cae8d5;
+  background: #edf9f2;
+  color: #246a45;
+}
+
+.jobs-status-failed,
+.jobs-status-cancelled {
+  border-color: #f0c6d3;
+  background: #fdf1f4;
+  color: #a03a51;
+}
+
+.jobs-result-card {
+  gap: 10px;
+}
+
+.jobs-result-summary-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.jobs-result-table {
+  min-width: 760px;
+}
+
+.jobs-result-table-wrap {
+  max-height: 320px;
+}
+
+.jobs-result-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.jobs-result-rows-meta {
+  margin: 0;
+  color: #6f7893;
+  font-size: 12px;
 }
 
 .transactions-cell-description {
@@ -813,6 +909,10 @@ button {
 }
 
 input {
+  min-height: 39px;
+}
+
+select {
   min-height: 39px;
 }
 
@@ -1019,11 +1119,23 @@ textarea {
   overflow-x: hidden;
 }
 
+.admin-panel[data-tab-panel="jobs"] .jobs-admin-table-wrap {
+  max-height: calc(100vh - 360px);
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.admin-panel[data-tab-panel="jobs"] .jobs-result-table-wrap {
+  max-height: calc(100vh - 560px);
+  min-height: 190px;
+}
+
 .admin-panel[data-tab-panel="transactions"] .admin-card {
   min-height: 0;
 }
 
 .admin-panel[data-tab-panel="transactions"] .transactions-admin-table,
+.admin-panel[data-tab-panel="jobs"] .transactions-admin-table,
 .admin-panel[data-tab-panel="flag-codes"] .transactions-admin-table {
   min-width: 0;
   table-layout: fixed;
@@ -1031,6 +1143,8 @@ textarea {
 
 .admin-panel[data-tab-panel="transactions"] .transactions-admin-table th,
 .admin-panel[data-tab-panel="transactions"] .transactions-admin-table td,
+.admin-panel[data-tab-panel="jobs"] .transactions-admin-table th,
+.admin-panel[data-tab-panel="jobs"] .transactions-admin-table td,
 .admin-panel[data-tab-panel="flag-codes"] .transactions-admin-table th,
 .admin-panel[data-tab-panel="flag-codes"] .transactions-admin-table td {
   font-size: 10px;
@@ -1083,6 +1197,75 @@ textarea {
   width: 14%;
 }
 
+.admin-panel[data-tab-panel="jobs"] .jobs-admin-table th:nth-child(1),
+.admin-panel[data-tab-panel="jobs"] .jobs-admin-table td:nth-child(1) {
+  width: 20%;
+}
+
+.admin-panel[data-tab-panel="jobs"] .jobs-admin-table th:nth-child(2),
+.admin-panel[data-tab-panel="jobs"] .jobs-admin-table td:nth-child(2) {
+  width: 16%;
+}
+
+.admin-panel[data-tab-panel="jobs"] .jobs-admin-table th:nth-child(3),
+.admin-panel[data-tab-panel="jobs"] .jobs-admin-table td:nth-child(3) {
+  width: 18%;
+}
+
+.admin-panel[data-tab-panel="jobs"] .jobs-admin-table th:nth-child(4),
+.admin-panel[data-tab-panel="jobs"] .jobs-admin-table td:nth-child(4) {
+  width: 13%;
+}
+
+.admin-panel[data-tab-panel="jobs"] .jobs-admin-table th:nth-child(5),
+.admin-panel[data-tab-panel="jobs"] .jobs-admin-table td:nth-child(5) {
+  width: 8%;
+}
+
+.admin-panel[data-tab-panel="jobs"] .jobs-admin-table th:nth-child(6),
+.admin-panel[data-tab-panel="jobs"] .jobs-admin-table td:nth-child(6) {
+  width: 8%;
+}
+
+.admin-panel[data-tab-panel="jobs"] .jobs-admin-table th:nth-child(7),
+.admin-panel[data-tab-panel="jobs"] .jobs-admin-table td:nth-child(7) {
+  width: 10%;
+}
+
+.admin-panel[data-tab-panel="jobs"] .jobs-admin-table th:nth-child(8),
+.admin-panel[data-tab-panel="jobs"] .jobs-admin-table td:nth-child(8) {
+  width: 12%;
+}
+
+.admin-panel[data-tab-panel="jobs"] .jobs-result-table th:nth-child(1),
+.admin-panel[data-tab-panel="jobs"] .jobs-result-table td:nth-child(1) {
+  width: 12%;
+}
+
+.admin-panel[data-tab-panel="jobs"] .jobs-result-table th:nth-child(2),
+.admin-panel[data-tab-panel="jobs"] .jobs-result-table td:nth-child(2) {
+  width: 14%;
+}
+
+.admin-panel[data-tab-panel="jobs"] .jobs-result-table th:nth-child(3),
+.admin-panel[data-tab-panel="jobs"] .jobs-result-table td:nth-child(3) {
+  width: 11%;
+}
+
+.admin-panel[data-tab-panel="jobs"] .jobs-result-table th:nth-child(4),
+.admin-panel[data-tab-panel="jobs"] .jobs-result-table td:nth-child(4) {
+  width: 33%;
+}
+
+.admin-panel[data-tab-panel="jobs"] .jobs-result-table th:nth-child(5),
+.admin-panel[data-tab-panel="jobs"] .jobs-result-table td:nth-child(5),
+.admin-panel[data-tab-panel="jobs"] .jobs-result-table th:nth-child(6),
+.admin-panel[data-tab-panel="jobs"] .jobs-result-table td:nth-child(6),
+.admin-panel[data-tab-panel="jobs"] .jobs-result-table th:nth-child(7),
+.admin-panel[data-tab-panel="jobs"] .jobs-result-table td:nth-child(7) {
+  width: 10%;
+}
+
 .admin-panel[data-tab-panel="transactions"] .transactions-cell-description,
 .admin-panel[data-tab-panel="transactions"] .transactions-cell-bounds {
   min-width: 0;
@@ -1105,6 +1288,14 @@ textarea {
 }
 
 .admin-panel[data-tab-panel="transactions"] .transactions-pagination-actions {
+  flex-wrap: wrap;
+}
+
+.admin-panel[data-tab-panel="jobs"] .transactions-pagination {
+  flex-wrap: wrap;
+}
+
+.admin-panel[data-tab-panel="jobs"] .transactions-pagination-actions {
   flex-wrap: wrap;
 }
 
@@ -1194,9 +1385,22 @@ textarea {
     align-items: stretch;
   }
 
+  #jobsFilterForm {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+
   #flagCodesFilterForm {
     grid-template-columns: 1fr;
     align-items: stretch;
+  }
+
+  .admin-panel[data-tab-panel="jobs"] .jobs-admin-table-wrap {
+    max-height: calc(100vh - 390px);
+  }
+
+  .admin-panel[data-tab-panel="jobs"] .jobs-result-table-wrap {
+    max-height: calc(100vh - 590px);
   }
 
   .admin-panel[data-tab-panel="transactions"] .transactions-admin-table-wrap {
@@ -1209,6 +1413,19 @@ textarea {
 }
 
 @media (max-width: 760px) {
+  .admin-panel[data-tab-panel="jobs"] .jobs-admin-table-wrap,
+  .admin-panel[data-tab-panel="jobs"] .jobs-result-table-wrap {
+    overflow-x: auto;
+  }
+
+  .admin-panel[data-tab-panel="jobs"] .jobs-admin-table {
+    min-width: 980px;
+  }
+
+  .admin-panel[data-tab-panel="jobs"] .jobs-result-table {
+    min-width: 760px;
+  }
+
   .admin-panel[data-tab-panel="transactions"] .transactions-admin-table-wrap {
     max-height: calc(100vh - 340px);
     overflow-x: auto;

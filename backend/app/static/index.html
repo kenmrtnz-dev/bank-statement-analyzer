@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Bank Statement Analyzer</title>
-    <link rel="stylesheet" href="/static/ui.css?v=20260304a" />
+    <link rel="stylesheet" href="/static/ui.css?v=20260318b" />
   </head>
   <body>
     <main class="app-shell">
@@ -61,7 +61,6 @@
                 </div>
               </div>
             </form>
-
             <div class="row-between files-head">
               <h3>Uploaded Files</h3>
               <div class="actions">
@@ -83,7 +82,8 @@
                     <th>File</th>
                     <th>Size</th>
                     <th>Date</th>
-                    <th>Owner</th>
+                    <th>Time Started</th>
+                    <th>Elapsed</th>
                     <th>Status</th>
                     <th>Actions</th>
                   </tr>
@@ -184,21 +184,29 @@
               <div class="row-between">
                 <h2>Preview</h2>
                 <div class="page-nav">
+                  <button id="pageFirstBtn" type="button" class="page-nav-btn" aria-label="First page">&lt;&lt;</button>
                   <button id="pagePrevBtn" type="button" class="page-nav-btn" aria-label="Previous page">&lt;</button>
-                  <span id="pageIndicator" class="page-indicator">0/0</span>
+                  <label class="page-indicator" for="pageNumberInput">
+                    <input id="pageNumberInput" class="page-number-input" type="text" inputmode="numeric" autocomplete="off" value="0" aria-label="Current page number" />
+                    <span>of</span>
+                    <span id="pageCount" class="page-count">0</span>
+                  </label>
                   <button id="pageNextBtn" type="button" class="page-nav-btn" aria-label="Next page">&gt;</button>
-                  <select id="pageSelect" class="hidden"></select>
+                  <button id="pageLastBtn" type="button" class="page-nav-btn" aria-label="Last page">&gt;&gt;</button>
                 </div>
               </div>
               <div class="preview-panel-tabs" role="tablist" aria-label="Preview panel tabs">
                 <button id="previewTabPreviewBtn" class="preview-panel-tab active" type="button" data-preview-tab="preview" role="tab" aria-selected="true">Preview</button>
                 <button id="previewTabDisbalanceBtn" class="preview-panel-tab" type="button" data-preview-tab="disbalance" role="tab" aria-selected="false">Disbalance</button>
+                <button id="previewTabFlaggedBtn" class="preview-panel-tab" type="button" data-preview-tab="flagged" role="tab" aria-selected="false">Flagged Transactions</button>
               </div>
               <div id="previewImagePanel">
                 <div class="preview-wrap" id="previewWrap">
                   <div id="previewEmpty" class="preview-empty">Page preview will appear here.</div>
-                  <img id="previewImage" alt="Page preview" />
-                  <canvas id="overlay"></canvas>
+                  <div class="preview-stage" id="previewStage">
+                    <img id="previewImage" alt="Page preview" />
+                    <canvas id="overlay"></canvas>
+                  </div>
                 </div>
                 <div class="hint">Click a row to show bounds on the image.</div>
               </div>
@@ -210,14 +218,30 @@
                         <th>Page</th>
                         <th>Row</th>
                         <th>Date</th>
-                        <th>Description</th>
                         <th>Expected</th>
                         <th>Actual</th>
-                        <th>Delta</th>
+                        <th>Variance</th>
                         <th>Action</th>
                       </tr>
                     </thead>
                     <tbody id="disbalanceRowsBody"></tbody>
+                  </table>
+                </div>
+              </div>
+              <div id="previewFlaggedPanel" class="hidden">
+                <div class="table-wrap flagged-transactions-table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Page</th>
+                        <th>Row</th>
+                        <th>Date</th>
+                        <th>Description</th>
+                        <th>Code</th>
+                        <th>Action</th>
+                      </tr>
+                    </thead>
+                    <tbody id="flaggedRowsBody"></tbody>
                   </table>
                 </div>
               </div>
@@ -227,9 +251,37 @@
               <div class="row-between">
                 <h2>Parsed Rows</h2>
                 <div class="parsed-header-controls">
-                  <button id="parsedDebugToggleBtn" type="button" class="parsed-header-action ghost">Debug JSON</button>
+                  <div id="processingGoogleVisionParserWrap" class="hidden">
+                    <select id="processingGoogleVisionParser" class="mode-select" aria-label="Auto-selected parser">
+                      <option value="auto">Auto (Detected)</option>
+                      <option value="sterling_bank_of_asia">Sterling Bank of Asia</option>
+                      <option value="bdo">BDO</option>
+                      <option value="generic">Generic Parser</option>
+                    </select>
+                  </div>
+                  <button id="pageNotesBtn" type="button" class="parsed-header-action parsed-header-icon-btn" disabled aria-label="Page notes" title="Page notes">
+                    <svg class="parsed-header-icon" aria-hidden="true" viewBox="0 0 24 24" focusable="false">
+                      <path d="M16 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2Zm0 16H5V5h11v14Zm3-12h2v10c0 1.1-.9 2-2 2h-1v-2h1V7ZM7 7h7v2H7V7Zm0 4h7v2H7v-2Zm0 4h5v2H7v-2Z" />
+                    </svg>
+                  </button>
                   <button id="reverseRowsBtn" type="button" class="parsed-header-action" disabled>Reverse Order</button>
-                  <span id="rowCount">0 rows</span>
+                  <div class="parsed-header-meta">
+                    <div class="parsed-row-legend" aria-label="Parsed row colors">
+                      <span class="parsed-row-legend-item">
+                        <span class="parsed-row-legend-swatch is-error" aria-hidden="true"></span>
+                        Errors
+                      </span>
+                      <span class="parsed-row-legend-item">
+                        <span class="parsed-row-legend-swatch is-modified" aria-hidden="true"></span>
+                        Modified
+                      </span>
+                      <span class="parsed-row-legend-item">
+                        <span class="parsed-row-legend-swatch is-added" aria-hidden="true"></span>
+                        Added
+                      </span>
+                    </div>
+                    <span id="rowCount">0 rows</span>
+                  </div>
                 </div>
               </div>
               <div id="parsedTableWrap" class="table-wrap parsed-side-wrap">
@@ -265,6 +317,24 @@
       </section>
     </main>
 
-    <script src="/static/ui.js?v=20260304a"></script>
+    <div id="pageNotesModal" class="ui-modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="pageNotesTitle">
+      <div class="ui-modal-card">
+        <div class="ui-modal-head">
+          <div>
+            <h3 id="pageNotesTitle">Page Notes</h3>
+            <p id="pageNotesSubtitle" class="ui-modal-subtitle">Add remarks for this page.</p>
+          </div>
+          <button id="pageNotesCloseBtn" type="button" class="ui-modal-close" aria-label="Close notes dialog">x</button>
+        </div>
+        <label class="ui-modal-field" for="pageNotesInput">Notes</label>
+        <textarea id="pageNotesInput" class="ui-modal-textarea" rows="7" placeholder="Write remarks for this page..."></textarea>
+        <div class="ui-modal-actions">
+          <button id="pageNotesCancelBtn" type="button" class="button-link ghost">Cancel</button>
+          <button id="pageNotesSaveBtn" type="button">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="/static/ui.js?v=20260318a"></script>
   </body>
 </html>

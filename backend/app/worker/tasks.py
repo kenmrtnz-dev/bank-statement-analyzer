@@ -1,9 +1,11 @@
+"""Celery task wrappers that add retries and status bookkeeping around job services."""
+
 from __future__ import annotations
 
 import os
 import random
 
-from app.modules.jobs.service import (
+from app.jobs.service import (
     finalize_job_processing,
     mark_job_failed,
     mark_job_retrying,
@@ -36,6 +38,7 @@ _RETRYABLE_MESSAGE_SNIPPETS = (
 
 
 def _env_int(name: str, default: int) -> int:
+    """Read an integer env var with a safe fallback when it is unset or invalid."""
     raw = os.getenv(name, str(default))
     try:
         return int(raw)
@@ -44,10 +47,12 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _max_retries() -> int:
+    """Return the configured retry budget for background tasks."""
     return max(0, _env_int("CELERY_TASK_MAX_RETRIES", 3))
 
 
 def _retry_delay_seconds(retry_attempt: int) -> int:
+    """Apply exponential backoff with optional jitter for transient worker failures."""
     base = max(1, _env_int("CELERY_TASK_RETRY_BACKOFF_SECONDS", 15))
     cap = max(base, _env_int("CELERY_TASK_RETRY_BACKOFF_MAX_SECONDS", 300))
     jitter = max(0, _env_int("CELERY_TASK_RETRY_JITTER_SECONDS", 3))
@@ -60,6 +65,7 @@ def _retry_delay_seconds(retry_attempt: int) -> int:
 
 
 def _is_retryable_exception(exc: Exception) -> bool:
+    """Classify transient network/service failures that should be retried by Celery."""
     if isinstance(exc, (TimeoutError, ConnectionError)):
         return True
 
@@ -83,6 +89,7 @@ def _is_retryable_exception(exc: Exception) -> bool:
     reject_on_worker_lost=True,
 )
 def process_job_task(self, job_id: str, parse_mode: str) -> dict:
+    """Run the top-level job processor and surface retry/failure state to the UI."""
     task_id = str(self.request.id or "").strip() or None
     retries_so_far = int(self.request.retries or 0)
     max_retries = _max_retries()
@@ -93,6 +100,7 @@ def process_job_task(self, job_id: str, parse_mode: str) -> dict:
         if _is_retryable_exception(exc) and retries_so_far < max_retries:
             next_attempt = retries_so_far + 1
             countdown = _retry_delay_seconds(next_attempt)
+            # Persist retry metadata before requeueing so polling clients can show accurate state.
             mark_job_retrying(
                 job_id=job_id,
                 parse_mode=parse_mode,
@@ -123,6 +131,7 @@ def process_job_task(self, job_id: str, parse_mode: str) -> dict:
     reject_on_worker_lost=True,
 )
 def process_page_task(self, job_id: str, parse_mode: str, page_name: str, page_index: int, page_count: int) -> dict:
+    """Process one OCR page with the same retry bookkeeping used by whole-job tasks."""
     task_id = str(self.request.id or "").strip() or None
     retries_so_far = int(self.request.retries or 0)
     max_retries = _max_retries()
@@ -140,6 +149,7 @@ def process_page_task(self, job_id: str, parse_mode: str, page_name: str, page_i
         if _is_retryable_exception(exc) and retries_so_far < max_retries:
             next_attempt = retries_so_far + 1
             countdown = _retry_delay_seconds(next_attempt)
+            # Page-level retries keep the parent job alive while showing which page is delayed.
             mark_page_retrying(
                 job_id=job_id,
                 parse_mode=parse_mode,
@@ -172,6 +182,7 @@ def process_page_task(self, job_id: str, parse_mode: str, page_name: str, page_i
     reject_on_worker_lost=True,
 )
 def finalize_job_task(self, job_id: str, parse_mode: str) -> dict:
+    """Merge OCR page fragments into the final job outputs once all pages finish."""
     task_id = str(self.request.id or "").strip() or None
     return finalize_job_processing(job_id=job_id, parse_mode=parse_mode, task_id=task_id)
 

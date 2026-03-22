@@ -7,17 +7,20 @@ from app.bank_profiles import BankProfile, PROFILES
 
 DATE_PATTERNS = {
     "mdy": [
-        re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b"),
+        re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{2,4})\b"),
         re.compile(r"\b(\d{1,2})-(\d{1,2})-(\d{2,4})\b"),
+        re.compile(r"\b(\d{1,2})\.(\d{1,2})\.(\d{2,4})\b"),
     ],
     "dmy": [
         re.compile(r"\b(\d{1,2})\s+([A-Za-z]{3})\s+(\d{2,4})\b"),
         re.compile(r"\b(\d{1,2})([A-Za-z]{3})(\d{2,4})\b"),
         re.compile(r"\b(\d{1,2})-(\d{1,2})-(\d{2,4})\b"),
+        re.compile(r"\b(\d{1,2})\.(\d{1,2})\.(\d{2,4})\b"),
     ],
     "ymd": [
         re.compile(r"\b(\d{4})/(\d{1,2})/(\d{1,2})\b"),
         re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b"),
+        re.compile(r"\b(\d{4})\.(\d{1,2})\.(\d{1,2})\b"),
     ],
 }
 
@@ -64,6 +67,28 @@ OCR_MONTH_CHAR_MAP = {
 }
 
 AMOUNT_RE = re.compile(r"(?<![A-Za-z0-9])\(?-?\s*\$?\s*[\d,]+(?:\.\d{2})?\)?(?![A-Za-z0-9])")
+HEADER_SYNONYMS = {
+    "row": ["ln"],
+    "date": ["date", "value date", "posting date"],
+    "description": ["description", "details", "particulars", "transaction"],
+    "debit": ["debit", "withdrawal"],
+    "credit": ["credit", "deposit"],
+    "balance": ["balance", "bal"],
+}
+NON_TRANSACTION_BALANCE_TOKENS = [
+    "beginning balance",
+    "beggining balance",
+    "opening balance",
+    "begin balance",
+    "balance brought forward",
+    "brought forward",
+    "balance forward",
+    "balance forwarded",
+    "forwarded balance",
+    "balance carried forward",
+    "carried forward",
+    "carry forward",
+]
 
 
 def normalize_amount(value: str) -> Optional[str]:
@@ -131,6 +156,10 @@ def normalize_date(value: str, order: List[str]) -> Optional[str]:
     ocr_compact = _parse_ocr_compact_month_date(text)
     if ocr_compact is not None:
         return ocr_compact
+
+    numeric_compact = _parse_ocr_compact_numeric_date(text, order)
+    if numeric_compact is not None:
+        return numeric_compact
 
     return None
 
@@ -226,15 +255,52 @@ def _parse_ocr_compact_month_date(text: str) -> Optional[str]:
     return None
 
 
+def _parse_ocr_compact_numeric_date(text: str, order: List[str]) -> Optional[str]:
+    tokens = re.findall(r"\d{6,8}", text or "")
+    for token in tokens:
+        for mode in order:
+            try:
+                if mode == "ymd" and len(token) == 8:
+                    year = _normalize_year(token[:4])
+                    month = int(token[4:6])
+                    day = int(token[6:8])
+                    return dt.date(year, month, day).isoformat()
+                if mode == "mdy":
+                    if len(token) == 8:
+                        month = int(token[:2])
+                        day = int(token[2:4])
+                        year = _normalize_year(token[4:8])
+                    else:
+                        month = int(token[:2])
+                        day = int(token[2:4])
+                        year = _normalize_year(token[4:6])
+                    return dt.date(year, month, day).isoformat()
+                if mode == "dmy":
+                    if len(token) == 8:
+                        day = int(token[:2])
+                        month = int(token[2:4])
+                        year = _normalize_year(token[4:8])
+                    else:
+                        day = int(token[:2])
+                        month = int(token[2:4])
+                        year = _normalize_year(token[4:6])
+                    return dt.date(year, month, day).isoformat()
+            except Exception:
+                continue
+    return None
+
+
 def parse_words_page(
     words: List[Dict],
     page_width: float,
     page_height: float,
     profile: BankProfile,
     header_hint: Optional[Dict] = None,
+    last_date_hint: Optional[str] = None,
 ) -> Tuple[List[Dict], List[Dict], Dict]:
     rows = []
     bounds = []
+    attempted_bounded_parse = False
 
     grouped = _group_words_by_line(words)
     detected_header = _find_header_anchors(grouped, profile)
@@ -245,6 +311,7 @@ def parse_words_page(
         "row_candidates": 0,
     }
     if detected_header:
+        attempted_bounded_parse = True
         rows, bounds = _parse_grouped_lines_with_header(
             grouped_lines=grouped,
             page_width=page_width,
@@ -253,11 +320,13 @@ def parse_words_page(
             header=detected_header,
             diagnostics=diagnostics,
             skip_before_header=True,
+            last_date_hint=last_date_hint,
         )
         diagnostics["header_anchors"] = _serialize_header_anchors(detected_header)
         if rows:
             return rows, bounds, diagnostics
     elif _is_valid_header_hint(header_hint):
+        attempted_bounded_parse = True
         hint_header = dict(header_hint or {})
         hint_header["y"] = float("-inf")
         rows, bounds = _parse_grouped_lines_with_header(
@@ -268,6 +337,7 @@ def parse_words_page(
             header=hint_header,
             diagnostics=diagnostics,
             skip_before_header=False,
+            last_date_hint=last_date_hint,
         )
         diagnostics["header_hint_used"] = True
         diagnostics["fallback_mode"] = "header_hint_reuse"
@@ -275,7 +345,25 @@ def parse_words_page(
         if rows:
             return rows, bounds, diagnostics
 
-    rows, bounds = _parse_rows_without_header(grouped, page_width, page_height, profile)
+    if attempted_bounded_parse:
+        suspicious_late_header = bool(detected_header) and float(detected_header.get("y") or 0.0) >= (page_height * 0.6)
+        if suspicious_late_header:
+            fallback_rows, fallback_bounds = _parse_rows_without_header(
+                grouped,
+                page_width,
+                page_height,
+                profile,
+                last_date_hint=last_date_hint,
+            )
+            if fallback_rows:
+                diagnostics["fallback_mode"] = diagnostics.get("fallback_mode") or "bounded_parse_to_line_parse"
+                diagnostics["row_candidates"] = max(int(diagnostics.get("row_candidates") or 0), len(grouped))
+                return fallback_rows, fallback_bounds, diagnostics
+
+        diagnostics["fallback_mode"] = diagnostics.get("fallback_mode") or "bounded_parse_no_rows"
+        return rows, bounds, diagnostics
+
+    rows, bounds = _parse_rows_without_header(grouped, page_width, page_height, profile, last_date_hint=last_date_hint)
     diagnostics["fallback_mode"] = "no_header_line_parse"
     diagnostics["row_candidates"] = len(grouped)
     return rows, bounds, diagnostics
@@ -290,15 +378,18 @@ def _parse_grouped_lines_with_header(
     diagnostics: Dict,
     *,
     skip_before_header: bool,
+    last_date_hint: Optional[str] = None,
 ) -> Tuple[List[Dict], List[Dict]]:
     rows: List[Dict] = []
     bounds: List[Dict] = []
+    last_date_iso: Optional[str] = last_date_hint
 
     date_x = header["date"]
     description_x = header.get("description")
     debit_x = header["debit"]
     credit_x = header["credit"]
     balance_x = header["balance"]
+    column_ranges = _build_header_column_ranges(header)
 
     for line in grouped_lines:
         y = line["cy"]
@@ -312,7 +403,14 @@ def _parse_grouped_lines_with_header(
         diagnostics["row_candidates"] += 1
         date_txt = _nearest_text(line["words"], date_x)
         debit_txt, credit_txt, balance_txt = _assign_amount_columns(
-            line["words"], debit_x, credit_x, balance_x, profile
+            line["words"],
+            debit_x,
+            credit_x,
+            balance_x,
+            profile,
+            debit_range=column_ranges.get("debit"),
+            credit_range=column_ranges.get("credit"),
+            balance_range=column_ranges.get("balance"),
         )
 
         # Parse dates from the full line first so multi-token dates
@@ -327,15 +425,12 @@ def _parse_grouped_lines_with_header(
             line["words"],
             line_text,
             profile,
-            date_x,
-            description_x,
-            debit_x,
-            credit_x,
-            balance_x,
+            header,
+            column_ranges,
         )
 
-        # Fallback amount inference from full line.
-        if balance is None:
+        # With explicit header bounds, do not promote description numbers into amount columns.
+        if balance is None and not any(column_ranges.get(key) is not None for key in ("debit", "credit", "balance")):
             line_amounts = _extract_line_amounts(line_text)
             if line_amounts:
                 balance = line_amounts[-1]
@@ -345,9 +440,6 @@ def _parse_grouped_lines_with_header(
                         debit = second
                     else:
                         credit = second
-
-        if not (date_iso and balance):
-            continue
 
         if _is_opening_balance_line(line_text):
             debit = None
@@ -360,7 +452,24 @@ def _parse_grouped_lines_with_header(
             debit,
             credit,
         )
+        if is_non_transaction_balance_line(description) or is_non_transaction_balance_line(line_text):
+            continue
 
+        if date_iso is None and _should_reuse_last_date_for_transaction(
+            last_date_iso=last_date_iso,
+            description=description,
+            debit=debit,
+            credit=credit,
+            balance=balance,
+            line_text=line_text,
+            profile=profile,
+        ):
+            date_iso = last_date_iso
+
+        if not (date_iso and balance):
+            continue
+
+        last_date_iso = date_iso
         row_id = f"{len(rows) + 1:03}"
         rows.append({
             "row_id": row_id,
@@ -386,7 +495,7 @@ def _parse_grouped_lines_with_header(
 
 def _serialize_header_anchors(header: Dict) -> Dict:
     out: Dict[str, float] = {}
-    for key in ("date", "description", "debit", "credit", "balance"):
+    for key in ("row", "date", "description", "debit", "credit", "balance"):
         value = header.get(key)
         if value is None:
             continue
@@ -394,6 +503,20 @@ def _serialize_header_anchors(header: Dict) -> Dict:
             out[key] = float(value)
         except Exception:
             continue
+    for key in ("row", "date", "description", "debit", "credit", "balance"):
+        span = header.get(f"{key}_span")
+        if isinstance(span, dict):
+            try:
+                out[f"{key}_span"] = {
+                    "x1": float(span.get("x1")),
+                    "x2": float(span.get("x2")),
+                    "cx": float(span.get("cx")),
+                }
+            except Exception:
+                pass
+    column_ranges = _build_header_column_ranges(header)
+    if column_ranges:
+        out["column_ranges"] = column_ranges
     return out
 
 
@@ -416,6 +539,7 @@ def parse_page_with_profile_fallback(
     page_height: float,
     detected_profile: BankProfile,
     header_hint: Optional[Dict] = None,
+    last_date_hint: Optional[str] = None,
 ) -> Tuple[List[Dict], List[Dict], Dict]:
     base_rows, base_bounds, base_diag = parse_words_page(
         words,
@@ -423,6 +547,7 @@ def parse_page_with_profile_fallback(
         page_height,
         detected_profile,
         header_hint=header_hint,
+        last_date_hint=last_date_hint,
     )
     base_ratio = _rows_conversion_ratio(base_rows, base_diag)
 
@@ -441,6 +566,7 @@ def parse_page_with_profile_fallback(
             page_height,
             generic_profile,
             header_hint=header_hint,
+            last_date_hint=last_date_hint,
         )
         fb_ratio = _rows_conversion_ratio(fb_rows, fb_diag)
 
@@ -512,7 +638,7 @@ def is_transaction_row(row: Dict, profile: BankProfile) -> bool:
     description = str(row.get("description") or "").strip()
     lower_desc = description.lower()
 
-    if description and _is_opening_balance_line(description):
+    if description and is_non_transaction_balance_line(description):
         return False
 
     if not row.get("debit") and not row.get("credit"):
@@ -597,51 +723,166 @@ def _group_words_by_line(words: List[Dict]) -> List[Dict]:
 
 
 def _find_header_anchors(grouped_lines: List[Dict], profile: BankProfile) -> Optional[Dict]:
-    for line in grouped_lines[:80]:
-        words = line["words"]
-        text = " ".join(w["text"] for w in words).lower()
+    search_window = grouped_lines[:80]
+    for line in search_window:
+        header = _detect_header_from_words(line["words"], profile, header_y=line["cy"])
+        if header:
+            return header
 
-        date_x = _find_token_x(text, words, profile.date_tokens)
-        description_x = _find_token_x(text, words, profile.description_tokens)
-        debit_x = _find_token_x(text, words, profile.debit_tokens)
-        credit_x = _find_token_x(text, words, profile.credit_tokens)
-        balance_x = _find_token_x(text, words, profile.balance_tokens)
-
-        if date_x is None or balance_x is None:
+    for idx in range(len(search_window) - 1):
+        upper = search_window[idx]
+        lower = search_window[idx + 1]
+        if not _header_lines_are_mergeable(upper, lower):
             continue
-        if debit_x is None and credit_x is None:
-            continue
+        combined_words = sorted(
+            [*upper["words"], *lower["words"]],
+            key=lambda word: (float(word["x1"]), float(word["y1"]), float(word["x2"])),
+        )
+        header = _detect_header_from_words(combined_words, profile, header_y=max(upper["cy"], lower["cy"]))
+        if header:
+            return header
 
-        # Fill missing anchors with nearest reasonable defaults.
-        if debit_x is None:
-            debit_x = (date_x + balance_x) / 2.0
-        if credit_x is None:
-            credit_x = (debit_x + balance_x) / 2.0
+    return None
 
-        return {
-            "y": line["cy"],
-            "date": date_x,
-            "description": description_x,
-            "debit": debit_x,
-            "credit": credit_x,
-            "balance": balance_x,
+
+def _detect_header_from_words(words: List[Dict], profile: BankProfile, *, header_y: float) -> Optional[Dict]:
+    segments = _identify_header_segments(words, profile)
+    core_hits = {segment["key"] for segment in segments if segment.get("source") == "core"}
+    if "date" not in core_hits or "balance" not in core_hits:
+        return None
+    if "debit" not in core_hits and "credit" not in core_hits:
+        return None
+    if len(core_hits) < 3:
+        return None
+
+    header = _build_header_from_segments(header_y, segments)
+    date_x = header.get("date")
+    debit_x = header.get("debit")
+    credit_x = header.get("credit")
+    balance_x = header.get("balance")
+    if date_x is None or balance_x is None:
+        return None
+    if debit_x is None:
+        debit_x = (date_x + balance_x) / 2.0
+        header["debit"] = debit_x
+    if credit_x is None:
+        credit_x = (debit_x + balance_x) / 2.0
+        header["credit"] = credit_x
+    return header
+
+
+def _header_lines_are_mergeable(upper: Dict, lower: Dict) -> bool:
+    upper_y = float(upper.get("cy") or 0.0)
+    lower_y = float(lower.get("cy") or 0.0)
+    if lower_y <= upper_y:
+        return False
+    return (lower_y - upper_y) <= 24.0
+
+
+def _header_token_map(profile: Optional[BankProfile]) -> Dict[str, List[str]]:
+    token_map = {key: list(values) for key, values in HEADER_SYNONYMS.items()}
+    if profile:
+        profile_tokens = {
+            "date": profile.date_tokens,
+            "description": profile.description_tokens,
+            "debit": profile.debit_tokens,
+            "credit": profile.credit_tokens,
+            "balance": profile.balance_tokens,
         }
+        for key, values in profile_tokens.items():
+            bucket = token_map.setdefault(key, [])
+            for value in values:
+                normalized = str(value or "").strip().lower()
+                if normalized and normalized not in bucket:
+                    bucket.append(normalized)
+    return token_map
 
-    return None
 
+def _identify_header_segments(words: List[Dict], profile: Optional[BankProfile]) -> List[Dict]:
+    if not words:
+        return []
 
-def _find_token_x(line_text: str, words: List[Dict], tokens: List[str]) -> Optional[float]:
-    for token in tokens:
-        if token not in line_text:
+    lowered = [str(w.get("text") or "").strip().lower() for w in words]
+    token_specs: List[Tuple[int, str, List[str]]] = []
+    for key, tokens in _header_token_map(profile).items():
+        for token in tokens:
+            parts = [part for part in token.split() if part]
+            if parts:
+                token_specs.append((len(parts), key, parts))
+    token_specs.sort(key=lambda item: (-item[0], item[2]))
+
+    matched_indices: set[int] = set()
+    segments: List[Dict] = []
+    i = 0
+    while i < len(words):
+        matched = False
+        for width, key, parts in token_specs:
+            if i + width > len(words):
+                continue
+            if any(idx in matched_indices for idx in range(i, i + width)):
+                continue
+            if lowered[i:i + width] != parts:
+                continue
+            segments.append(_make_header_segment(words, i, i + width - 1, key, source="core"))
+            matched_indices.update(range(i, i + width))
+            i += width
+            matched = True
+            break
+        if not matched:
+            i += 1
+
+    extra_start: Optional[int] = None
+    for idx in range(len(words)):
+        token = lowered[idx]
+        if not token:
             continue
-        token_parts = token.split()
-        for i in range(len(words)):
-            candidate = " ".join(w["text"].lower() for w in words[i:i + len(token_parts)])
-            if candidate == token:
-                left = words[i]["x1"]
-                right = words[i + len(token_parts) - 1]["x2"]
-                return (left + right) / 2.0
-    return None
+        if idx in matched_indices:
+            if extra_start is not None:
+                segments.append(_make_header_segment(words, extra_start, idx - 1, "description", source="extra"))
+                extra_start = None
+            continue
+        if extra_start is None:
+            extra_start = idx
+    if extra_start is not None:
+        segments.append(_make_header_segment(words, extra_start, len(words) - 1, "description", source="extra"))
+
+    return sorted(segments, key=lambda segment: (segment["x1"], segment["x2"]))
+
+
+def _make_header_segment(words: List[Dict], start_idx: int, end_idx: int, key: str, *, source: str) -> Dict:
+    left = float(words[start_idx]["x1"])
+    right = float(words[end_idx]["x2"])
+    cx = (left + right) / 2.0
+    return {
+        "key": key,
+        "x1": left,
+        "x2": right,
+        "cx": cx,
+        "source": source,
+    }
+
+
+def _build_header_from_segments(header_y: float, segments: List[Dict]) -> Dict:
+    header: Dict = {"y": header_y, "segments": [dict(segment) for segment in segments]}
+    merged_spans: Dict[str, Dict[str, float]] = {}
+
+    for segment in segments:
+        key = segment["key"]
+        span = {"x1": float(segment["x1"]), "x2": float(segment["x2"]), "cx": float(segment["cx"])}
+        if key not in header:
+            header[key] = span["cx"]
+        if key not in merged_spans:
+            merged_spans[key] = dict(span)
+            continue
+        merged = merged_spans[key]
+        merged["x1"] = min(merged["x1"], span["x1"])
+        merged["x2"] = max(merged["x2"], span["x2"])
+        merged["cx"] = (merged["x1"] + merged["x2"]) / 2.0
+
+    for key, span in merged_spans.items():
+        header[f"{key}_span"] = span
+
+    return header
 
 
 def _nearest_text(words: List[Dict], target_x: float) -> Optional[str]:
@@ -662,9 +903,14 @@ def _assign_amount_columns(
     credit_x: float,
     balance_x: float,
     profile: Optional[BankProfile] = None,
+    *,
+    debit_range: Optional[Tuple[float, float]] = None,
+    credit_range: Optional[Tuple[float, float]] = None,
+    balance_range: Optional[Tuple[float, float]] = None,
 ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     amount_words = []
     flow_left = min(debit_x, credit_x, balance_x)
+    strict_column_ranges = any(bounds is not None for bounds in (debit_range, credit_range, balance_range))
     for w in words:
         token = str(w.get("text", "")).strip()
         cx = (w["x1"] + w["x2"]) / 2.0
@@ -674,6 +920,10 @@ def _assign_amount_columns(
             continue
         if _is_date_like_token(w.get("text", "")):
             continue
+        if _is_short_integer_amount_fragment(token):
+            continue
+        if _is_unformatted_long_integer_token(token):
+            continue
         norm = normalize_amount(w["text"])
         if norm is None:
             continue
@@ -682,7 +932,17 @@ def _assign_amount_columns(
     if not amount_words:
         return None, None, None
 
-    balance_idx = min(range(len(amount_words)), key=lambda i: abs(amount_words[i]["cx"] - balance_x))
+    balance_candidates = [
+        (i, amount)
+        for i, amount in enumerate(amount_words)
+        if _x_in_column_range(amount["cx"], balance_range)
+    ]
+    if balance_candidates:
+        balance_idx = min(balance_candidates, key=lambda item: abs(item[1]["cx"] - balance_x))[0]
+    elif strict_column_ranges:
+        return None, None, None
+    else:
+        balance_idx = min(range(len(amount_words)), key=lambda i: abs(amount_words[i]["cx"] - balance_x))
     balance = amount_words[balance_idx]["value"]
     remaining = [a for i, a in enumerate(amount_words) if i != balance_idx]
 
@@ -691,19 +951,68 @@ def _assign_amount_columns(
     if not remaining:
         return debit, credit, balance
 
-    d_idx = min(range(len(remaining)), key=lambda i: abs(remaining[i]["cx"] - debit_x))
-    c_idx = min(range(len(remaining)), key=lambda i: abs(remaining[i]["cx"] - credit_x))
+    debit_candidates = [amount for amount in remaining if _x_in_column_range(amount["cx"], debit_range)]
+    credit_candidates = [amount for amount in remaining if _x_in_column_range(amount["cx"], credit_range)]
+    used_candidates: list[dict] = []
 
-    if d_idx == c_idx:
-        cand = remaining[d_idx]
-        if abs(cand["cx"] - debit_x) <= abs(cand["cx"] - credit_x):
-            debit = cand["value"]
-        else:
-            credit = cand["value"]
-        return debit, credit, balance
+    if debit_candidates:
+        debit_pick = min(debit_candidates, key=lambda amount: abs(amount["cx"] - debit_x))
+        debit = debit_pick["value"]
+        used_candidates.append(debit_pick)
+        credit_candidates = [amount for amount in credit_candidates if amount is not debit_pick]
+    if credit_candidates:
+        credit_pick = min(credit_candidates, key=lambda amount: abs(amount["cx"] - credit_x))
+        credit = credit_pick["value"]
+        used_candidates.append(credit_pick)
 
-    debit = remaining[d_idx]["value"]
-    credit = remaining[c_idx]["value"]
+    residual_candidates = [amount for amount in remaining if amount not in used_candidates]
+    if residual_candidates and debit_range is None and credit_range is None:
+        if debit is None and credit is not None:
+            debit_pick = min(residual_candidates, key=lambda amount: abs(amount["cx"] - debit_x))
+            debit = debit_pick["value"]
+            used_candidates.append(debit_pick)
+            residual_candidates = [amount for amount in residual_candidates if amount is not debit_pick]
+        elif credit is None and debit is not None:
+            credit_pick = min(residual_candidates, key=lambda amount: abs(amount["cx"] - credit_x))
+            credit = credit_pick["value"]
+            used_candidates.append(credit_pick)
+            residual_candidates = [amount for amount in residual_candidates if amount is not credit_pick]
+        elif debit is None and credit is None:
+            if len(residual_candidates) == 1:
+                cand = residual_candidates[0]
+                if abs(cand["cx"] - debit_x) <= abs(cand["cx"] - credit_x):
+                    debit = cand["value"]
+                else:
+                    credit = cand["value"]
+            else:
+                d_idx = min(range(len(residual_candidates)), key=lambda i: abs(residual_candidates[i]["cx"] - debit_x))
+                c_idx = min(range(len(residual_candidates)), key=lambda i: abs(residual_candidates[i]["cx"] - credit_x))
+
+                if d_idx == c_idx:
+                    cand = residual_candidates[d_idx]
+                    if abs(cand["cx"] - debit_x) <= abs(cand["cx"] - credit_x):
+                        debit = cand["value"]
+                    else:
+                        credit = cand["value"]
+                    return debit, credit, balance
+
+                debit = residual_candidates[d_idx]["value"]
+                credit = residual_candidates[c_idx]["value"]
+
+    if debit is None and credit is None and debit_range is None and credit_range is None:
+        d_idx = min(range(len(remaining)), key=lambda i: abs(remaining[i]["cx"] - debit_x))
+        c_idx = min(range(len(remaining)), key=lambda i: abs(remaining[i]["cx"] - credit_x))
+
+        if d_idx == c_idx:
+            cand = remaining[d_idx]
+            if abs(cand["cx"] - debit_x) <= abs(cand["cx"] - credit_x):
+                debit = cand["value"]
+            else:
+                credit = cand["value"]
+            return debit, credit, balance
+
+        debit = remaining[d_idx]["value"]
+        credit = remaining[c_idx]["value"]
     return debit, credit, balance
 
 
@@ -714,35 +1023,75 @@ def _is_date_like_token(token: str) -> bool:
     return bool(re.search(r"\b\d{1,4}[/-]\d{1,2}[/-]\d{1,4}\b", text))
 
 
+def _is_short_integer_amount_fragment(token: str) -> bool:
+    text = str(token or "").strip().replace(",", "")
+    if not text:
+        return False
+    if any(ch in text for ch in ".()"):
+        return False
+    stripped = text.lstrip("-")
+    return stripped.isdigit() and len(stripped) <= 2
+
+
+def _is_unformatted_long_integer_token(token: str) -> bool:
+    text = str(token or "").strip()
+    if not text or any(ch in text for ch in ",.()"):
+        return False
+    digits_only = re.sub(r"[^0-9]", "", text.lstrip("-"))
+    return digits_only.isdigit() and len(digits_only) >= 5
+
+
 def _extract_description_from_header_line(
     words: List[Dict],
     line_text: str,
     profile: BankProfile,
-    date_x: float,
-    description_x: Optional[float],
-    debit_x: float,
-    credit_x: float,
-    balance_x: float,
+    header: Dict,
+    column_ranges: Dict[str, Tuple[float, float]],
 ) -> Optional[str]:
     if not words:
         return _extract_description_without_header(line_text, profile)
 
-    flow_left = min(debit_x, credit_x, balance_x)
-    left_anchor = min(date_x, description_x if description_x is not None else date_x)
-    if flow_left <= left_anchor:
+    segment_ranges = column_ranges.get("_segment_ranges") or []
+    description_ranges = [
+        segment["range"]
+        for segment in segment_ranges
+        if segment.get("key") == "description"
+    ]
+    reserved_segments = [
+        segment
+        for segment in segment_ranges
+        if segment.get("key") in {"row", "date", "debit", "credit", "balance"}
+    ]
+    flow_ranges = [column_ranges.get(key) for key in ("debit", "credit", "balance") if column_ranges.get(key)]
+
+    if not description_ranges and not flow_ranges:
         return _extract_description_without_header(line_text, profile)
 
     picked: List[str] = []
     for w in words:
         cx = (w["x1"] + w["x2"]) / 2.0
-        if cx <= left_anchor + 2.0 or cx >= flow_left - 2.0:
-            continue
         token = (w.get("text") or "").strip()
         if not token:
             continue
-        if normalize_amount(token) is not None and not _is_profile_reference_code(profile, token):
+        if _is_placeholder_description_token(token):
+            continue
+        if any(
+            _word_in_column_range(w, segment["range"], slack=2.0)
+            if segment.get("key") == "row"
+            else _x_in_column_range(cx, segment["range"], slack=2.0)
+            for segment in reserved_segments
+        ):
+            continue
+        if (
+            normalize_amount(token) is not None
+            and not _is_profile_reference_code(profile, token)
+            and any(_x_in_column_range(cx, column_ranges.get(key)) for key in ("debit", "credit", "balance"))
+        ):
             continue
         if normalize_date(token, profile.date_order) is not None:
+            continue
+        if description_ranges and any(_word_in_column_range(w, bounds, slack=2.0) for bounds in description_ranges):
+            picked.append(token)
             continue
         picked.append(token)
 
@@ -776,7 +1125,7 @@ def _extract_description_without_header(line_text: str, profile: BankProfile) ->
 
     text = re.sub(r",?\s+\d{1,2}:\d{2}(?::\d{2})?\s*[APMapm]{0,2}$", "", text)
     text = AMOUNT_RE.sub(" ", text)
-    text = re.sub(r"\s+", " ", text).strip(" -:|,")
+    text = _normalize_description_text(text)
     if not text:
         return None
     if _is_noise(text, profile):
@@ -801,6 +1150,8 @@ def _extract_description_from_words(words: List[Dict], profile: BankProfile) -> 
         token = (w.get("text") or "").strip()
         if not token:
             continue
+        if _is_placeholder_description_token(token):
+            continue
         lower = token.lower()
         if lower in ignored_tokens:
             continue
@@ -810,12 +1161,26 @@ def _extract_description_from_words(words: List[Dict], profile: BankProfile) -> 
             continue
         parts.append(token)
 
-    text = re.sub(r"\s+", " ", " ".join(parts)).strip(" -:|,")
+    text = _normalize_description_text(" ".join(parts))
     if not text:
         return None
     if _is_noise(text, profile):
         return None
     return text
+
+
+def _is_placeholder_description_token(token: str) -> bool:
+    cleaned = re.sub(r"\s+", "", str(token or ""))
+    if not cleaned:
+        return True
+    return all(ch in "-–—_:|." for ch in cleaned)
+
+
+def _normalize_description_text(text: str) -> Optional[str]:
+    raw_tokens = [token for token in re.split(r"\s+", str(text or "").strip()) if token]
+    tokens = [token for token in raw_tokens if not _is_placeholder_description_token(token)]
+    normalized = re.sub(r"\s+", " ", " ".join(tokens)).strip(" -:|,")
+    return normalized or None
 
 
 def _extract_line_amounts(line_text: str) -> List[str]:
@@ -832,6 +1197,46 @@ def _extract_line_amounts(line_text: str) -> List[str]:
         if norm is not None:
             out.append(norm)
     return out
+
+
+def _should_reuse_last_date_for_transaction(
+    *,
+    last_date_iso: Optional[str],
+    description: Optional[str],
+    debit: Optional[str],
+    credit: Optional[str],
+    balance: Optional[str],
+    line_text: str,
+    profile: BankProfile,
+) -> bool:
+    if not last_date_iso:
+        return False
+    if not balance:
+        return False
+    if not (debit or credit):
+        return False
+    if is_non_transaction_balance_line(line_text):
+        return False
+
+    desc = str(description or "").strip()
+    if not desc:
+        return False
+    if _is_noise(desc, profile):
+        return False
+
+    header_tokens = set(
+        profile.date_tokens
+        + profile.description_tokens
+        + profile.debit_tokens
+        + profile.credit_tokens
+        + profile.balance_tokens
+    )
+    lower_desc = desc.lower()
+    header_hits = sum(1 for token in header_tokens if token and token in lower_desc)
+    if header_hits >= 2:
+        return False
+
+    return True
 
 
 def _is_profile_reference_code(profile: Optional[BankProfile], token: str) -> bool:
@@ -883,10 +1288,13 @@ def _parse_rows_without_header(
     page_width: float,
     page_height: float,
     profile: BankProfile,
+    *,
+    last_date_hint: Optional[str] = None,
 ) -> Tuple[List[Dict], List[Dict]]:
     rows = []
     bounds = []
     i = 0
+    last_date_iso: Optional[str] = last_date_hint
     while i < len(grouped_lines):
         line = grouped_lines[i]
         line_text = " ".join(w["text"] for w in line["words"])
@@ -895,9 +1303,6 @@ def _parse_rows_without_header(
             continue
 
         date_iso = normalize_date(line_text, profile.date_order)
-        if date_iso is None:
-            i += 1
-            continue
 
         line_words = list(line["words"])
         amounts = _extract_line_amounts(line_text)
@@ -932,15 +1337,35 @@ def _parse_rows_without_header(
                 debit = flow
 
         combined_text = " ".join(w["text"] for w in line_words)
-        if _is_opening_balance_line(combined_text):
+        if is_non_transaction_balance_line(combined_text):
             debit = None
             credit = None
 
+        description = _extract_description_from_words(line_words, profile) or _extract_description_without_header(combined_text, profile)
+        if is_non_transaction_balance_line(description) or is_non_transaction_balance_line(combined_text):
+            i = max(i + 1, j)
+            continue
+        if date_iso is None and _should_reuse_last_date_for_transaction(
+            last_date_iso=last_date_iso,
+            description=description,
+            debit=debit,
+            credit=credit,
+            balance=balance,
+            line_text=combined_text,
+            profile=profile,
+        ):
+            date_iso = last_date_iso
+
+        if not date_iso:
+            i = max(i + 1, j)
+            continue
+
+        last_date_iso = date_iso
         row_id = f"{len(rows) + 1:03}"
         rows.append({
             "row_id": row_id,
             "date": date_iso,
-            "description": _extract_description_from_words(line_words, profile) or _extract_description_without_header(combined_text, profile),
+            "description": description,
             "debit": debit,
             "credit": credit,
             "balance": balance,
@@ -970,19 +1395,18 @@ def _is_noise(line_text: str, profile: BankProfile) -> bool:
 
 
 def _is_opening_balance_line(text: str) -> bool:
+    return is_non_transaction_balance_line(text)
+
+
+def is_non_transaction_balance_line(text: str) -> bool:
     lower = (text or "").lower()
     if not lower.strip():
         return False
+    normalized = re.sub(r"[^a-z0-9]+", " ", lower)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
     return any(
-        token in lower
-        for token in [
-            "beginning balance",
-            "opening balance",
-            "begin balance",
-            "balance brought forward",
-            "brought forward",
-            "balance forward",
-        ]
+        token in normalized
+        for token in NON_TRANSACTION_BALANCE_TOKENS
     )
 
 
@@ -1043,3 +1467,100 @@ def _compute_tight_row_bounds(
 
 def _clamp01(v: float) -> float:
     return max(0.0, min(1.0, float(v)))
+
+
+def _build_header_column_ranges(header: Dict) -> Dict[str, Tuple[float, float]]:
+    segments = header.get("segments")
+    if isinstance(segments, list) and segments:
+        ordered_segments = sorted(
+            [
+                {
+                    "key": str(segment.get("key") or ""),
+                    "x1": float(segment.get("x1")),
+                    "x2": float(segment.get("x2")),
+                    "cx": float(segment.get("cx")),
+                }
+                for segment in segments
+                if segment.get("key") is not None
+            ],
+            key=lambda item: (item["x1"], item["x2"]),
+        )
+        if ordered_segments:
+            ranges: Dict[str, Tuple[float, float]] = {}
+            segment_ranges: List[Dict] = []
+            for idx, segment in enumerate(ordered_segments):
+                key = segment["key"]
+                left = float(segment["x1"]) if key in {"debit", "credit", "balance"} else float(segment["cx"])
+                right = float("inf")
+                if key in {"debit", "credit", "balance"}:
+                    for future in ordered_segments[idx + 1:]:
+                        if future["key"] in {"debit", "credit", "balance"} and float(future["x1"]) > left:
+                            right = float(future["x1"])
+                            break
+                elif idx + 1 < len(ordered_segments):
+                    right = float(ordered_segments[idx + 1]["x1"])
+                bounds = (left, right)
+                segment_ranges.append({"key": segment["key"], "range": bounds})
+                if key not in ranges:
+                    ranges[key] = bounds
+                else:
+                    current_left, current_right = ranges[key]
+                    merged_right = right if current_right == float("inf") or right == float("inf") else max(current_right, right)
+                    ranges[key] = (min(current_left, left), merged_right)
+            ranges["_segment_ranges"] = segment_ranges
+            return ranges
+
+    ordered_keys = ("date", "description", "debit", "credit", "balance")
+    anchors = []
+    for key in ordered_keys:
+        center = header.get(key)
+        if center is None:
+            continue
+        span = header.get(f"{key}_span")
+        if isinstance(span, dict):
+            left = float(span.get("x1", center))
+            right = float(span.get("x2", center))
+        else:
+            left = float(center)
+            right = float(center)
+        anchors.append((key, left, right, float(center)))
+
+    if not anchors:
+        return {}
+
+    ranges: Dict[str, Tuple[float, float]] = {}
+    for idx, (key, left, right, center) in enumerate(anchors):
+        prev_anchor = anchors[idx - 1] if idx > 0 else None
+        next_anchor = anchors[idx + 1] if idx + 1 < len(anchors) else None
+
+        if prev_anchor is None:
+            range_left = float("-inf")
+        else:
+            prev_right = prev_anchor[2]
+            range_left = (prev_right + left) / 2.0 if prev_right <= left else (prev_anchor[3] + center) / 2.0
+
+        if next_anchor is None:
+            range_right = float("inf")
+        else:
+            next_left = next_anchor[1]
+            range_right = (right + next_left) / 2.0 if right <= next_left else (center + next_anchor[3]) / 2.0
+
+        ranges[key] = (float(range_left), float(range_right))
+
+    return ranges
+
+
+def _x_in_column_range(x: float, bounds: Optional[Tuple[float, float]], slack: float = 4.0) -> bool:
+    if bounds is None:
+        return False
+    left, right = bounds
+    return (x >= (left - slack)) and (x <= (right + slack))
+
+
+def _word_in_column_range(word: Dict, bounds: Optional[Tuple[float, float]], slack: float = 4.0) -> bool:
+    if bounds is None:
+        return False
+    left, right = bounds
+    x1 = float(word.get("x1") or 0.0)
+    x2 = float(word.get("x2") or 0.0)
+    return x2 >= (left - slack) and x1 <= (right + slack)

@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from app.modules.crm import service as crm_service
+from app.crm import service as crm_service
 
 
 def test_load_attachment_process_index_marks_uploaded_from_meta(monkeypatch, tmp_path: Path):

@@ -16,6 +16,28 @@
   const overviewUploadTesting = document.getElementById('overviewUploadTesting');
   const headerUploadTestingStatus = document.getElementById('headerUploadTestingStatus');
   const sidebarUploadTestingStatus = document.getElementById('sidebarUploadTestingStatus');
+  const jobsResultCount = document.getElementById('jobsResultCount');
+  const jobsFilterForm = document.getElementById('jobsFilterForm');
+  const jobsFilterJobId = document.getElementById('jobsFilterJobId');
+  const jobsFilterOwner = document.getElementById('jobsFilterOwner');
+  const jobsFilterStatus = document.getElementById('jobsFilterStatus');
+  const jobsFilterQuery = document.getElementById('jobsFilterQuery');
+  const resetJobsFiltersBtn = document.getElementById('resetJobsFiltersBtn');
+  const jobsRowsBody = document.getElementById('jobsRowsBody');
+  const jobsPageInfo = document.getElementById('jobsPageInfo');
+  const jobsPrevBtn = document.getElementById('jobsPrevBtn');
+  const jobsNextBtn = document.getElementById('jobsNextBtn');
+  const jobsFeedback = document.getElementById('jobsFeedback');
+  const jobsResultMeta = document.getElementById('jobsResultMeta');
+  const jobsResultReadyTag = document.getElementById('jobsResultReadyTag');
+  const jobsResultSummaryTotalTx = document.getElementById('jobsResultSummaryTotalTx');
+  const jobsResultSummaryTotalDebit = document.getElementById('jobsResultSummaryTotalDebit');
+  const jobsResultSummaryTotalCredit = document.getElementById('jobsResultSummaryTotalCredit');
+  const jobsResultSummaryEndingBalance = document.getElementById('jobsResultSummaryEndingBalance');
+  const jobsResultRowsBody = document.getElementById('jobsResultRowsBody');
+  const jobsResultRowsMeta = document.getElementById('jobsResultRowsMeta');
+  const jobsResultPdfLink = document.getElementById('jobsResultPdfLink');
+  const jobsResultExcelLink = document.getElementById('jobsResultExcelLink');
   const transactionsResultCount = document.getElementById('transactionsResultCount');
   const flagCodeRuleCountTag = document.getElementById('flagCodeRuleCountTag');
   const createForm = document.getElementById('createEvaluatorForm');
@@ -48,6 +70,8 @@
   const confirmModal = document.getElementById('confirmModal');
   const confirmCancelBtn = document.getElementById('confirmCancelBtn');
   const confirmClearBtn = document.getElementById('confirmClearBtn');
+  let jobsPage = 1;
+  let jobsTotalPages = 1;
   let transactionsPage = 1;
   let transactionsTotalPages = 1;
   let bankCodeRowsState = [];
@@ -55,6 +79,10 @@
     accounts: {
       label: 'Accounts',
       description: 'Provision evaluator access and review the authentication model.'
+    },
+    jobs: {
+      label: 'Jobs',
+      description: 'Track all user jobs, progress, and parsed outputs from a single admin workspace.'
     },
     transactions: {
       label: 'Transactions',
@@ -164,6 +192,35 @@
     transactionsFeedback?.classList.add('hidden');
   }
 
+  async function apiJson(url, options = {}) {
+    const res = await fetch(url, options);
+    if (res.status === 401) {
+      window.location.href = '/login';
+      throw new Error('not_authenticated');
+    }
+    const raw = await res.text();
+    if (!res.ok) {
+      let detail = raw;
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object' && parsed.detail) {
+          detail = String(parsed.detail);
+        }
+      } catch (_err) {
+        // Keep raw text fallback.
+      }
+      throw new Error(detail || `HTTP ${res.status}`);
+    }
+    if (!raw.trim()) {
+      return {};
+    }
+    try {
+      return JSON.parse(raw);
+    } catch (_err) {
+      return {};
+    }
+  }
+
   function escapeHtml(value) {
     return String(value ?? '')
       .replaceAll('&', '&amp;')
@@ -210,6 +267,233 @@
       return escapeHtml(raw);
     }
     return escapeHtml(parsed.toLocaleString());
+  }
+
+  function formatJobStatusLabel(value) {
+    const normalized = String(value || '').trim().toLowerCase();
+    if (!normalized) return 'Unknown';
+    if (normalized === 'done') return 'Done';
+    if (normalized === 'done_with_warnings') return 'Done (Warnings)';
+    if (normalized === 'queued') return 'Queued';
+    if (normalized === 'processing') return 'Processing';
+    if (normalized === 'failed') return 'Failed';
+    if (normalized === 'cancelled') return 'Cancelled';
+    return normalized.replaceAll('_', ' ').replace(/(^|\s)\S/g, (match) => match.toUpperCase());
+  }
+
+  function formatJobOwner(row = {}) {
+    const owner = String(row.owner_username || '').trim();
+    if (!owner) return '<span class="transactions-cell-muted">Unknown</span>';
+    const role = String(row.owner_role || '').trim();
+    if (!role) return escapeHtml(owner);
+    return `${escapeHtml(owner)} <span class="transactions-cell-muted">(${escapeHtml(role)})</span>`;
+  }
+
+  function showJobsFeedback(message, isError = false) {
+    showInlineFeedback(jobsFeedback, message, isError);
+  }
+
+  function clearJobsFeedback() {
+    jobsFeedback?.classList.add('hidden');
+  }
+
+  function setJobsResultLoadingState(message = 'Select a job above to view parsed results.') {
+    if (jobsResultRowsBody) {
+      jobsResultRowsBody.innerHTML = `<tr><td colspan="7">${escapeHtml(message)}</td></tr>`;
+    }
+    setText(jobsResultMeta, message);
+    setText(jobsResultRowsMeta, message);
+    setText(jobsResultReadyTag, 'Not selected');
+    setText(jobsResultSummaryTotalTx, '-');
+    setText(jobsResultSummaryTotalDebit, '-');
+    setText(jobsResultSummaryTotalCredit, '-');
+    setText(jobsResultSummaryEndingBalance, '-');
+    jobsResultPdfLink?.classList.add('hidden');
+    jobsResultExcelLink?.classList.add('hidden');
+    if (jobsResultPdfLink) jobsResultPdfLink.removeAttribute('href');
+    if (jobsResultExcelLink) jobsResultExcelLink.removeAttribute('href');
+  }
+
+  function renderJobsResultSummary(summary = {}) {
+    const totalTx = Number(summary.total_transactions || 0);
+    setText(jobsResultSummaryTotalTx, Number.isFinite(totalTx) ? totalTx.toLocaleString() : '-');
+
+    const totalDebit = Number(summary.total_debit);
+    setText(
+      jobsResultSummaryTotalDebit,
+      Number.isFinite(totalDebit)
+        ? totalDebit.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+        : '-'
+    );
+
+    const totalCredit = Number(summary.total_credit);
+    setText(
+      jobsResultSummaryTotalCredit,
+      Number.isFinite(totalCredit)
+        ? totalCredit.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+        : '-'
+    );
+
+    const endingBalance = Number(summary.ending_balance);
+    setText(
+      jobsResultSummaryEndingBalance,
+      Number.isFinite(endingBalance)
+        ? endingBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+        : '-'
+    );
+  }
+
+  function renderJobsResultRows(rows = []) {
+    if (!jobsResultRowsBody) return;
+    if (!rows.length) {
+      jobsResultRowsBody.innerHTML = '<tr><td colspan="7">No parsed rows available for this job.</td></tr>';
+      return;
+    }
+    jobsResultRowsBody.innerHTML = rows.map((row) => `
+      <tr>
+        <td>${escapeHtml(row.page_key || '-')}</td>
+        <td>${escapeHtml(`${row.row_index || '-'} / ${row.row_id || '-'}`)}</td>
+        <td>${escapeHtml(row.date || '-')}</td>
+        <td class="transactions-cell-description">${escapeHtml(row.description || '-')}</td>
+        <td>${formatAmount(row.debit)}</td>
+        <td>${formatAmount(row.credit)}</td>
+        <td>${formatAmount(row.balance)}</td>
+      </tr>
+    `).join('');
+  }
+
+  function renderJobsTable(payload = {}) {
+    if (!jobsRowsBody) return;
+    const rows = Array.isArray(payload.rows) ? payload.rows : [];
+    const pagination = payload.pagination && typeof payload.pagination === 'object' ? payload.pagination : {};
+    jobsPage = Number(pagination.page || 1) || 1;
+    jobsTotalPages = Number(pagination.total_pages || 1) || 1;
+    const totalRows = Number(pagination.total_rows || 0) || 0;
+
+    setText(jobsResultCount, pluralize(totalRows, 'job'));
+    if (jobsPageInfo) {
+      jobsPageInfo.textContent = `Page ${jobsPage} of ${jobsTotalPages} • ${totalRows} job(s)`;
+    }
+    if (jobsPrevBtn) jobsPrevBtn.disabled = jobsPage <= 1;
+    if (jobsNextBtn) jobsNextBtn.disabled = jobsPage >= jobsTotalPages;
+
+    if (!rows.length) {
+      jobsRowsBody.innerHTML = '<tr><td colspan="8">No jobs found.</td></tr>';
+      return;
+    }
+
+    jobsRowsBody.innerHTML = rows.map((row) => {
+      const progress = Math.max(0, Math.min(100, Number(row.progress || 0)));
+      const status = String(row.status || '').trim().toLowerCase() || 'unknown';
+      const statusClass = status.replace(/[^a-z0-9_-]/g, '');
+      return `
+        <tr>
+          <td>
+            <strong>${escapeHtml(row.job_id || '-')}</strong>
+            <div class="subtle-id">${escapeHtml(row.created_at || '-')}</div>
+          </td>
+          <td>${formatJobOwner(row)}</td>
+          <td>${escapeHtml(row.original_filename || '-')}</td>
+          <td>
+            <span class="jobs-status-pill jobs-status-${escapeHtml(statusClass)}">${escapeHtml(formatJobStatusLabel(status))}</span>
+            <div class="subtle-id">${escapeHtml(row.step || '-')}</div>
+          </td>
+          <td>${escapeHtml(`${progress}%`)}</td>
+          <td>${escapeHtml(row.parse_mode || row.requested_mode || '-')}</td>
+          <td>${formatTimestamp(row.updated_at)}</td>
+          <td>
+            <button class="ghost-button jobs-view-result-btn" type="button" data-job-id="${escapeHtml(row.job_id || '')}">
+              View Results
+            </button>
+          </td>
+        </tr>
+      `;
+    }).join('');
+  }
+
+  function setJobsLoadingState(message = 'Loading jobs…') {
+    if (jobsRowsBody) {
+      jobsRowsBody.innerHTML = `<tr><td colspan="8">${escapeHtml(message)}</td></tr>`;
+    }
+    setText(jobsResultCount, message === 'Loading jobs…' ? 'Loading…' : 'Unavailable');
+  }
+
+  function buildJobsQuery(page = 1) {
+    const params = new URLSearchParams();
+    params.set('page', String(Math.max(1, Number(page) || 1)));
+    params.set('limit', '20');
+    const jobId = String(jobsFilterJobId?.value || '').trim();
+    const owner = String(jobsFilterOwner?.value || '').trim();
+    const status = String(jobsFilterStatus?.value || '').trim();
+    const query = String(jobsFilterQuery?.value || '').trim();
+    if (jobId) params.set('job_id', jobId);
+    if (query) params.set('q', query);
+    if (owner) params.set('owner', owner);
+    if (status) params.set('status', status);
+    return params;
+  }
+
+  async function loadJobs(page = 1) {
+    if (!jobsRowsBody) return;
+    setJobsLoadingState();
+    clearJobsFeedback();
+    try {
+      const params = buildJobsQuery(page);
+      const payload = await apiJson(`/admin/jobs?${params.toString()}`);
+      renderJobsTable(payload);
+    } catch (err) {
+      setJobsLoadingState('Failed to load jobs.');
+      showJobsFeedback(`Failed to load jobs: ${err.message}`, true);
+    }
+  }
+
+  async function loadJobResult(jobId) {
+    const cleanedJobId = String(jobId || '').trim();
+    if (!cleanedJobId) return;
+    setJobsResultLoadingState(`Loading results for ${cleanedJobId}…`);
+    try {
+      const payload = await apiJson(`/admin/jobs/${encodeURIComponent(cleanedJobId)}/result?limit=50`);
+      const resultPayload = payload && typeof payload === 'object' ? payload : {};
+      const summary = resultPayload.summary && typeof resultPayload.summary === 'object' ? resultPayload.summary : {};
+      const results = resultPayload.results && typeof resultPayload.results === 'object' ? resultPayload.results : {};
+      const rows = Array.isArray(results.rows) ? results.rows : [];
+      const totalRows = Number(results.total_rows || 0) || 0;
+      const ready = Boolean(results.ready);
+      const statusLabel = formatJobStatusLabel(resultPayload.status || '');
+      const ownerLabel = String(resultPayload.owner_username || '').trim() || 'unknown owner';
+      setText(
+        jobsResultMeta,
+        `Job ${cleanedJobId} • ${statusLabel} • ${ownerLabel}`
+      );
+      setText(jobsResultReadyTag, ready ? 'Results Ready' : 'Not Ready');
+      setText(
+        jobsResultRowsMeta,
+        ready
+          ? `Showing ${rows.length} of ${totalRows} row(s).`
+          : 'Results are not available for this job yet.'
+      );
+      renderJobsResultSummary(summary);
+      renderJobsResultRows(rows);
+
+      const downloads = resultPayload.downloads && typeof resultPayload.downloads === 'object' ? resultPayload.downloads : {};
+      const pdfUrl = String(downloads.pdf || '').trim();
+      const excelUrl = String(downloads.excel || '').trim();
+      if (pdfUrl) {
+        jobsResultPdfLink?.classList.remove('hidden');
+        if (jobsResultPdfLink) jobsResultPdfLink.href = pdfUrl;
+      } else {
+        jobsResultPdfLink?.classList.add('hidden');
+      }
+      if (excelUrl) {
+        jobsResultExcelLink?.classList.remove('hidden');
+        if (jobsResultExcelLink) jobsResultExcelLink.href = excelUrl;
+      } else {
+        jobsResultExcelLink?.classList.add('hidden');
+      }
+    } catch (err) {
+      setJobsResultLoadingState(`Failed to load job results: ${err.message}`);
+      showJobsFeedback(`Failed to load job results: ${err.message}`, true);
+    }
   }
 
   function renderTransactionsTable(payload = {}) {
@@ -274,9 +558,7 @@
     clearTransactionsFeedback();
     try {
       const params = buildTransactionsQuery(page);
-      const res = await fetch(`/admin/job-transactions?${params.toString()}`);
-      if (!res.ok) throw new Error(await res.text());
-      const payload = await res.json();
+      const payload = await apiJson(`/admin/job-transactions?${params.toString()}`);
       renderTransactionsTable(payload);
     } catch (err) {
       setTransactionsLoadingState('Failed to load transactions.');
@@ -423,6 +705,7 @@
       if (featureToggleForm) featureToggleForm.style.display = 'none';
       if (flagCodesFilterForm) flagCodesFilterForm.style.display = 'none';
       if (bankCodeFlagsForm) bankCodeFlagsForm.style.display = 'none';
+      if (jobsFilterForm) jobsFilterForm.style.display = 'none';
       if (transactionsFilterForm) transactionsFilterForm.style.display = 'none';
       return false;
     }
@@ -430,9 +713,7 @@
   }
 
   async function loadSettings() {
-    const res = await fetch(`/admin/settings?_=${Date.now()}`, { cache: 'no-store' });
-    if (!res.ok) throw new Error(await res.text());
-    const payload = await res.json();
+    const payload = await apiJson(`/admin/settings?_=${Date.now()}`, { cache: 'no-store' });
     const uploadTestingEnabled = Boolean(payload.upload_testing_enabled);
     if (uploadTestingToggle) uploadTestingToggle.checked = uploadTestingEnabled;
     updateUploadTestingState(uploadTestingEnabled);
@@ -455,12 +736,11 @@
         username: String(document.getElementById('evUsername')?.value || '').trim(),
         password: String(document.getElementById('evPassword')?.value || '')
       };
-      const res = await fetch('/admin/evaluators', {
+      await apiJson('/admin/evaluators', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       });
-      if (!res.ok) throw new Error(await res.text());
       showCreateFeedback(`Evaluator "${payload.username}" created.`);
       createForm.reset();
     } catch (err) {
@@ -477,12 +757,11 @@
     e.preventDefault();
     try {
       const enabled = Boolean(uploadTestingToggle?.checked);
-      const res = await fetch('/admin/settings/upload-testing', {
+      await apiJson('/admin/settings/upload-testing', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ enabled })
       });
-      if (!res.ok) throw new Error(await res.text());
       updateUploadTestingState(enabled);
       showFeatureFeedback(`Upload testing section ${enabled ? 'enabled' : 'disabled'}.`);
     } catch (err) {
@@ -541,13 +820,11 @@
       if (!rows.length) {
         throw new Error('Please add at least one bank with at least one code.');
       }
-      const res = await fetch('/admin/settings/bank-code-flags', {
+      const payload = await apiJson('/admin/settings/bank-code-flags', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ rows })
       });
-      if (!res.ok) throw new Error(await res.text());
-      const payload = await res.json();
       const updatedRows = Array.isArray(payload.bank_code_flag_rows)
         ? payload.bank_code_flag_rows.map((item) => ({
           bank_id: String(item?.bank_id || ''),
@@ -561,6 +838,43 @@
       showBankCodeFeedback(`Saved ${updatedRows.length} flag code row(s).`);
     } catch (err) {
       showBankCodeFeedback(`Failed to save bank code flags: ${err.message}`, true);
+    }
+  });
+
+  jobsFilterForm?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    await loadJobs(1);
+  });
+
+  resetJobsFiltersBtn?.addEventListener('click', async () => {
+    if (jobsFilterJobId) jobsFilterJobId.value = '';
+    if (jobsFilterOwner) jobsFilterOwner.value = '';
+    if (jobsFilterStatus) jobsFilterStatus.value = '';
+    if (jobsFilterQuery) jobsFilterQuery.value = '';
+    await loadJobs(1);
+  });
+
+  jobsPrevBtn?.addEventListener('click', async () => {
+    if (jobsPage <= 1) return;
+    await loadJobs(jobsPage - 1);
+  });
+
+  jobsNextBtn?.addEventListener('click', async () => {
+    if (jobsPage >= jobsTotalPages) return;
+    await loadJobs(jobsPage + 1);
+  });
+
+  jobsRowsBody?.addEventListener('click', async (e) => {
+    const target = e.target;
+    if (!(target instanceof HTMLElement)) return;
+    const btn = target.closest('.jobs-view-result-btn');
+    if (!(btn instanceof HTMLElement)) return;
+    const jobId = String(btn.dataset.jobId || '').trim();
+    if (!jobId) return;
+    const url = `/processing?job-id=${encodeURIComponent(jobId)}`;
+    const opened = window.open(url, '_blank', 'noopener,noreferrer');
+    if (!opened) {
+      window.location.href = url;
     }
   });
 
@@ -594,9 +908,7 @@
   confirmClearBtn?.addEventListener('click', async () => {
     closeConfirmModal();
     try {
-      const res = await fetch('/admin/clear-store', { method: 'POST' });
-      if (!res.ok) throw new Error(await res.text());
-      const payload = await res.json();
+      const payload = await apiJson('/admin/clear-store', { method: 'POST' });
       try {
         window.localStorage.removeItem(UPLOADS_CACHE_KEY);
       } catch (_err) {
@@ -605,6 +917,8 @@
       show(
         `Cleared ${payload.cleared_jobs} jobs, ${payload.cleared_exports} exports, and ${payload.cleared_db_rows} DB rows.`
       );
+      setJobsResultLoadingState('Select a job above to view parsed results.');
+      await loadJobs(1);
       await loadTransactions(1);
     } catch (err) {
       show(`Failed to clear store: ${err.message}`, true);
@@ -632,11 +946,12 @@
 
   const initialTab = String(window.location.hash || '').replace(/^#/, '') || 'accounts';
   setActiveTab(initialTab, { updateHash: false });
+  setJobsResultLoadingState('Select a job above to view parsed results.');
 
   requireAdmin()
     .then((ok) => {
       if (!ok) return;
-      return loadSettings().then(() => loadTransactions(1));
+      return loadSettings().then(() => Promise.all([loadJobs(1), loadTransactions(1)]));
     })
     .catch(() => show('Failed to verify admin session.', true));
 })();

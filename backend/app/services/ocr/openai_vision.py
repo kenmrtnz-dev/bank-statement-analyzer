@@ -16,6 +16,9 @@ import httpx
 from PIL import Image
 from redis import Redis
 
+from app.paths import get_data_dir
+from app.settings import load_settings
+
 SYSTEM_PROMPT = (
     "You are a high-accuracy OCR engine. Extract text exactly as written. "
     "Do not summarize. Preserve numbers, dates, spacing, and formatting."
@@ -146,7 +149,7 @@ class OpenAIVisionOCR:
 
         model = str(os.getenv("OPENAI_OCR_MODEL", "gpt-4o-mini")).strip() or "gpt-4o-mini"
         timeout_seconds = _env_int("OPENAI_TIMEOUT_SECONDS", 60)
-        data_dir = Path(os.getenv("DATA_DIR", "./data"))
+        data_dir = get_data_dir()
         cache_dir = Path(os.getenv("OPENAI_OCR_CACHE_DIR", str(data_dir / "ocr_cache")))
         base_url = str(os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")).strip()
         if not base_url:
@@ -943,9 +946,9 @@ class OpenAIVisionOCR:
         if self._rate_redis_init_failed:
             return None
         try:
-            redis_url = str(os.getenv("REDIS_URL", os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0"))).strip()
+            redis_url = load_settings().celery_broker_url
             if not redis_url:
-                redis_url = "redis://redis:6379/0"
+                raise RuntimeError("redis_url_missing")
             self._rate_redis = Redis.from_url(redis_url, decode_responses=True, socket_timeout=5, socket_connect_timeout=5)
             self._rate_redis.ping()
             return self._rate_redis

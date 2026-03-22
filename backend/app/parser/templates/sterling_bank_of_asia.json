@@ -1,0 +1,11 @@
+{
+  "bank": "sterling_bank_of_asia",
+  "columns": {
+    "row_number": [0, 80],
+    "date": [81, 220],
+    "credit": [221, 330],
+    "debit": [331, 470],
+    "balance": [471, 620],
+    "description": [621, 750]
+  }
+}

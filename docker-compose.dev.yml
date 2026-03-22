@@ -1,0 +1,23 @@
+services:
+  api:
+    environment:
+      DATA_DIR: /data
+    volumes:
+      - .:/app
+      - ocr_data:/data
+    command: >
+      sh -c "uvicorn app.main:app
+      --app-dir backend
+      --host 0.0.0.0
+      --port 8000
+      --proxy-headers
+      --reload"
+
+  worker:
+    environment:
+      DATA_DIR: /data
+    volumes:
+      - .:/app
+      - ocr_data:/data
+    command: >
+      sh -c "PYTHONPATH=backend ./scripts/run-worker.sh"

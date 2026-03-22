@@ -140,6 +140,15 @@
       "balance_tokens": ["balance", "ending balance", "closing balance", "running balance"],
       "date_order": ["mdy", "dmy", "ymd"],
       "noise_tokens": ["balance brought forward", "period covered", "available balance"]
+    },
+    "AUTO_BUSINESS_BANKING_GROWIDE": {
+      "date_tokens": ["posting date", "date"],
+      "description_tokens": ["branch description", "description"],
+      "debit_tokens": ["debit"],
+      "credit_tokens": ["credit"],
+      "balance_tokens": ["running balance", "balance"],
+      "date_order": ["mdy", "dmy", "ymd"],
+      "noise_tokens": ["page ", "period covered", "printed by", "requested date", "account alias", "currency", "check number"]
     }
   },
   "detection_rules": [
@@ -211,6 +220,11 @@
       "profile": "AUB",
       "contains_any": [],
       "contains_all": ["period coverage", "check no."]
+    },
+    {
+      "profile": "AUTO_BUSINESS_BANKING_GROWIDE",
+      "contains_any": [],
+      "contains_all": ["business banking", "branch description", "running balance", "check number"]
     }
   ]
 }

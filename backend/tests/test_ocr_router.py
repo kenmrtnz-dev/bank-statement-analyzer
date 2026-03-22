@@ -27,10 +27,10 @@ def test_resolve_document_parse_mode_prefers_text_when_avg_chars_high(monkeypatc
         return _FakeReader(_path, [_FakePage("A" * 400), _FakePage("B" * 360)])
 
     monkeypatch.setattr(router, "PdfReader", _reader)
-    assert router.resolve_document_parse_mode(str(pdf), "auto") == "text"
+    assert router.resolve_document_parse_mode(str(pdf), "auto") == "pdftotext"
 
 
-def test_resolve_document_parse_mode_uses_ocr_when_text_is_low(monkeypatch, tmp_path: Path):
+def test_resolve_document_parse_mode_uses_google_vision_when_text_is_low(monkeypatch, tmp_path: Path):
     pdf = tmp_path / "scan.pdf"
     pdf.write_bytes(b"%PDF-1.4\n%%EOF")
 
@@ -38,17 +38,59 @@ def test_resolve_document_parse_mode_uses_ocr_when_text_is_low(monkeypatch, tmp_
         return _FakeReader(_path, [_FakePage("tiny"), _FakePage("")])
 
     monkeypatch.setattr(router, "PdfReader", _reader)
-    assert router.resolve_document_parse_mode(str(pdf), "auto") == "ocr"
+    assert router.resolve_document_parse_mode(str(pdf), "auto") == "google_vision"
+
+
+def test_resolve_document_parse_mode_maps_forced_ocr_to_google_vision(tmp_path: Path):
+    pdf = tmp_path / "scan.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n%%EOF")
+    assert router.resolve_document_parse_mode(str(pdf), "ocr") == "google_vision"
+
+
+def test_resolve_document_parse_mode_respects_forced_google_vision(tmp_path: Path):
+    pdf = tmp_path / "scan.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n%%EOF")
+    assert router.resolve_document_parse_mode(str(pdf), "google_vision") == "google_vision"
+
+
+def test_resolve_document_parse_mode_respects_forced_pdftotext(tmp_path: Path):
+    pdf = tmp_path / "digital.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n%%EOF")
+    assert router.resolve_document_parse_mode(str(pdf), "pdftotext") == "pdftotext"
+
+
+def test_resolve_document_parse_mode_maps_forced_text_to_pdftotext(tmp_path: Path):
+    pdf = tmp_path / "digital.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n%%EOF")
+    assert router.resolve_document_parse_mode(str(pdf), "text") == "pdftotext"
 
 
 def test_openai_selected_even_when_page_count_exceeds_previous_limit(monkeypatch):
-    class _DummyOpenAIClient:
+    class _DummyGoogleVisionClient:
         pass
 
-    monkeypatch.setattr(router.OpenAIVisionOCR, "from_env", staticmethod(lambda: _DummyOpenAIClient()))
+    monkeypatch.setattr(router.GoogleVisionOCR, "from_env", staticmethod(lambda: _DummyGoogleVisionClient()))
     selected = router.build_scanned_ocr_router(page_count=75)
-    assert selected.engine_name == "openai_vision"
-    assert selected.openai_client is not None
+    assert selected.engine_name == "google_vision"
+    assert selected.openai_client is None
+
+
+def test_apple_vision_fallback_selected_when_google_vision_missing(monkeypatch):
+    class _DummyAppleClient:
+        pass
+
+    monkeypatch.setattr(
+        router.GoogleVisionOCR,
+        "from_env",
+        staticmethod(lambda: (_ for _ in ()).throw(RuntimeError("google_vision_not_configured"))),
+    )
+    monkeypatch.setattr(router.AppleVisionOCR, "is_available", staticmethod(lambda: True))
+    monkeypatch.setattr(router.AppleVisionOCR, "from_env", staticmethod(lambda: _DummyAppleClient()))
+
+    selected = router.build_scanned_ocr_router(page_count=5)
+
+    assert selected.engine_name == "apple_vision"
+    assert selected.openai_client is None
 
 
 def test_plain_text_to_ocr_items_shapes_tokens():

@@ -1,0 +1,15 @@
+{
+  "name": "bank-statement-analyzer-e2e",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:e2e": "playwright test",
+    "test:e2e:headed": "playwright test --headed",
+    "test:e2e:report": "playwright show-report",
+    "test:e2e:live": "E2E_RUN_LIVE=1 playwright test e2e/integration-live.spec.ts"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.58.2"
+  }
+}

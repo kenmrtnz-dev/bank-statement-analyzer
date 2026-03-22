@@ -13,8 +13,13 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-if os.getenv("DATABASE_URL"):
-    config.set_main_option("sqlalchemy.url", os.getenv("DATABASE_URL"))
+database_url = str(os.getenv("DATABASE_URL") or "").strip()
+if database_url:
+    config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
+else:
+    raise RuntimeError(
+        "DATABASE_URL is required for Alembic migrations."
+    )
 
 target_metadata = Base.metadata
 
