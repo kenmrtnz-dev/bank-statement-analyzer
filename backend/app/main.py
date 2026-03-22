@@ -16,6 +16,7 @@ from app.jobs.repository import ensure_job_pages_schema, ensure_job_results_raw_
 from app.jobs.router import router as jobs_router
 from app.paths import get_data_dir
 from app.settings import load_settings
+from app.volume.router import router as volume_router
 
 DATA_DIR = get_data_dir()
 
@@ -52,6 +53,7 @@ def create_app() -> FastAPI:
     app.include_router(jobs_router)
     app.include_router(crm_router)
     app.include_router(admin_router)
+    app.include_router(volume_router)
 
     return app
 

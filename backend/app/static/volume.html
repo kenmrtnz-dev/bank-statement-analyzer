@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Volume Upload · Bank Statement Analyzer</title>
+    <link rel="stylesheet" href="/static/volume.css?v=20260323a" />
+  </head>
+  <body>
+    <main class="volume-page">
+      <section class="volume-shell">
+        <header class="volume-header">
+          <div>
+            <p class="volume-kicker">Bulk Volume Testing</p>
+            <h1>Upload a document set</h1>
+            <p class="volume-copy">
+              Add a required set name, attach multiple documents, and save them under
+              <code>/storage/&lt;set_name&gt;</code>.
+            </p>
+          </div>
+          <a class="back-link" href="/uploads">Back to Uploads</a>
+        </header>
+
+        <section class="volume-card">
+          <form id="volumeUploadForm" class="volume-form">
+            <label for="setName">
+              Set Name
+              <input id="setName" name="set_name" type="text" required placeholder="e.g. march-bulk-run" />
+            </label>
+
+            <label for="bulkFiles">
+              Files
+              <input id="bulkFiles" name="files" type="file" multiple required />
+            </label>
+
+            <div class="file-summary">
+              <strong id="fileCountLabel">No files selected</strong>
+              <ul id="fileList" class="file-list"></ul>
+            </div>
+
+            <div class="form-actions">
+              <button id="volumeSubmitBtn" type="submit">Upload Files</button>
+            </div>
+          </form>
+
+          <div id="volumeSuccess" class="message success hidden" aria-live="polite"></div>
+          <div id="volumeError" class="message error hidden" aria-live="polite"></div>
+        </section>
+
+        <section class="volume-card">
+          <div class="sets-header">
+            <div>
+              <h2>Saved Sets</h2>
+              <p class="sets-copy">Browse uploaded sets and download each set as a zip archive.</p>
+            </div>
+            <button id="refreshSetsBtn" type="button" class="secondary-btn">Refresh List</button>
+          </div>
+
+          <div id="setsEmptyState" class="sets-empty-state hidden">
+            <p>No saved sets yet.</p>
+            <small>Uploaded sets will appear here for zip download.</small>
+          </div>
+
+          <div id="setsTableWrap" class="sets-table-wrap hidden">
+            <table class="sets-table">
+              <thead>
+                <tr>
+                  <th>Set Name</th>
+                  <th>Files</th>
+                  <th>Total Size</th>
+                  <th>Updated</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody id="setsTableBody"></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+    </main>
+    <script id="volumeInitialSets" type="application/json">__VOLUME_INITIAL_SETS__</script>
+    <script src="/static/volume.js?v=20260323b"></script>
+  </body>
+</html>
