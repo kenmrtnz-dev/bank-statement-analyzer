@@ -10,3 +10,4 @@ frontend/node_modules
 frontend/dist
 storage/*
 !storage/.gitkeep
+E2E_WORKFLOW_BREAKDOWN.md
