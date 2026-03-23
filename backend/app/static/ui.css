@@ -34,17 +34,17 @@ body {
 }
 
 .app-shell {
-  width: min(1280px, calc(100% - 24px));
+  width: 100%;
   max-width: 100%;
-  margin: 18px auto;
+  margin: 0;
   background: var(--panel);
-  border: 1px solid #d7d9e7;
-  border-radius: 24px;
+  border: 0;
+  border-radius: 0;
   overflow: hidden;
   display: block;
-  min-height: calc(100vh - 36px);
+  min-height: 100vh;
   box-sizing: border-box;
-  box-shadow: 0 20px 64px rgba(24, 33, 56, 0.12);
+  box-shadow: none;
 }
 
 .app-header {
@@ -180,9 +180,9 @@ body {
 }
 
 .workspace {
-  padding: 10px 16px 16px;
+  padding: 0;
   display: grid;
-  gap: 10px;
+  gap: 0;
   align-content: start;
   width: 100%;
   max-width: 100%;
@@ -192,7 +192,7 @@ body {
 
 .view-pane {
   display: grid;
-  gap: 8px;
+  gap: 0;
   width: 100%;
   max-width: 100%;
   min-width: 0;
@@ -204,10 +204,13 @@ body {
 
 .card {
   background: var(--card);
-  border: 1px solid var(--line);
-  border-radius: 14px;
+  border-top: 1px solid var(--line);
+  border-right: 0;
+  border-bottom: 1px solid var(--line);
+  border-left: 0;
+  border-radius: 0;
   padding: 12px;
-  box-shadow: 0 6px 16px rgba(27, 36, 58, 0.07);
+  box-shadow: none;
 }
 
 .topbar {
@@ -1748,7 +1751,7 @@ td {
 
 @media (max-width: 920px) {
   .workspace {
-    padding: 14px;
+    padding: 0;
   }
 
   h1 {

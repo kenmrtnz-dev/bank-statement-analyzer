@@ -67,9 +67,10 @@ def test_get_summary_recomputes_when_cached_summary_is_missing_new_fields(monkey
         refreshed = get_summary(job_id)
         assert "monthly_credit_average" in refreshed
         assert "monthly_disposable_income" in refreshed
+        assert refreshed["summary_version"] == 2
         assert refreshed["monthly_credit_average"] == 600.0
         assert refreshed["monthly_disposable_income"] == 180.0
-        assert refreshed["adb"] == round(600.0 / 31.0, 2)
+        assert refreshed["adb"] == 600.0
         assert refreshed["monthly"][0]["credit_count"] == 1
         assert refreshed["monthly"][0]["debit_count"] == 0
     finally:

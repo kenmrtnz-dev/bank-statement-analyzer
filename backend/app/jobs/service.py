@@ -24,6 +24,7 @@ from PIL import Image
 from pypdf import PdfReader
 
 from app.bank_profiles import detect_bank_profile
+from app.json_utils import make_json_safe
 from app.jobs.repository import JobResultsRawRepository, JobStateRepository, JobsRepository, JobTransactionsRepository
 from app.ocr import prepare_ocr_pages, process_ocr_page, resolve_parse_mode
 from app.ocr.pipeline import (
@@ -640,7 +641,7 @@ def get_parse_diagnostics(job_id: str) -> Dict:
     if not path.exists():
         raise HTTPException(status_code=404, detail="parse_diagnostics_not_ready")
     payload = repo.read_json(path, default={})
-    return payload if isinstance(payload, dict) else {}
+    return make_json_safe(payload) if isinstance(payload, dict) else {}
 
 
 def export_pdf(job_id: str) -> tuple[bytes, str]:
@@ -1805,6 +1806,8 @@ def _flatten_rows(rows_by_page: Dict[str, List[Dict]]) -> List[Dict]:
 def _summary_needs_refresh(summary: Dict[str, Any]) -> bool:
     if not isinstance(summary, dict):
         return True
+    if summary.get("summary_version") != 2:
+        return True
     if "monthly_credit_average" not in summary or "monthly_disposable_income" not in summary:
         return True
     monthly = summary.get("monthly")
@@ -2329,9 +2332,8 @@ def compute_summary(rows: List[Dict]) -> Dict:
                 "credit": 0.0,
                 "debit_count": 0,
                 "credit_count": 0,
-                "days_in_month": days_in_month,
-                "last_balance_date": None,
-                "last_balance": None,
+                "balance_sum": 0.0,
+                "balance_count": 0,
             },
         )
         if debit is not None:
@@ -2342,18 +2344,16 @@ def compute_summary(rows: List[Dict]) -> Dict:
             bucket["credit"] += abs(credit)
             if abs(credit) > 0:
                 bucket["credit_count"] += 1
-        if balance is not None and (
-            bucket["last_balance_date"] is None or date >= bucket["last_balance_date"]
-        ):
-            bucket["last_balance_date"] = date
-            bucket["last_balance"] = balance
+        if balance is not None:
+            bucket["balance_sum"] += balance
+            bucket["balance_count"] += 1
 
     monthly_rows = []
     for key in sorted(monthly.keys()):
         item = monthly[key]
-        last_balance = _to_float(item.get("last_balance"))
-        days_in_month = int(item.get("days_in_month") or 0)
-        monthly_adb = (last_balance / days_in_month) if last_balance is not None and days_in_month > 0 else 0.0
+        balance_sum = _to_float(item.get("balance_sum")) or 0.0
+        balance_count = int(item.get("balance_count") or 0)
+        monthly_adb = (balance_sum / balance_count) if balance_count > 0 else 0.0
         monthly_rows.append(
             {
                 "month": key,
@@ -2376,6 +2376,7 @@ def compute_summary(rows: List[Dict]) -> Dict:
     )
 
     return {
+        "summary_version": 2,
         "total_transactions": tx_count,
         "debit_transactions": debit_count,
         "credit_transactions": credit_count,

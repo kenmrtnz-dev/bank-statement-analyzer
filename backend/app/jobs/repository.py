@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.exc import OperationalError
 
 from app.infra.db.models import BankCodeFlagRecord, Base, JobPageRecord, JobRecord, JobResultRawRecord, TransactionRecord
+from app.json_utils import json_default, make_json_safe
 from app.settings import load_settings
 
 _DB_ENGINE_CACHE: dict[str, Engine] = {}
@@ -62,6 +63,7 @@ class JobsRepository:
     def write_json(self, path: Path, payload: Any):
         """Write JSON atomically by replacing the target file after a temp-file flush."""
         path.parent.mkdir(parents=True, exist_ok=True)
+        safe_payload = make_json_safe(payload)
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
@@ -70,7 +72,7 @@ class JobsRepository:
             suffix=".tmp",
             delete=False,
         ) as handle:
-            json.dump(payload, handle, indent=2, default=_json_default)
+            json.dump(safe_payload, handle, indent=2, default=json_default, allow_nan=False)
             tmp = Path(handle.name)
         os.replace(tmp, path)
 
@@ -345,14 +347,6 @@ def _to_decimal(value: Any) -> Decimal | None:
         return Decimal(cleaned)
     except (InvalidOperation, ValueError):
         return None
-
-
-def _json_default(value: Any) -> Any:
-    """Normalize non-standard numeric types before JSON serialization."""
-    if isinstance(value, Decimal):
-        # Keep JSON numeric values while handling Decimal instances from parser diagnostics.
-        return float(value)
-    raise TypeError(f"Object of type {value.__class__.__name__} is not JSON serializable")
 
 
 def _to_float(value: Any) -> float | None:

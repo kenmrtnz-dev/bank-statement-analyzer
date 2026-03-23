@@ -1,7 +1,5 @@
 from pathlib import Path
 
-import pytest
-
 from app.services.ocr import router
 from app.services.ocr.openai_vision import plain_text_to_ocr_items
 
@@ -72,24 +70,6 @@ def test_openai_selected_even_when_page_count_exceeds_previous_limit(monkeypatch
     monkeypatch.setattr(router.GoogleVisionOCR, "from_env", staticmethod(lambda: _DummyGoogleVisionClient()))
     selected = router.build_scanned_ocr_router(page_count=75)
     assert selected.engine_name == "google_vision"
-    assert selected.openai_client is None
-
-
-def test_apple_vision_fallback_selected_when_google_vision_missing(monkeypatch):
-    class _DummyAppleClient:
-        pass
-
-    monkeypatch.setattr(
-        router.GoogleVisionOCR,
-        "from_env",
-        staticmethod(lambda: (_ for _ in ()).throw(RuntimeError("google_vision_not_configured"))),
-    )
-    monkeypatch.setattr(router.AppleVisionOCR, "is_available", staticmethod(lambda: True))
-    monkeypatch.setattr(router.AppleVisionOCR, "from_env", staticmethod(lambda: _DummyAppleClient()))
-
-    selected = router.build_scanned_ocr_router(page_count=5)
-
-    assert selected.engine_name == "apple_vision"
     assert selected.openai_client is None
 
 

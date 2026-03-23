@@ -14,6 +14,7 @@ from pdf2image import convert_from_path, pdfinfo_from_path
 from PIL import Image
 
 from app.bank_profiles import detect_bank_profile
+from app.json_utils import json_default, make_json_safe
 from app.pdf_text_extract import extract_pdf_layout_pages
 from app.services.ocr.router import (
     build_scanned_ocr_router,
@@ -1112,5 +1113,5 @@ def _write_json_atomic(path: Path, payload):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     with open(tmp_path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2)
+        json.dump(make_json_safe(payload), handle, indent=2, default=json_default, allow_nan=False)
     os.replace(tmp_path, path)
