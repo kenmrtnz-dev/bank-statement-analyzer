@@ -8,6 +8,7 @@ import calendar
 import fcntl
 import io
 import json
+import logging
 import math
 import os
 import threading
@@ -34,12 +35,20 @@ from app.ocr.pipeline import (
     _last_row_date,
     _ocr_items_to_words,
     _repair_page_flow_columns,
+    resolve_ocr_page_path,
 )
 from app.paths import get_data_dir
 from app.pdf_text_extract import extract_pdf_layout_pages, extract_pdf_layout_xml, layout_page_to_json_payload
+from app.services.openai_page_fix import (
+    OpenAIPageFixError,
+    OpenAIPageFixNotConfiguredError,
+    is_openai_page_fix_available,
+    repair_page_rows_with_openai,
+)
 from app.statement_parser import normalize_date, parse_page_with_profile_fallback
 
 DATA_DIR = get_data_dir()
+logger = logging.getLogger(__name__)
 FALLBACK_PREVIEW_DPI = int(os.getenv("FALLBACK_PREVIEW_DPI", "130"))
 PREVIEW_MAX_PIXELS = int(os.getenv("PREVIEW_MAX_PIXELS", "6000000"))
 _ACTIVE_CELERY_STATES = {"PENDING", "RECEIVED", "STARTED", "RETRY"}
@@ -49,6 +58,7 @@ _JOB_UPDATE_LOCKS: Dict[str, threading.Lock] = {}
 _JOB_UPDATE_LOCKS_GUARD = threading.Lock()
 _SUPPORTED_PARSE_MODES = {"auto", "text", "ocr", "google_vision", "pdftotext"}
 _SUPPORTED_GOOGLE_VISION_PARSERS = {"auto", "sterling_bank_of_asia", "bdo", "generic"}
+_SUPPORTED_ROW_TYPES = {"transaction", "balance_only", "opening_balance", "closing_balance"}
 
 
 def _normalize_export_business_name(raw: str | None) -> str:
@@ -314,7 +324,7 @@ def get_status(job_id: str) -> Dict:
             job_state_repo.sync_job(job_id=job_id, meta=meta, status=status if isinstance(status, dict) else {})
             job_state = job_state_repo.get_job(job_id) or {}
     if not status:
-        return {"status": "queued", "step": "queued", "progress": 0, **job_state}
+        return _augment_runtime_features({"status": "queued", "step": "queued", "progress": 0, **job_state})
 
     def _merge_job_state_fields(target: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(target, dict):
@@ -324,7 +334,7 @@ def get_status(job_id: str) -> Dict:
         if job_state.get("process_end") and not target.get("process_end"):
             target["process_end"] = job_state["process_end"]
         target["is_reversed"] = bool(job_state.get("is_reversed", False))
-        return target
+        return _augment_runtime_features(target)
 
     payload = dict(status)
     parse_mode = str(payload.get("parse_mode") or "auto")
@@ -380,6 +390,13 @@ def get_status(job_id: str) -> Dict:
 
     payload["progress"] = _coerce_progress(payload.get("progress"), 0)
     return _merge_job_state_fields(payload)
+
+
+def _augment_runtime_features(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return payload
+    payload["page_ai_fix_enabled"] = is_openai_page_fix_available()
+    return payload
 
 
 def set_job_reversed(job_id: str, is_reversed: bool) -> Dict[str, Any]:
@@ -439,6 +456,10 @@ def get_cleaned_path(job_id: str, filename: str) -> Path:
     if path.exists():
         return path
 
+    rendered_path = repo.path(job_id, "pages", filename)
+    if rendered_path.exists():
+        return rendered_path
+
     generated = _generate_preview_page_if_missing(repo, job_id, filename, path)
     if generated:
         return path
@@ -458,6 +479,10 @@ def get_preview_path(job_id: str, page: str) -> Path:
     cleaned_path = repo.path(job_id, "cleaned", filename)
     if cleaned_path.exists():
         return cleaned_path
+
+    rendered_path = repo.path(job_id, "pages", filename)
+    if rendered_path.exists():
+        return rendered_path
 
     preview_path = repo.path(job_id, "preview", filename)
     if preview_path.exists():
@@ -522,6 +547,103 @@ def get_page_rows(job_id: str, page: str) -> List[Dict]:
     return rows.get(page_name, [])
 
 
+def _normalize_page_row_payload_item(row: Dict[str, Any], idx: int) -> Dict[str, Any]:
+    row_id = str(row.get("row_id") or "").strip() or f"{idx:03}"
+    normalized_rownumber = _normalize_row_number_output(
+        row.get("rownumber"),
+        fallback=row.get("row_number"),
+    )
+    row_type = str(row.get("row_type") or "transaction").strip().lower() or "transaction"
+    if row_type not in _SUPPORTED_ROW_TYPES:
+        row_type = "transaction"
+    return {
+        "row_id": row_id,
+        "rownumber": normalized_rownumber,
+        "row_number": _normalize_row_cell(row.get("row_number")) or (str(normalized_rownumber) if normalized_rownumber is not None else ""),
+        "date": _normalize_row_date_for_output(row.get("date")),
+        "description": _normalize_row_cell(row.get("description")),
+        "debit": _normalize_row_amount_output(row.get("debit")),
+        "credit": _normalize_row_amount_output(row.get("credit")),
+        "balance": _normalize_row_amount_output(row.get("balance")),
+        "row_type": row_type,
+    }
+
+
+def _normalize_page_rows_payload(rows: List[Dict]) -> List[Dict]:
+    normalized_rows: List[Dict] = []
+    for idx, row in enumerate(rows, start=1):
+        if not isinstance(row, dict):
+            raise HTTPException(status_code=400, detail="invalid_row_item")
+        normalized_rows.append(_normalize_page_row_payload_item(row, idx))
+    return normalized_rows
+
+
+def _load_page_ai_fix_raw_payload(repo: JobsRepository, job_id: str, page_name: str) -> tuple[str, Any]:
+    parsed_repo = JobTransactionsRepository(DATA_DIR)
+    page_metadata_by_page = parsed_repo.get_page_metadata_by_job(job_id)
+    page_metadata = page_metadata_by_page.get(page_name) or {}
+    raw_result = page_metadata.get("raw_result")
+    if isinstance(raw_result, (dict, list)):
+        return "page_raw_result", raw_result
+
+    raw_path = _page_raw_result_path(repo, job_id, page_name)
+    if raw_path.exists():
+        payload = repo.read_json(raw_path, default=None)
+        if isinstance(payload, (dict, list)):
+            return "page_raw_result_file", payload
+
+    return "none", {}
+
+
+def get_page_ai_fix(job_id: str, page: str) -> Dict[str, Any]:
+    repo = JobsRepository(DATA_DIR)
+    _require_job(repo, job_id)
+
+    page_name = normalize_page_name(page)
+    if not page_name:
+        raise HTTPException(status_code=400, detail="invalid_page")
+    if not is_openai_page_fix_available():
+        raise HTTPException(status_code=503, detail="page_ai_fix_unavailable")
+
+    parsed_rows = get_page_rows(job_id, page_name)
+    raw_source, raw_payload = _load_page_ai_fix_raw_payload(repo, job_id, page_name)
+    preview_path = get_preview_path(job_id, page_name)
+
+    try:
+        proposal = repair_page_rows_with_openai(
+            page_name=page_name,
+            parsed_rows=parsed_rows,
+            raw_payload=raw_payload,
+            raw_source=raw_source,
+            image_path=preview_path,
+        )
+    except OpenAIPageFixNotConfiguredError as exc:
+        raise HTTPException(status_code=503, detail=str(exc) or "page_ai_fix_unavailable") from exc
+    except OpenAIPageFixError as exc:
+        raise HTTPException(status_code=502, detail=str(exc) or "page_ai_fix_failed") from exc
+
+    normalized_rows = _normalize_page_rows_payload(proposal.get("rows") or [])
+    summary = proposal.get("summary") if isinstance(proposal.get("summary"), dict) else {}
+    return {
+        "page": page_name,
+        "inputs_used": {
+            "has_image": True,
+            "raw_source": raw_source,
+            "parsed_row_count": len(parsed_rows),
+        },
+        "proposal": {
+            "rows": normalized_rows,
+            "summary": {
+                "changed": bool(summary.get("changed", False)),
+                "issues_found": [str(item).strip() for item in summary.get("issues_found", [])]
+                if isinstance(summary.get("issues_found"), list)
+                else [],
+                "rationale": str(summary.get("rationale") or "").strip(),
+            },
+        },
+    }
+
+
 def get_all_rows(job_id: str) -> Dict[str, List[Dict]]:
     repo = JobsRepository(DATA_DIR)
     _require_job(repo, job_id)
@@ -539,26 +661,7 @@ def update_page_rows(job_id: str, page: str, rows: List[Dict]) -> Dict:
     if not isinstance(rows, list):
         raise HTTPException(status_code=400, detail="invalid_rows_payload")
 
-    normalized_rows: List[Dict] = []
-    for idx, row in enumerate(rows, start=1):
-        if not isinstance(row, dict):
-            raise HTTPException(status_code=400, detail="invalid_row_item")
-        row_id = str(row.get("row_id") or "").strip() or f"{idx:03}"
-        normalized_rows.append(
-            {
-                "row_id": row_id,
-                "rownumber": _normalize_row_number_output(
-                    row.get("rownumber"),
-                    fallback=row.get("row_number"),
-                ),
-                "row_number": _normalize_row_cell(row.get("row_number")),
-                "date": _normalize_row_date_for_output(row.get("date")),
-                "description": _normalize_row_cell(row.get("description")),
-                "debit": _normalize_row_amount_output(row.get("debit")),
-                "credit": _normalize_row_amount_output(row.get("credit")),
-                "balance": _normalize_row_amount_output(row.get("balance")),
-            }
-        )
+    normalized_rows = _normalize_page_rows_payload(rows)
 
     lock = _get_job_update_lock(job_id)
     with lock:
@@ -729,6 +832,7 @@ def _start_job_worker(job_id: str, parse_mode: str) -> bool:
 
 def process_job(job_id: str, parse_mode: str, task_id: Optional[str] = None) -> Dict[str, Any]:
     """Execute a job: parse inline for text PDFs or enqueue per-page OCR work."""
+    started_at = dt.datetime.now(dt.timezone.utc)
     repo = JobsRepository(DATA_DIR)
     _require_job(repo, job_id)
     root = repo.job_dir(job_id)
@@ -760,9 +864,15 @@ def process_job(job_id: str, parse_mode: str, task_id: Optional[str] = None) -> 
     manifest = _load_pages_manifest(repo, job_id)
     page_files = manifest.get("pages") if isinstance(manifest.get("pages"), list) else []
     if not page_files:
-        # Generate cleaned page images once, then reuse the manifest on retries.
+        # Generate page images once, then reuse the manifest on retries.
         page_files = prepare_ocr_pages(input_pdf=input_pdf, pages_dir=pages_dir, cleaned_dir=cleaned_dir, report=report)
         _write_pages_manifest(repo, job_id, page_files)
+        logger.info(
+            "Job %s prepared %s page images in %sms before enqueue.",
+            job_id,
+            len(page_files),
+            int((dt.datetime.now(dt.timezone.utc) - started_at).total_seconds() * 1000),
+        )
     page_routing = _prepare_page_routing_inputs(
         repo=repo,
         job_id=job_id,
@@ -808,6 +918,7 @@ def process_job(job_id: str, parse_mode: str, task_id: Optional[str] = None) -> 
     _write_page_status_map(repo, job_id, page_status)
 
     # Only pages still missing successful fragments are queued for OCR work.
+    enqueue_started = dt.datetime.now(dt.timezone.utc)
     for page_name in pending_pages:
         page_payload = page_status.get(page_name) or {}
         page_index = int(page_payload.get("page_index") or 1)
@@ -824,6 +935,13 @@ def process_job(job_id: str, parse_mode: str, task_id: Optional[str] = None) -> 
         page_status[page_name] = page_payload
         active_task_ids.append(task_id_page)
     _write_page_status_map(repo, job_id, page_status)
+    logger.info(
+        "Job %s queued %s pending page tasks in %sms (%s total pages).",
+        job_id,
+        len(pending_pages),
+        int((dt.datetime.now(dt.timezone.utc) - enqueue_started).total_seconds() * 1000),
+        len(page_files),
+    )
 
     done_pages, failed_pages = _count_page_states(page_status)
     inflight_pages = max(0, len(page_files) - done_pages - failed_pages)
@@ -938,13 +1056,15 @@ def process_job_page(
     """Process one page using embedded text when available, else OCR the page image."""
     repo = JobsRepository(DATA_DIR)
     _require_job(repo, job_id)
+    pages_dir = repo.path(job_id, "pages")
     cleaned_dir = repo.path(job_id, "cleaned")
     ocr_dir = repo.path(job_id, "ocr")
 
     page_file = f"{normalize_page_name(page_name)}.png"
     page_name = page_file.replace(".png", "")
-    if not (cleaned_dir / page_file).exists():
-        raise RuntimeError(f"cleaned_page_missing:{page_file}")
+    page_path = resolve_ocr_page_path(page_file=page_file, pages_dir=pages_dir, cleaned_dir=cleaned_dir)
+    if not page_path.exists():
+        raise RuntimeError(f"page_image_missing:{page_file}")
 
     with _edit_page_status_map(repo, job_id) as page_status:
         payload = dict(page_status.get(page_name) or {})
@@ -976,6 +1096,7 @@ def process_job_page(
     else:
         page_name, page_rows, page_bounds, page_diag = process_ocr_page(
             page_file=page_file,
+            pages_dir=pages_dir,
             cleaned_dir=cleaned_dir,
             ocr_dir=ocr_dir,
             rate_limit_heartbeat=_heartbeat,
@@ -1180,6 +1301,7 @@ def _rebuild_ocr_outputs_from_saved_artifacts(
     bounds_output: Dict[str, List[Dict]],
     page_diagnostics: Dict[str, Dict[str, Any]],
 ) -> tuple[Dict[str, List[Dict]], Dict[str, List[Dict]], Dict[str, Dict[str, Any]]]:
+    pages_dir = repo.path(job_id, "pages")
     cleaned_dir = repo.path(job_id, "cleaned")
     ocr_dir = repo.path(job_id, "ocr")
 
@@ -1196,7 +1318,6 @@ def _rebuild_ocr_outputs_from_saved_artifacts(
         raw_result_path = _page_raw_result_path(repo, job_id, page_name)
         raw_result = repo.read_json(raw_result_path, default=None) if raw_result_path.exists() else None
         ocr_path = ocr_dir / f"{page_name}.json"
-        page_path = cleaned_dir / page_file
 
         text_raw = raw_result if isinstance(raw_result, dict) and str(raw_result.get("source_type") or "").strip().lower() == "text" else None
         ocr_raw = raw_result if isinstance(raw_result, dict) and str(raw_result.get("source_type") or "").strip().lower() == "ocr" else None
@@ -1218,6 +1339,7 @@ def _rebuild_ocr_outputs_from_saved_artifacts(
                     ocr_items = payload_items
             if ocr_items is None:
                 ocr_items = repo.read_json(ocr_path, default=None) if ocr_path.exists() else None
+            page_path = resolve_ocr_page_path(page_file=page_file, pages_dir=pages_dir, cleaned_dir=cleaned_dir)
             can_reparse = isinstance(ocr_items, list) and ocr_items and page_path.exists()
             if can_reparse:
                 page_h, page_w = _image_size(page_path)
@@ -2292,7 +2414,7 @@ def _coerce_statement_century(value: dt.date) -> dt.date:
 
 def compute_summary(rows: List[Dict]) -> Dict:
     """Aggregate parsed rows into the summary metrics shown in the UI and exports."""
-    tx_count = len(rows)
+    tx_count = 0
     debit_count = 0
     credit_count = 0
     total_debit = 0.0
@@ -2301,25 +2423,29 @@ def compute_summary(rows: List[Dict]) -> Dict:
 
     normalized = []
     for row in rows:
+        row_type = str(row.get("row_type") or "transaction").strip().lower() or "transaction"
+        is_transaction = row_type == "transaction"
         date = _parse_date(row.get("date"))
         debit = _to_float(row.get("debit"))
         credit = _to_float(row.get("credit"))
         balance = _to_float(row.get("balance"))
-        if debit is not None and abs(debit) > 0:
-            debit_count += 1
-            total_debit += abs(debit)
-        if credit is not None and abs(credit) > 0:
-            credit_count += 1
-            total_credit += abs(credit)
-        normalized.append((date, debit, credit, balance))
+        if is_transaction:
+            tx_count += 1
+            if debit is not None and abs(debit) > 0:
+                debit_count += 1
+                total_debit += abs(debit)
+            if credit is not None and abs(credit) > 0:
+                credit_count += 1
+                total_credit += abs(credit)
+        normalized.append((date, debit, credit, balance, is_transaction))
 
     ending_balance = None
-    for _, _, _, bal in reversed(normalized):
+    for _, _, _, bal, _ in reversed(normalized):
         if bal is not None:
             ending_balance = bal
             break
 
-    for date, debit, credit, balance in normalized:
+    for date, debit, credit, balance, is_transaction in normalized:
         if not date:
             continue
         key = date.strftime("%Y-%m")
@@ -2336,11 +2462,11 @@ def compute_summary(rows: List[Dict]) -> Dict:
                 "balance_count": 0,
             },
         )
-        if debit is not None:
+        if is_transaction and debit is not None:
             bucket["debit"] += abs(debit)
             if abs(debit) > 0:
                 bucket["debit_count"] += 1
-        if credit is not None:
+        if is_transaction and credit is not None:
             bucket["credit"] += abs(credit)
             if abs(credit) > 0:
                 bucket["credit_count"] += 1
@@ -2560,6 +2686,7 @@ __all__ = [
     "get_ocr_page",
     "get_ocr_openai_raw_page",
     "get_page_bounds",
+    "get_page_ai_fix",
     "get_page_rows",
     "get_pages_status",
     "get_preview_path",

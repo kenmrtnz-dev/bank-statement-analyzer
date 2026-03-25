@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import datetime as dt
 import json
+import logging
 import math
 import os
-import datetime as dt
-import shutil
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Callable, Dict, List
@@ -28,6 +28,7 @@ from app.statement_parser import (
     parse_page_with_profile_fallback,
 )
 
+logger = logging.getLogger(__name__)
 OCR_BACKEND = "google_vision"
 PREVIEW_MAX_PIXELS = int(os.getenv("PREVIEW_MAX_PIXELS", "6000000"))
 OPENAI_OCR_USE_STRUCTURED_ROWS = str(os.getenv("OPENAI_OCR_USE_STRUCTURED_ROWS", "true")).strip().lower() in {
@@ -46,6 +47,13 @@ OCR_ROW_FILTER_LENIENT = str(os.getenv("OCR_ROW_FILTER_LENIENT", "true")).strip(
 FLOW_AMOUNT_TOLERANCE = Decimal("0.005")
 
 ProgressReporter = Callable[[str, str, int], None]
+
+
+def resolve_ocr_page_path(*, page_file: str, pages_dir: Path, cleaned_dir: Path) -> Path:
+    cleaned_path = cleaned_dir / page_file
+    if cleaned_path.exists():
+        return cleaned_path
+    return pages_dir / page_file
 
 
 def normalize_parse_mode(mode: str | None) -> str:
@@ -180,6 +188,7 @@ def _run_text_pipeline(
                 raise RuntimeError(f"ocr_fallback_page_missing:{page_name}")
             _, filtered_rows, filtered_bounds, page_diag = process_ocr_page(
                 page_file=page_files[idx - 1],
+                pages_dir=pages_dir,
                 cleaned_dir=cleaned_dir,
                 ocr_dir=ocr_dir,
                 ocr_router=ocr_router,
@@ -306,6 +315,7 @@ def _run_ocr_pipeline(
             idx = batch_start + inner_idx
             page_name, page_rows, page_bounds, page_diag = process_ocr_page(
                 page_file=page_file,
+                pages_dir=pages_dir,
                 cleaned_dir=cleaned_dir,
                 ocr_dir=ocr_dir,
                 ocr_router=ocr_router,
@@ -338,6 +348,7 @@ def prepare_ocr_pages(
     cleaned_dir: Path,
     report: ProgressReporter | None = None,
 ) -> List[str]:
+    started_at = dt.datetime.now(dt.timezone.utc)
     if report is not None:
         report("processing", "pdf_to_images", 5)
     page_files = _render_pdf_pages(input_pdf=input_pdf, pages_dir=pages_dir, dpi=scanned_render_dpi())
@@ -346,19 +357,20 @@ def prepare_ocr_pages(
 
     cleaned_dir.mkdir(parents=True, exist_ok=True)
     if report is not None:
-        report("processing", "image_copy", 20)
-    for idx, page_file in enumerate(page_files, start=1):
-        src = pages_dir / page_file
-        dst = cleaned_dir / page_file
-        shutil.copyfile(src, dst)
-        if report is not None:
-            progress = 20 + int((idx / max(len(page_files), 1)) * 20)
-            report("processing", "image_copy", progress)
+        report("processing", "image_prepare", 20)
+    elapsed_ms = int((dt.datetime.now(dt.timezone.utc) - started_at).total_seconds() * 1000)
+    logger.info(
+        "Prepared %s OCR page images for %s in %sms; rendered pages are reused directly unless cleaned overrides exist.",
+        len(page_files),
+        input_pdf.name,
+        elapsed_ms,
+    )
     return page_files
 
 
 def process_ocr_page(
     page_file: str,
+    pages_dir: Path,
     cleaned_dir: Path,
     ocr_dir: Path,
     *,
@@ -369,7 +381,7 @@ def process_ocr_page(
     previous_balance_hint=None,
 ) -> tuple[str, List[Dict], List[Dict], Dict]:
     page_name = page_file.replace(".png", "")
-    page_path = cleaned_dir / page_file
+    page_path = resolve_ocr_page_path(page_file=page_file, pages_dir=pages_dir, cleaned_dir=cleaned_dir)
     page_h, page_w = _image_size(page_path)
 
     if ocr_router is None:
@@ -1055,6 +1067,7 @@ def _ocr_items_to_words(ocr_items: List[Dict]) -> List[Dict]:
 
 def _render_pdf_pages(input_pdf: Path, pages_dir: Path, dpi: int) -> List[str]:
     pages_dir.mkdir(parents=True, exist_ok=True)
+    render_started = dt.datetime.now(dt.timezone.utc)
     total_pages = 0
     try:
         info = pdfinfo_from_path(str(input_pdf))
@@ -1062,29 +1075,20 @@ def _render_pdf_pages(input_pdf: Path, pages_dir: Path, dpi: int) -> List[str]:
     except Exception:
         total_pages = 0
 
-    if total_pages <= 0:
-        pages = convert_from_path(str(input_pdf), dpi=dpi, fmt="png")
-        files = []
-        for idx, page in enumerate(pages, start=1):
-            name = f"page_{idx:03}.png"
-            _save_preview_page(page, pages_dir / name)
-            files.append(name)
-        return files
-
+    pages = convert_from_path(str(input_pdf), dpi=dpi, fmt="png")
     files = []
-    for idx in range(1, total_pages + 1):
-        page_list = convert_from_path(
-            str(input_pdf),
-            dpi=dpi,
-            fmt="png",
-            first_page=idx,
-            last_page=idx,
-        )
-        if not page_list:
-            continue
+    for idx, page in enumerate(pages, start=1):
         name = f"page_{idx:03}.png"
-        _save_preview_page(page_list[0], pages_dir / name)
+        _save_preview_page(page, pages_dir / name)
         files.append(name)
+    elapsed_ms = int((dt.datetime.now(dt.timezone.utc) - render_started).total_seconds() * 1000)
+    logger.info(
+        "Rendered %s PDF pages for %s at %sdpi in %sms.",
+        len(files) if files else total_pages,
+        input_pdf.name,
+        dpi,
+        elapsed_ms,
+    )
     return files
 
 

@@ -195,4 +195,147 @@ test.describe('Processing summary smoke', () => {
     await expect(page.locator('#flaggedRowsBody')).toContainText('Transfer AB1 received');
     await expect(page.locator('#flaggedRowsBody')).toContainText('AB1');
   });
+
+  test('ai fix button opens review modal and applies proposed rows', async ({ page }) => {
+    await page.route('**/jobs/test-job', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          status: 'done',
+          step: 'completed',
+          progress: 100,
+          parse_mode: 'text',
+          page_ai_fix_enabled: true,
+        }),
+      });
+    });
+
+    await page.route('**/jobs/test-job/cleaned', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ pages: ['page_001.png'] }),
+      });
+    });
+
+    await page.route('**/jobs/test-job/parsed/page_001', async (route) => {
+      const method = route.request().method();
+      if (method === 'PUT') {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            rows: [
+              {
+                row_id: '001',
+                rownumber: null,
+                row_number: '',
+                date: '2026-02-01',
+                description: 'Beginning balance',
+                debit: '',
+                credit: '',
+                balance: '100.00',
+                row_type: 'opening_balance',
+              },
+            ],
+            summary: {
+              total_transactions: 1,
+              debit_transactions: 0,
+              credit_transactions: 1,
+              total_debit: 0,
+              total_credit: 100,
+              monthly_credit_average: 100,
+              monthly_disposable_income: 100,
+              adb: 100,
+              monthly: [],
+            },
+          }),
+        });
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify([
+          {
+            row_id: '001',
+            date: '2026-02-01',
+            description: 'Tranfer AB1 recived',
+            debit: '',
+            credit: '100.00',
+            balance: '100.00',
+          },
+        ]),
+      });
+    });
+
+    await page.route('**/jobs/test-job/parsed', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          page_001: [
+            {
+              row_id: '001',
+              date: '2026-02-01',
+              description: 'Tranfer AB1 recived',
+              debit: '',
+              credit: '100.00',
+              balance: '100.00',
+              row_type: 'opening_balance',
+              is_flagged: false,
+            },
+          ],
+        }),
+      });
+    });
+
+    await page.route('**/jobs/test-job/pages/page_001/ai-fix', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          page: 'page_001',
+          inputs_used: {
+            has_image: true,
+            raw_source: 'page_raw_result',
+            parsed_row_count: 1,
+          },
+          proposal: {
+            rows: [
+              {
+                row_id: '001',
+                rownumber: null,
+                row_number: '',
+                date: '2026-02-01',
+                description: 'Beginning balance',
+                debit: '',
+                credit: '',
+                balance: '100.00',
+                row_type: 'opening_balance',
+              },
+            ],
+            summary: {
+              changed: true,
+              issues_found: ['description_typo'],
+              rationale: 'Fixed the OCR typo in the row description.',
+            },
+          },
+        }),
+      });
+    });
+
+    await page.goto('/processing?job-id=test-job');
+
+    await expect(page.locator('#pageAiFixBtn')).toBeVisible();
+    await page.locator('#pageAiFixBtn').click();
+    await expect(page.locator('#pageAiFixModal')).toBeVisible();
+    await expect(page.locator('#pageAiFixJson')).toContainText('Beginning balance');
+    await expect(page.locator('#pageAiFixJson')).toContainText('"row_type": "opening_balance"');
+
+    await page.locator('#pageAiFixApplyBtn').click();
+    await expect(page.locator('#pageAiFixModal')).toBeHidden();
+    await expect(page.locator('.table-row-input-description').first()).toHaveValue('Beginning balance');
+  });
 });

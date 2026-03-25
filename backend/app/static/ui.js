@@ -16,12 +16,20 @@
     processingGoogleVisionParserWrap: document.getElementById('processingGoogleVisionParserWrap'),
     processingGoogleVisionParser: document.getElementById('processingGoogleVisionParser'),
     pageNotesBtn: document.getElementById('pageNotesBtn'),
+    pageAiFixBtn: document.getElementById('pageAiFixBtn'),
     pageNotesModal: document.getElementById('pageNotesModal'),
     pageNotesSubtitle: document.getElementById('pageNotesSubtitle'),
     pageNotesInput: document.getElementById('pageNotesInput'),
     pageNotesCloseBtn: document.getElementById('pageNotesCloseBtn'),
     pageNotesCancelBtn: document.getElementById('pageNotesCancelBtn'),
     pageNotesSaveBtn: document.getElementById('pageNotesSaveBtn'),
+    pageAiFixModal: document.getElementById('pageAiFixModal'),
+    pageAiFixSubtitle: document.getElementById('pageAiFixSubtitle'),
+    pageAiFixStatus: document.getElementById('pageAiFixStatus'),
+    pageAiFixJson: document.getElementById('pageAiFixJson'),
+    pageAiFixCloseBtn: document.getElementById('pageAiFixCloseBtn'),
+    pageAiFixCancelBtn: document.getElementById('pageAiFixCancelBtn'),
+    pageAiFixApplyBtn: document.getElementById('pageAiFixApplyBtn'),
     startBtn: document.getElementById('startBtn'),
     jobId: document.getElementById('jobId'),
     jobStatus: document.getElementById('jobStatus'),
@@ -164,7 +172,12 @@
     pageNotesByPage: {},
     pageNotesModalOpen: false,
     pageNotesSaving: false,
-    pageNotesLoading: false
+    pageNotesLoading: false,
+    pageAiFixEnabled: false,
+    pageAiFixLoading: false,
+    pageAiFixApplying: false,
+    pageAiFixModalOpen: false,
+    pageAiFixDraftByPage: {}
   };
   const ROUTE_TO_VIEW = {
     '/uploads': 'uploads',
@@ -324,6 +337,7 @@
     if (els.uploadTestingSection) {
       els.uploadTestingSection.classList.toggle('hidden', !state.uploadTestingEnabled);
     }
+    updatePageAiFixActionState();
   }
 
   function formatBytes(value) {
@@ -1111,6 +1125,7 @@
     if (els.jobProgressFill) els.jobProgressFill.style.width = `${progress}%`;
     state.isCompleted = mapped === 'completed' || mapped === 'needs_review';
     state.currentParseMode = String(payload.parse_mode || state.currentParseMode || '').trim().toLowerCase();
+    state.pageAiFixEnabled = Boolean(payload?.page_ai_fix_enabled);
 
     if (els.startBtn) {
       const allowStart = Boolean(state.jobId) && !['processing', 'completed', 'needs_review', 'failed'].includes(mapped);
@@ -1118,6 +1133,7 @@
       els.startBtn.classList.toggle('start-emphasis', mapped === 'idle' && Boolean(state.jobId));
     }
     updateExportAvailability();
+    updatePageAiFixActionState();
     if (mapped === 'idle' && state.totalParsedRows === 0) renderSummary(null);
     updatePreviewEmptyState();
 
@@ -2386,6 +2402,7 @@
         debit: formatAmountCellValue(row?.debit),
         credit: formatAmountCellValue(row?.credit),
         balance: formatAmountCellValue(row?.balance),
+        row_type: String(row?.row_type || 'transaction').trim() || 'transaction',
       };
     });
 
@@ -2428,52 +2445,8 @@
           )
         )
         : null;
-      const existingRows = Array.isArray(state.parsedByPage[pageName]) ? state.parsedByPage[pageName] : [];
-      const sameShape = existingRows.length === payload.rows.length
-        && existingRows.every((row, idx) => {
-          const existingId = String(row?.row_id || idx + 1);
-          const payloadId = String(payload.rows[idx]?.row_id || idx + 1);
-          return existingId === payloadId;
-        });
-
-      if (sameShape) {
-        for (let idx = 0; idx < existingRows.length; idx += 1) {
-          const src = payload.rows[idx] || {};
-          existingRows[idx].row_id = String(src.row_id || existingRows[idx].row_id || '').trim();
-          existingRows[idx].date = normalizeEditableCellValue(src.date).trim();
-          existingRows[idx].description = normalizeEditableCellValue(src.description).trim();
-          existingRows[idx].debit = formatAmountCellValue(src.debit);
-          existingRows[idx].credit = formatAmountCellValue(src.credit);
-          existingRows[idx].balance = formatAmountCellValue(src.balance);
-          existingRows[idx].is_flagged = Boolean(src.is_flagged);
-        }
-        if (pageName === state.currentPage) {
-          if (preservedFocus) state.pendingRowFocus = preservedFocus;
-          snapshotParsedScrollPosition();
-          renderRows();
-        }
-      } else {
-        state.parsedByPage[pageName] = payload.rows;
-        if (pageName === state.currentPage) {
-          if (preservedFocus) state.pendingRowFocus = preservedFocus;
-          snapshotParsedScrollPosition();
-          renderRows();
-        }
-      }
-
-      if (
-        state.selectedRowId
-        && !payload.rows.some((row) => String(row?.row_id || '') === String(state.selectedRowId))
-      ) {
-        state.selectedRowId = null;
-      }
-    }
-
-    recomputeTotalParsedRows();
-    updateExportAvailability();
-
-    if (payload && payload.summary && typeof payload.summary === 'object') {
-      renderSummary(payload.summary);
+      if (preservedFocus) state.pendingRowFocus = preservedFocus;
+      applyPageUpdatePayload(pageName, payload);
     }
   }
 
@@ -2876,6 +2849,7 @@
     if (els.pageNextBtn) els.pageNextBtn.disabled = !(idx >= 0 && idx < total - 1);
     if (els.pageLastBtn) els.pageLastBtn.disabled = !(idx >= 0 && idx < total - 1);
     updatePageNotesActionState();
+    updatePageAiFixActionState();
   }
 
   function getCurrentPageNotes() {
@@ -2891,6 +2865,192 @@
     els.pageNotesBtn.disabled = !hasJobAndPage || state.pageNotesSaving || state.pageNotesLoading;
     els.pageNotesBtn.classList.toggle('has-notes', Boolean(getCurrentPageNotes().trim()));
     els.pageNotesBtn.title = hasJobAndPage ? 'Page notes' : 'Page notes';
+  }
+
+  function getCurrentPageAiFixDraft() {
+    const page = String(state.currentPage || '').trim();
+    if (!page) return null;
+    const draft = state.pageAiFixDraftByPage[page];
+    return draft && typeof draft === 'object' ? draft : null;
+  }
+
+  function updatePageAiFixActionState() {
+    if (!els.pageAiFixBtn) return;
+    const hasJobAndPage = Boolean(state.jobId && state.currentPage);
+    const visible = Boolean(state.pageAiFixEnabled);
+    els.pageAiFixBtn.classList.toggle('hidden', !visible);
+    els.pageAiFixBtn.disabled = !visible || !hasJobAndPage || state.pageAiFixLoading || state.pageAiFixApplying;
+    els.pageAiFixBtn.classList.toggle('is-busy', Boolean(state.pageAiFixLoading));
+    els.pageAiFixBtn.title = state.pageAiFixLoading ? 'AI is analyzing this page...' : 'AI fix page errors';
+  }
+
+  function renderPageAiFixDraft() {
+    const draft = getCurrentPageAiFixDraft();
+    const summary = draft?.proposal?.summary || {};
+    const rows = Array.isArray(draft?.proposal?.rows) ? draft.proposal.rows : [];
+    if (els.pageAiFixSubtitle) {
+      els.pageAiFixSubtitle.textContent = state.currentPage
+        ? `Review the proposed parsed-row fixes for ${String(state.currentPage).replace(/^page_/, 'Page ')}.`
+        : 'Review the proposed parsed-row fixes for this page.';
+    }
+    if (els.pageAiFixJson) {
+      els.pageAiFixJson.textContent = JSON.stringify(rows, null, 2);
+    }
+    if (els.pageAiFixStatus) {
+      const issues = Array.isArray(summary.issues_found) && summary.issues_found.length
+        ? ` Issues: ${summary.issues_found.join(', ')}.`
+        : '';
+      const rationale = String(summary.rationale || '').trim();
+      const changed = typeof summary.changed === 'boolean' ? summary.changed : null;
+      const message = rationale || changed !== null
+        ? `${changed === false ? 'AI could not confidently improve this page.' : 'AI proposed repairs for this page.'}${issues}${rationale ? ` ${rationale}` : ''}`.trim()
+        : '';
+      els.pageAiFixStatus.textContent = message;
+      els.pageAiFixStatus.classList.toggle('hidden', !message);
+      els.pageAiFixStatus.classList.remove('is-error');
+    }
+    if (els.pageAiFixApplyBtn) {
+      els.pageAiFixApplyBtn.disabled = !draft || state.pageAiFixApplying;
+      els.pageAiFixApplyBtn.textContent = state.pageAiFixApplying ? 'Applying...' : 'Apply fixes';
+    }
+  }
+
+  function setPageAiFixModalOpen(open) {
+    state.pageAiFixModalOpen = Boolean(open);
+    if (els.pageAiFixModal) {
+      els.pageAiFixModal.classList.toggle('hidden', !state.pageAiFixModalOpen);
+    }
+    if (state.pageAiFixModalOpen) {
+      renderPageAiFixDraft();
+    }
+  }
+
+  function closePageAiFixModal() {
+    if (state.pageAiFixApplying) return;
+    setPageAiFixModalOpen(false);
+  }
+
+  async function requestCurrentPageAiFix() {
+    const page = String(state.currentPage || '').trim();
+    const jobId = String(state.jobId || '').trim();
+    if (!jobId || !page || !state.pageAiFixEnabled || state.pageAiFixLoading || state.pageAiFixApplying) return;
+
+    state.pageAiFixLoading = true;
+    updatePageAiFixActionState();
+    if (els.pageAiFixStatus) {
+      els.pageAiFixStatus.textContent = 'AI is reviewing the page image, raw OCR, and parsed rows...';
+      els.pageAiFixStatus.classList.remove('hidden', 'is-error');
+    }
+    if (els.pageAiFixJson) {
+      els.pageAiFixJson.textContent = '';
+    }
+    setPageAiFixModalOpen(true);
+
+    let didFail = false;
+    try {
+      const payload = await api(`/jobs/${jobId}/pages/${page}/ai-fix`, { method: 'POST' });
+      state.pageAiFixDraftByPage[page] = payload;
+      renderPageAiFixDraft();
+    } catch (err) {
+      didFail = true;
+      if (els.pageAiFixStatus) {
+        els.pageAiFixStatus.textContent = `Unable to generate AI fix: ${normalizeApiErrorMessage(err?.message)}`;
+        els.pageAiFixStatus.classList.remove('hidden');
+        els.pageAiFixStatus.classList.add('is-error');
+      }
+      if (els.pageAiFixJson) {
+        els.pageAiFixJson.textContent = '';
+      }
+      showToast(`Unable to generate AI fix: ${normalizeApiErrorMessage(err?.message)}`, 'error', 4200);
+    } finally {
+      state.pageAiFixLoading = false;
+      updatePageAiFixActionState();
+      if (!didFail) renderPageAiFixDraft();
+    }
+  }
+
+  function applyPageUpdatePayload(pageName, payload) {
+    if (!payload || !Array.isArray(payload.rows)) return;
+    const existingRows = Array.isArray(state.parsedByPage[pageName]) ? state.parsedByPage[pageName] : [];
+    const sameShape = existingRows.length === payload.rows.length
+      && existingRows.every((row, idx) => {
+        const existingId = String(row?.row_id || idx + 1);
+        const payloadId = String(payload.rows[idx]?.row_id || idx + 1);
+        return existingId === payloadId;
+      });
+
+    if (sameShape) {
+      for (let idx = 0; idx < existingRows.length; idx += 1) {
+        const src = payload.rows[idx] || {};
+        existingRows[idx].row_id = String(src.row_id || existingRows[idx].row_id || '').trim();
+        existingRows[idx].rownumber = src.rownumber ?? existingRows[idx].rownumber ?? null;
+        existingRows[idx].row_number = String(src.row_number || existingRows[idx].row_number || '').trim();
+        existingRows[idx].date = normalizeEditableCellValue(src.date).trim();
+        existingRows[idx].description = normalizeEditableCellValue(src.description).trim();
+        existingRows[idx].debit = formatAmountCellValue(src.debit);
+        existingRows[idx].credit = formatAmountCellValue(src.credit);
+        existingRows[idx].balance = formatAmountCellValue(src.balance);
+        existingRows[idx].row_type = String(src.row_type || existingRows[idx].row_type || 'transaction').trim() || 'transaction';
+        existingRows[idx].is_flagged = Boolean(src.is_flagged);
+      }
+    } else {
+      state.parsedByPage[pageName] = payload.rows;
+    }
+
+    if (
+      state.selectedRowId
+      && !payload.rows.some((row) => String(row?.row_id || '') === String(state.selectedRowId))
+    ) {
+      state.selectedRowId = null;
+    }
+
+    recomputeTotalParsedRows();
+    updateExportAvailability();
+    if (payload.summary && typeof payload.summary === 'object') {
+      renderSummary(payload.summary);
+    }
+    if (pageName === state.currentPage) {
+      snapshotParsedScrollPosition();
+      renderRows();
+    }
+    renderDisbalanceTable();
+    renderFlaggedTransactionsTable();
+  }
+
+  async function applyCurrentPageAiFix() {
+    const page = String(state.currentPage || '').trim();
+    const jobId = String(state.jobId || '').trim();
+    const draft = getCurrentPageAiFixDraft();
+    const rows = Array.isArray(draft?.proposal?.rows) ? draft.proposal.rows : null;
+    if (!jobId || !page || !rows || state.pageAiFixApplying) return;
+
+    state.pageAiFixApplying = true;
+    updatePageAiFixActionState();
+    renderPageAiFixDraft();
+
+    let didFail = false;
+    try {
+      const payload = await api(`/jobs/${jobId}/parsed/${page}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(rows),
+      });
+      applyPageUpdatePayload(page, payload || {});
+      setPageAiFixModalOpen(false);
+      showToast('AI fixes applied.', 'success');
+    } catch (err) {
+      didFail = true;
+      if (els.pageAiFixStatus) {
+        els.pageAiFixStatus.textContent = `Unable to apply AI fix: ${normalizeApiErrorMessage(err?.message)}`;
+        els.pageAiFixStatus.classList.remove('hidden');
+        els.pageAiFixStatus.classList.add('is-error');
+      }
+      showToast(`Unable to apply AI fix: ${normalizeApiErrorMessage(err?.message)}`, 'error', 4200);
+    } finally {
+      state.pageAiFixApplying = false;
+      updatePageAiFixActionState();
+      if (!didFail) renderPageAiFixDraft();
+    }
   }
 
   function setPageNotesModalOpen(open) {
@@ -3015,6 +3175,7 @@
     const page = state.currentPage;
     loadPreview();
     updatePageNotesActionState();
+    updatePageAiFixActionState();
 
     const pending = [];
     if (!state.parsedByPage[page]) {
@@ -3085,10 +3246,14 @@
     state.pageNotesByPage = {};
     state.pageNotesLoading = false;
     state.pageNotesSaving = false;
+    state.pageAiFixLoading = false;
+    state.pageAiFixApplying = false;
+    state.pageAiFixDraftByPage = {};
     state.disbalanceLoading = false;
     state.disbalanceLoadPromise = null;
     state.totalParsedRows = Number(summary?.total_transactions || 0);
     setPageNotesModalOpen(false);
+    setPageAiFixModalOpen(false);
 
     for (const page of state.pages) {
       if (!Array.isArray(state.parsedByPage[page])) state.parsedByPage[page] = [];
@@ -3164,11 +3329,15 @@
     state.pageNotesByPage = {};
     state.pageNotesLoading = false;
     state.pageNotesSaving = false;
+    state.pageAiFixLoading = false;
+    state.pageAiFixApplying = false;
+    state.pageAiFixDraftByPage = {};
     state.disbalanceLoading = false;
     state.disbalanceLoadPromise = null;
     setExportLinks(false);
     setParsedPanelMode(state.parsedPanelMode);
     setPageNotesModalOpen(false);
+    setPageAiFixModalOpen(false);
     clearRows();
     renderSummary(null);
     if (switchToProcessing) syncRoute('/processing', false, id);
@@ -3367,6 +3536,11 @@
       openPageNotesModal();
     });
   }
+  if (els.pageAiFixBtn) {
+    els.pageAiFixBtn.addEventListener('click', () => {
+      requestCurrentPageAiFix();
+    });
+  }
   if (els.pageNotesCloseBtn) {
     els.pageNotesCloseBtn.addEventListener('click', () => {
       closePageNotesModal();
@@ -3385,6 +3559,26 @@
   if (els.pageNotesModal) {
     els.pageNotesModal.addEventListener('click', (evt) => {
       if (evt.target === els.pageNotesModal) closePageNotesModal();
+    });
+  }
+  if (els.pageAiFixCloseBtn) {
+    els.pageAiFixCloseBtn.addEventListener('click', () => {
+      closePageAiFixModal();
+    });
+  }
+  if (els.pageAiFixCancelBtn) {
+    els.pageAiFixCancelBtn.addEventListener('click', () => {
+      closePageAiFixModal();
+    });
+  }
+  if (els.pageAiFixApplyBtn) {
+    els.pageAiFixApplyBtn.addEventListener('click', () => {
+      applyCurrentPageAiFix();
+    });
+  }
+  if (els.pageAiFixModal) {
+    els.pageAiFixModal.addEventListener('click', (evt) => {
+      if (evt.target === els.pageAiFixModal) closePageAiFixModal();
     });
   }
   if (els.pageNotesInput) {
@@ -3630,6 +3824,11 @@
     if (evt.key === 'Escape' && state.pageNotesModalOpen) {
       evt.preventDefault();
       closePageNotesModal();
+      return;
+    }
+    if (evt.key === 'Escape' && state.pageAiFixModalOpen) {
+      evt.preventDefault();
+      closePageAiFixModal();
     }
   });
 

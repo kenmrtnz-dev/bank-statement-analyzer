@@ -145,6 +145,8 @@ For local hot reload on top of the production-like compose file:
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 ```
 
+On Apple Silicon, the compose stack now runs native `arm64` images by default instead of forcing `linux/amd64` emulation. If you need x86 containers for compatibility testing, you can still override the platform explicitly when launching compose.
+
 ## Deployment Notes
 - Jobs are queued to Redis and executed by Celery workers.
 - API and worker must share the same `DATA_DIR`.
@@ -152,10 +154,12 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 - `DATABASE_URL` is required for the API, worker, and Alembic.
 - In production, set `APP_ENV=prod`, `DB_AUTO_CREATE_SCHEMA=false`, `SEED_DEFAULT_USERS=false`, and a real `JWT_SECRET`.
 - Retry/backoff knobs are configurable via `CELERY_TASK_MAX_RETRIES`, `CELERY_TASK_RETRY_BACKOFF_SECONDS`, and related `CELERY_TASK_*` env vars.
+- `CELERY_CONCURRENCY` increases page-level OCR fan-out, but it does not speed up the initial PDF-to-image render phase by itself.
 - `mode=pdftotext` forces the modern text-layer pipeline.
 - `mode=google_vision` forces the modern OCR pipeline.
 - Data is stored in `${DATA_DIR:-<repo>/storage}/jobs/<job_id>/...`.
 - Scanned PDFs route to Google Vision OCR:
+  - `SCANNED_RENDER_DPI=180`
   - `GOOGLE_VISION_API_KEY` (or `GOOGLE_APPLICATION_CREDENTIALS`)
   - `GOOGLE_VISION_BATCH_SIZE=5`
   - `GOOGLE_VISION_PDF_DPI=120`

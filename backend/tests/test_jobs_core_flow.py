@@ -97,7 +97,6 @@ def test_job_flow_with_mocked_pipeline(client, monkeypatch):
         pages_dir.mkdir(parents=True, exist_ok=True)
         cleaned_dir.mkdir(parents=True, exist_ok=True)
         (pages_dir / "page_001.png").write_bytes(b"png")
-        (cleaned_dir / "page_001.png").write_bytes(b"png")
         return ["page_001.png"]
 
     def _prepare_page_routing_inputs(*, repo, job_id, input_pdf, page_files, requested_mode):
