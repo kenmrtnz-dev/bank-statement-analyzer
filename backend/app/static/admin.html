@@ -32,6 +32,13 @@
               <small>Track all user runs</small>
             </span>
           </button>
+          <button class="admin-nav-btn" type="button" data-tab-target="volume-tests">
+            <span class="nav-icon" aria-hidden="true">VT</span>
+            <span class="nav-copy">
+              <strong>Volume Tests</strong>
+              <small>Process saved sets</small>
+            </span>
+          </button>
           <button class="admin-nav-btn" type="button" data-tab-target="transactions">
             <span class="nav-icon" aria-hidden="true">TX</span>
             <span class="nav-copy">
@@ -273,6 +280,102 @@
                 <a id="jobsResultExcelLink" class="ghost-link hidden" href="#" download>Download Excel</a>
               </div>
               <p id="jobsResultRowsMeta" class="jobs-result-rows-meta">No job selected.</p>
+            </article>
+          </div>
+        </section>
+
+        <section class="admin-panel" data-tab-panel="volume-tests">
+          <div class="panel-stack">
+            <article class="admin-card">
+              <div class="card-head">
+                <div class="card-title-group">
+                  <h2>Saved VT Sets</h2>
+                  <p>Inspect uploaded bulk sets and start each document one by one for evaluator review.</p>
+                </div>
+                <span id="volumeSetsCount" class="card-tag">Loading…</span>
+              </div>
+
+              <div class="volume-inline-actions">
+                <a class="ghost-link" href="/volume">Open Volume Upload</a>
+                <button id="refreshVolumeSetsBtn" type="button" class="ghost-button">Refresh Sets</button>
+              </div>
+
+              <div class="transactions-admin-table-wrap volume-sets-table-wrap">
+                <table class="transactions-admin-table volume-sets-table">
+                  <thead>
+                    <tr>
+                      <th>Set Name</th>
+                      <th>Owner</th>
+                      <th>Files</th>
+                      <th>Pending</th>
+                      <th>Active</th>
+                      <th>Completed</th>
+                      <th>Updated</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody id="volumeSetsRowsBody">
+                    <tr>
+                      <td colspan="8">Loading saved sets…</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </article>
+
+            <article class="admin-card">
+              <div class="card-head">
+                <div class="card-title-group">
+                  <h2>Set Files</h2>
+                  <p id="volumeSetMeta">Select a saved set to review its files and start the next VT job.</p>
+                </div>
+                <span id="volumeSetReadyTag" class="card-tag">Not selected</span>
+              </div>
+
+              <div class="volume-inline-actions">
+                <button id="refreshVolumeSetDetailBtn" type="button" class="ghost-button" disabled>Refresh Set</button>
+                <button id="startNextVolumeFileBtn" type="button" disabled>Start Next Pending</button>
+              </div>
+
+              <div class="detail-grid volume-set-summary-grid">
+                <div class="detail-item">
+                  <span>Uploader</span>
+                  <strong id="volumeSetUploader">-</strong>
+                </div>
+                <div class="detail-item">
+                  <span>Next File</span>
+                  <strong id="volumeSetNextFile">-</strong>
+                </div>
+                <div class="detail-item">
+                  <span>Pending</span>
+                  <strong id="volumeSetPendingCount">0</strong>
+                </div>
+                <div class="detail-item">
+                  <span>Active</span>
+                  <strong id="volumeSetActiveCount">0</strong>
+                </div>
+              </div>
+
+              <div class="transactions-admin-table-wrap volume-files-table-wrap">
+                <table class="transactions-admin-table volume-files-table">
+                  <thead>
+                    <tr>
+                      <th>File</th>
+                      <th>Size</th>
+                      <th>Status</th>
+                      <th>Job</th>
+                      <th>Updated</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody id="volumeFilesRowsBody">
+                    <tr>
+                      <td colspan="6">Select a saved set to view its files.</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+              <p id="volumeSetsFeedback" class="inline-feedback hidden"></p>
             </article>
           </div>
         </section>

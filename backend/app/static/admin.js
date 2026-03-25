@@ -38,6 +38,19 @@
   const jobsResultRowsMeta = document.getElementById('jobsResultRowsMeta');
   const jobsResultPdfLink = document.getElementById('jobsResultPdfLink');
   const jobsResultExcelLink = document.getElementById('jobsResultExcelLink');
+  const volumeSetsCount = document.getElementById('volumeSetsCount');
+  const refreshVolumeSetsBtn = document.getElementById('refreshVolumeSetsBtn');
+  const volumeSetsRowsBody = document.getElementById('volumeSetsRowsBody');
+  const volumeSetMeta = document.getElementById('volumeSetMeta');
+  const volumeSetReadyTag = document.getElementById('volumeSetReadyTag');
+  const refreshVolumeSetDetailBtn = document.getElementById('refreshVolumeSetDetailBtn');
+  const startNextVolumeFileBtn = document.getElementById('startNextVolumeFileBtn');
+  const volumeSetUploader = document.getElementById('volumeSetUploader');
+  const volumeSetNextFile = document.getElementById('volumeSetNextFile');
+  const volumeSetPendingCount = document.getElementById('volumeSetPendingCount');
+  const volumeSetActiveCount = document.getElementById('volumeSetActiveCount');
+  const volumeFilesRowsBody = document.getElementById('volumeFilesRowsBody');
+  const volumeSetsFeedback = document.getElementById('volumeSetsFeedback');
   const transactionsResultCount = document.getElementById('transactionsResultCount');
   const flagCodeRuleCountTag = document.getElementById('flagCodeRuleCountTag');
   const createForm = document.getElementById('createEvaluatorForm');
@@ -72,6 +85,7 @@
   const confirmClearBtn = document.getElementById('confirmClearBtn');
   let jobsPage = 1;
   let jobsTotalPages = 1;
+  let selectedVolumeSetName = '';
   let transactionsPage = 1;
   let transactionsTotalPages = 1;
   let bankCodeRowsState = [];
@@ -83,6 +97,10 @@
     jobs: {
       label: 'Jobs',
       description: 'Track all user jobs, progress, and parsed outputs from a single admin workspace.'
+    },
+    'volume-tests': {
+      label: 'Volume Tests',
+      description: 'Start saved VT files one by one and route completed jobs back to the original uploader.'
     },
     transactions: {
       label: 'Transactions',
@@ -246,6 +264,19 @@
     );
   }
 
+  function formatBytes(value) {
+    const bytes = Number(value || 0);
+    if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let size = bytes;
+    let unitIndex = 0;
+    while (size >= 1024 && unitIndex < units.length - 1) {
+      size /= 1024;
+      unitIndex += 1;
+    }
+    return `${size.toFixed(size >= 10 || unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
+  }
+
   function formatBounds(bounds) {
     const x1 = Number(bounds?.x1);
     const y1 = Number(bounds?.y1);
@@ -258,9 +289,23 @@
   }
 
   function formatTimestamp(value) {
-    const raw = String(value || '').trim();
+    const rawValue = value;
+    const raw = String(rawValue || '').trim();
     if (!raw) {
       return '<span class="transactions-cell-muted">-</span>';
+    }
+    if (typeof rawValue === 'number' && Number.isFinite(rawValue)) {
+      const numericDate = new Date(rawValue < 1e12 ? rawValue * 1000 : rawValue);
+      if (!Number.isNaN(numericDate.getTime())) {
+        return escapeHtml(numericDate.toLocaleString());
+      }
+    }
+    if (/^\d{10,13}(\.\d+)?$/.test(raw)) {
+      const numeric = Number(raw);
+      const numericDate = new Date(raw.length <= 10 ? numeric * 1000 : numeric);
+      if (!Number.isNaN(numericDate.getTime())) {
+        return escapeHtml(numericDate.toLocaleString());
+      }
     }
     const parsed = new Date(raw);
     if (Number.isNaN(parsed.getTime())) {
@@ -295,6 +340,14 @@
 
   function clearJobsFeedback() {
     jobsFeedback?.classList.add('hidden');
+  }
+
+  function showVolumeSetsFeedback(message, isError = false) {
+    showInlineFeedback(volumeSetsFeedback, message, isError);
+  }
+
+  function clearVolumeSetsFeedback() {
+    volumeSetsFeedback?.classList.add('hidden');
   }
 
   function setJobsResultLoadingState(message = 'Select a job above to view parsed results.') {
@@ -493,6 +546,240 @@
     } catch (err) {
       setJobsResultLoadingState(`Failed to load job results: ${err.message}`);
       showJobsFeedback(`Failed to load job results: ${err.message}`, true);
+    }
+  }
+
+  function formatVolumeOwner(row = {}) {
+    const owner = String(row.uploader_username || '').trim();
+    if (!owner) return '<span class="transactions-cell-muted">Unknown</span>';
+    const role = String(row.uploader_role || '').trim();
+    if (!role) return escapeHtml(owner);
+    return `${escapeHtml(owner)} <span class="transactions-cell-muted">(${escapeHtml(role)})</span>`;
+  }
+
+  function formatVolumeStatusLabel(status, isPdf = true) {
+    const normalized = String(status || '').trim().toLowerCase();
+    if (!isPdf || normalized === 'unsupported') return 'Unsupported';
+    if (!normalized || normalized === 'pending') return 'Pending';
+    if (normalized === 'done') return 'Done';
+    if (normalized === 'done_with_warnings') return 'Done (Warnings)';
+    if (normalized === 'queued') return 'Queued';
+    if (normalized === 'processing') return 'Processing';
+    if (normalized === 'failed') return 'Failed';
+    if (normalized === 'cancelled') return 'Cancelled';
+    return normalized.replaceAll('_', ' ').replace(/(^|\s)\S/g, (match) => match.toUpperCase());
+  }
+
+  function formatVolumeStatusClass(status, isPdf = true) {
+    const normalized = String(status || '').trim().toLowerCase();
+    if (!isPdf || normalized === 'unsupported') return 'unsupported';
+    if (!normalized || normalized === 'pending') return 'pending';
+    return normalized.replace(/[^a-z0-9_-]/g, '') || 'pending';
+  }
+
+  function syncSelectedVolumeSetHighlight() {
+    if (!volumeSetsRowsBody) return;
+    Array.from(volumeSetsRowsBody.querySelectorAll('tr[data-set-name]')).forEach((row) => {
+      const isSelected = row.getAttribute('data-set-name') === selectedVolumeSetName;
+      row.classList.toggle('volume-row-selected', isSelected);
+    });
+  }
+
+  function setVolumeSetLoadingState(message = 'Select a saved set to review its files and start the next VT job.') {
+    setText(volumeSetMeta, message);
+    setText(volumeSetReadyTag, 'Not selected');
+    setText(volumeSetUploader, '-');
+    setText(volumeSetNextFile, '-');
+    setText(volumeSetPendingCount, '0');
+    setText(volumeSetActiveCount, '0');
+    if (refreshVolumeSetDetailBtn) refreshVolumeSetDetailBtn.disabled = !selectedVolumeSetName;
+    if (startNextVolumeFileBtn) startNextVolumeFileBtn.disabled = true;
+    if (volumeFilesRowsBody) {
+      volumeFilesRowsBody.innerHTML = `<tr><td colspan="6">${escapeHtml(message)}</td></tr>`;
+    }
+  }
+
+  function renderVolumeSetsTable(payload = {}) {
+    if (!volumeSetsRowsBody) return;
+    const rows = Array.isArray(payload.items) ? payload.items : [];
+    setText(volumeSetsCount, pluralize(rows.length, 'set'));
+    if (!rows.length) {
+      volumeSetsRowsBody.innerHTML = '<tr><td colspan="8">No saved VT sets found.</td></tr>';
+      return;
+    }
+
+    volumeSetsRowsBody.innerHTML = rows.map((row) => `
+      <tr data-set-name="${escapeHtml(row.set_name || '')}" class="${selectedVolumeSetName === row.set_name ? 'volume-row-selected' : ''}">
+        <td>
+          <strong>${escapeHtml(row.set_name || '-')}</strong>
+          <div class="subtle-id">${escapeHtml(row.next_file_name || 'No pending file')}</div>
+        </td>
+        <td>${formatVolumeOwner(row)}</td>
+        <td>${escapeHtml(String(row.file_count ?? 0))}</td>
+        <td>${escapeHtml(String(row.pending_count ?? 0))}</td>
+        <td>${escapeHtml(String(row.active_count ?? 0))}</td>
+        <td>${escapeHtml(String(row.completed_count ?? 0))}</td>
+        <td>${formatTimestamp(row.updated_at)}</td>
+        <td>
+          <div class="volume-inline-actions">
+            <button class="ghost-button volume-view-set-btn" type="button" data-set-name="${escapeHtml(row.set_name || '')}">View Files</button>
+            <button class="volume-start-next-btn" type="button" data-set-name="${escapeHtml(row.set_name || '')}" ${row.next_file_name ? '' : 'disabled'}>
+              Start Next
+            </button>
+          </div>
+        </td>
+      </tr>
+    `).join('');
+    syncSelectedVolumeSetHighlight();
+  }
+
+  function renderVolumeSetDetail(item = null) {
+    if (!item || typeof item !== 'object') {
+      setVolumeSetLoadingState();
+      return;
+    }
+    selectedVolumeSetName = String(item.set_name || '').trim();
+    const uploaderName = String(item.uploader_username || '').trim();
+    const uploaderRole = String(item.uploader_role || '').trim();
+    const uploaderLabel = uploaderName ? `${uploaderName}${uploaderRole ? ` (${uploaderRole})` : ''}` : 'Unknown';
+    const nextFile = String(item.next_file_name || '').trim() || '-';
+    const hasActiveJob = Boolean(item.has_active_job);
+    const files = Array.isArray(item.files) ? item.files : [];
+
+    setText(volumeSetMeta, `Set ${selectedVolumeSetName} • ${files.length} file(s)`);
+    setText(volumeSetReadyTag, hasActiveJob ? 'Active Job' : 'Ready');
+    setText(volumeSetUploader, uploaderLabel);
+    setText(volumeSetNextFile, nextFile);
+    setText(volumeSetPendingCount, String(item.pending_count ?? 0));
+    setText(volumeSetActiveCount, String(item.active_count ?? 0));
+    if (refreshVolumeSetDetailBtn) refreshVolumeSetDetailBtn.disabled = !selectedVolumeSetName;
+    if (startNextVolumeFileBtn) startNextVolumeFileBtn.disabled = !selectedVolumeSetName || !String(item.next_file_name || '').trim();
+
+    if (!files.length) {
+      if (volumeFilesRowsBody) volumeFilesRowsBody.innerHTML = '<tr><td colspan="6">This set has no files.</td></tr>';
+      return;
+    }
+
+    if (volumeFilesRowsBody) {
+      volumeFilesRowsBody.innerHTML = files.map((row) => {
+        const volumeStatus = String(row.volume_status || '').trim().toLowerCase();
+        const statusClass = formatVolumeStatusClass(volumeStatus, Boolean(row.is_pdf));
+        const canStart = Boolean(row.can_start);
+        const hasJob = Boolean(row.job_id);
+        const actionLabel = canStart ? 'Start File' : hasJob ? 'Open Job' : 'Unavailable';
+        const actionClass = canStart ? 'volume-start-file-btn' : hasJob ? 'jobs-view-result-btn ghost-button' : 'ghost-button';
+        const actionAttrs = canStart
+          ? `data-set-name="${escapeHtml(selectedVolumeSetName)}" data-file-name="${escapeHtml(row.file_name || '')}"`
+          : hasJob
+            ? `data-job-id="${escapeHtml(row.job_id || '')}"`
+            : '';
+        return `
+          <tr>
+            <td>
+              <strong>${escapeHtml(row.file_name || '-')}</strong>
+              <div class="subtle-id">${escapeHtml(row.last_started_at || row.job_id || '-')}</div>
+            </td>
+            <td>${escapeHtml(formatBytes(row.size_bytes))}</td>
+            <td>
+              <span class="jobs-status-pill jobs-status-${escapeHtml(statusClass)}">${escapeHtml(formatVolumeStatusLabel(volumeStatus, Boolean(row.is_pdf)))}</span>
+              <div class="subtle-id">${escapeHtml(row.job_step || row.parse_mode || '-')}</div>
+            </td>
+            <td>
+              ${row.job_id ? `<strong>${escapeHtml(row.job_id)}</strong>` : '<span class="transactions-cell-muted">-</span>'}
+            </td>
+            <td>${formatTimestamp(row.updated_at || row.last_started_at)}</td>
+            <td>
+              <button class="${actionClass}" type="button" ${actionAttrs} ${canStart || hasJob ? '' : 'disabled'}>
+                ${escapeHtml(actionLabel)}
+              </button>
+            </td>
+          </tr>
+        `;
+      }).join('');
+    }
+    syncSelectedVolumeSetHighlight();
+  }
+
+  async function loadVolumeSets(selectedSetName = selectedVolumeSetName, { skipDetail = false } = {}) {
+    if (!volumeSetsRowsBody) return;
+    if (refreshVolumeSetsBtn) {
+      refreshVolumeSetsBtn.disabled = true;
+      refreshVolumeSetsBtn.textContent = 'Refreshing…';
+    }
+    clearVolumeSetsFeedback();
+    try {
+      const payload = await apiJson(`/admin/volume-sets?_=${Date.now()}`, { cache: 'no-store' });
+      renderVolumeSetsTable(payload);
+      const rows = Array.isArray(payload.items) ? payload.items : [];
+      if (selectedSetName && !skipDetail) {
+        const stillExists = rows.some((row) => String(row.set_name || '').trim() === selectedSetName);
+        if (stillExists) await loadVolumeSetDetail(selectedSetName);
+        else {
+          selectedVolumeSetName = '';
+          setVolumeSetLoadingState();
+        }
+      }
+    } catch (err) {
+      setText(volumeSetsCount, 'Unavailable');
+      volumeSetsRowsBody.innerHTML = '<tr><td colspan="8">Failed to load saved VT sets.</td></tr>';
+      showVolumeSetsFeedback(`Failed to load saved VT sets: ${err.message}`, true);
+    } finally {
+      if (refreshVolumeSetsBtn) {
+        refreshVolumeSetsBtn.disabled = false;
+        refreshVolumeSetsBtn.textContent = 'Refresh Sets';
+      }
+    }
+  }
+
+  async function loadVolumeSetDetail(setName) {
+    const cleanedSetName = String(setName || '').trim();
+    if (!cleanedSetName) {
+      selectedVolumeSetName = '';
+      setVolumeSetLoadingState();
+      return;
+    }
+    selectedVolumeSetName = cleanedSetName;
+    setVolumeSetLoadingState(`Loading ${cleanedSetName}…`);
+    clearVolumeSetsFeedback();
+    try {
+      const payload = await apiJson(`/admin/volume-sets/${encodeURIComponent(cleanedSetName)}?_=${Date.now()}`, { cache: 'no-store' });
+      renderVolumeSetDetail(payload.item);
+      syncSelectedVolumeSetHighlight();
+    } catch (err) {
+      setVolumeSetLoadingState(`Failed to load ${cleanedSetName}.`);
+      showVolumeSetsFeedback(`Failed to load set details: ${err.message}`, true);
+    }
+  }
+
+  async function startVolumeFile(setName, fileName = '') {
+    const cleanedSetName = String(setName || '').trim();
+    const cleanedFileName = String(fileName || '').trim();
+    if (!cleanedSetName || !cleanedFileName) return;
+    clearVolumeSetsFeedback();
+    try {
+      const payload = await apiJson(
+        `/admin/volume-sets/${encodeURIComponent(cleanedSetName)}/files/${encodeURIComponent(cleanedFileName)}/start`,
+        { method: 'POST' }
+      );
+      renderVolumeSetDetail(payload.item);
+      await loadVolumeSets(cleanedSetName, { skipDetail: true });
+      showVolumeSetsFeedback(`Started ${cleanedFileName} as VT job ${payload.job_id}.`);
+    } catch (err) {
+      showVolumeSetsFeedback(`Failed to start ${cleanedFileName}: ${err.message}`, true);
+    }
+  }
+
+  async function startNextVolumeFile() {
+    const cleanedSetName = String(selectedVolumeSetName || '').trim();
+    if (!cleanedSetName) return;
+    clearVolumeSetsFeedback();
+    try {
+      const payload = await apiJson(`/admin/volume-sets/${encodeURIComponent(cleanedSetName)}/start-next`, { method: 'POST' });
+      renderVolumeSetDetail(payload.item);
+      await loadVolumeSets(cleanedSetName, { skipDetail: true });
+      showVolumeSetsFeedback(`Started ${payload.file_name} as VT job ${payload.job_id}.`);
+    } catch (err) {
+      showVolumeSetsFeedback(`Failed to start the next VT file: ${err.message}`, true);
     }
   }
 
@@ -878,6 +1165,62 @@
     }
   });
 
+  refreshVolumeSetsBtn?.addEventListener('click', async () => {
+    await loadVolumeSets(selectedVolumeSetName, { skipDetail: false });
+  });
+
+  refreshVolumeSetDetailBtn?.addEventListener('click', async () => {
+    if (!selectedVolumeSetName) return;
+    await loadVolumeSetDetail(selectedVolumeSetName);
+  });
+
+  startNextVolumeFileBtn?.addEventListener('click', async () => {
+    await startNextVolumeFile();
+  });
+
+  volumeSetsRowsBody?.addEventListener('click', async (e) => {
+    const target = e.target;
+    if (!(target instanceof HTMLElement)) return;
+    const viewBtn = target.closest('.volume-view-set-btn');
+    if (viewBtn instanceof HTMLElement) {
+      const setName = String(viewBtn.dataset.setName || '').trim();
+      if (!setName) return;
+      await loadVolumeSetDetail(setName);
+      return;
+    }
+
+    const startBtn = target.closest('.volume-start-next-btn');
+    if (startBtn instanceof HTMLElement) {
+      const setName = String(startBtn.dataset.setName || '').trim();
+      if (!setName) return;
+      selectedVolumeSetName = setName;
+      await startNextVolumeFile();
+    }
+  });
+
+  volumeFilesRowsBody?.addEventListener('click', async (e) => {
+    const target = e.target;
+    if (!(target instanceof HTMLElement)) return;
+    const startBtn = target.closest('.volume-start-file-btn');
+    if (startBtn instanceof HTMLElement) {
+      const setName = String(startBtn.dataset.setName || '').trim();
+      const fileName = String(startBtn.dataset.fileName || '').trim();
+      if (!setName || !fileName) return;
+      await startVolumeFile(setName, fileName);
+      return;
+    }
+
+    const openBtn = target.closest('.jobs-view-result-btn');
+    if (!(openBtn instanceof HTMLElement)) return;
+    const jobId = String(openBtn.dataset.jobId || '').trim();
+    if (!jobId) return;
+    const url = `/processing?job-id=${encodeURIComponent(jobId)}`;
+    const opened = window.open(url, '_blank', 'noopener,noreferrer');
+    if (!opened) {
+      window.location.href = url;
+    }
+  });
+
   transactionsFilterForm?.addEventListener('submit', async (e) => {
     e.preventDefault();
     await loadTransactions(1);
@@ -951,7 +1294,7 @@
   requireAdmin()
     .then((ok) => {
       if (!ok) return;
-      return loadSettings().then(() => Promise.all([loadJobs(1), loadTransactions(1)]));
+      return loadSettings().then(() => Promise.all([loadJobs(1), loadVolumeSets(), loadTransactions(1)]));
     })
     .catch(() => show('Failed to verify admin session.', true));
 })();

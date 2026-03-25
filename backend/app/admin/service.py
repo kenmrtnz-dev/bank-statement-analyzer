@@ -606,6 +606,9 @@ def _build_admin_job_row(job_dir: Path) -> dict[str, Any]:
         "parse_mode": parse_mode,
         "owner_username": owner_username,
         "owner_role": owner_role,
+        "source_tag": str(meta_payload.get("source_tag") or "").strip().upper(),
+        "source_category": str(meta_payload.get("source_category") or "").strip().lower(),
+        "volume_set_name": str(meta_payload.get("volume_set_name") or "").strip(),
         "status": status_value,
         "step": step,
         "progress": progress,
@@ -656,6 +659,8 @@ def list_admin_jobs(
                     str(item.get("original_filename") or ""),
                     str(item.get("status") or ""),
                     str(item.get("parse_mode") or ""),
+                    str(item.get("source_tag") or ""),
+                    str(item.get("volume_set_name") or ""),
                 ]
             ).lower()
             if search_filter not in haystack:

@@ -741,6 +741,12 @@ label {
   color: #2f568d;
 }
 
+.jobs-status-pending {
+  border-color: #d8dced;
+  background: #f4f6ff;
+  color: #59637f;
+}
+
 .jobs-status-done,
 .jobs-status-done_with_warnings {
   border-color: #cae8d5;
@@ -753,6 +759,31 @@ label {
   border-color: #f0c6d3;
   background: #fdf1f4;
   color: #a03a51;
+}
+
+.jobs-status-unsupported {
+  border-color: #eed9a4;
+  background: #fff8e5;
+  color: #8a6700;
+}
+
+.volume-inline-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.volume-set-summary-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.volume-row-selected {
+  background: #f7f8ff;
+}
+
+.volume-sets-table,
+.volume-files-table {
+  min-width: 860px;
 }
 
 .jobs-result-card {
@@ -1125,6 +1156,17 @@ textarea {
   overflow-x: hidden;
 }
 
+.admin-panel[data-tab-panel="volume-tests"] .volume-sets-table-wrap {
+  max-height: calc(100vh - 380px);
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.admin-panel[data-tab-panel="volume-tests"] .volume-files-table-wrap {
+  max-height: calc(100vh - 540px);
+  min-height: 190px;
+}
+
 .admin-panel[data-tab-panel="jobs"] .jobs-result-table-wrap {
   max-height: calc(100vh - 560px);
   min-height: 190px;
@@ -1136,7 +1178,8 @@ textarea {
 
 .admin-panel[data-tab-panel="transactions"] .transactions-admin-table,
 .admin-panel[data-tab-panel="jobs"] .transactions-admin-table,
-.admin-panel[data-tab-panel="flag-codes"] .transactions-admin-table {
+.admin-panel[data-tab-panel="flag-codes"] .transactions-admin-table,
+.admin-panel[data-tab-panel="volume-tests"] .transactions-admin-table {
   min-width: 0;
   table-layout: fixed;
 }
@@ -1146,7 +1189,9 @@ textarea {
 .admin-panel[data-tab-panel="jobs"] .transactions-admin-table th,
 .admin-panel[data-tab-panel="jobs"] .transactions-admin-table td,
 .admin-panel[data-tab-panel="flag-codes"] .transactions-admin-table th,
-.admin-panel[data-tab-panel="flag-codes"] .transactions-admin-table td {
+.admin-panel[data-tab-panel="flag-codes"] .transactions-admin-table td,
+.admin-panel[data-tab-panel="volume-tests"] .transactions-admin-table th,
+.admin-panel[data-tab-panel="volume-tests"] .transactions-admin-table td {
   font-size: 10px;
   white-space: nowrap;
   overflow: hidden;

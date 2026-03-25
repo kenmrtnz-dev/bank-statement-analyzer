@@ -29,6 +29,7 @@ from app.jobs.service import (
     get_preview_path,
     get_status,
     get_summary,
+    list_jobs_for_owner,
     list_cleaned_pages,
     set_job_reversed,
     start_job,
@@ -38,6 +39,22 @@ from app.jobs.service import (
 
 # Keep the router thin: auth lives in dependencies and all business logic stays in the service layer.
 router = APIRouter(dependencies=[Depends(require_evaluator_or_admin)])
+
+
+@router.get("/jobs/mine")
+def list_my_jobs_endpoint(
+    page: int = Query(default=1, ge=1),
+    limit: int = Query(default=100, ge=1, le=100),
+    source_tag: str | None = Query(default=None),
+    user=Depends(require_evaluator_or_admin),
+):
+    payload = list_jobs_for_owner(
+        str(user.get("username") or "").strip(),
+        page=page,
+        limit=limit,
+        source_tag=source_tag,
+    )
+    return {"ok": True, **payload}
 
 
 @router.post("/jobs", response_model=JobCreateResponse)

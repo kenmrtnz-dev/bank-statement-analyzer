@@ -206,6 +206,173 @@ def start_job(job_id: str, requested_mode: Optional[str] = None, requested_parse
     return {"job_id": job_id, "parse_mode": parse_mode, "started": started}
 
 
+def _parse_iso_datetime(value: Any) -> dt.datetime | None:
+    text_value = str(value or "").strip()
+    if not text_value:
+        return None
+    normalized = text_value.replace("Z", "+00:00")
+    try:
+        parsed = dt.datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def _iso_from_mtime(path: Path | None) -> str:
+    if not isinstance(path, Path) or not path.exists():
+        return ""
+    value = dt.datetime.fromtimestamp(path.stat().st_mtime, tz=dt.timezone.utc)
+    return value.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _resolve_job_owner(meta_payload: dict[str, Any]) -> tuple[str, str]:
+    if not isinstance(meta_payload, dict):
+        return "", ""
+    owner = (
+        str(meta_payload.get("created_by") or "").strip()
+        or str(meta_payload.get("uploaded_by") or "").strip()
+        or str(meta_payload.get("source_assigned_user") or "").strip()
+    )
+    role = str(meta_payload.get("created_role") or "").strip().lower()
+    return owner, role
+
+
+def _build_owned_job_row(job_dir: Path, *, state_repo: JobStateRepository | None = None) -> dict[str, Any]:
+    repo = JobsRepository(DATA_DIR)
+    job_id = str(job_dir.name)
+    meta_path = job_dir / "meta.json"
+    status_path = job_dir / "status.json"
+    input_path = job_dir / "input" / "document.pdf"
+    meta_payload = repo.read_json(meta_path, default={})
+    if not isinstance(meta_payload, dict):
+        meta_payload = {}
+    status_payload = repo.read_json(status_path, default={})
+    if not isinstance(status_payload, dict):
+        status_payload = {}
+    state_payload = state_repo.get_job(job_id) if state_repo is not None else {}
+    if not isinstance(state_payload, dict):
+        state_payload = {}
+
+    owner_username, owner_role = _resolve_job_owner(meta_payload)
+    created_at = (
+        str(meta_payload.get("created_at") or "").strip()
+        or _iso_from_mtime(meta_path if meta_path.exists() else input_path if input_path.exists() else job_dir)
+    )
+    updated_at = (
+        str(status_payload.get("updated_at") or "").strip()
+        or _iso_from_mtime(status_path if status_path.exists() else job_dir)
+    )
+    raw_size = meta_payload.get("file_size")
+    try:
+        size_bytes = max(0, int(raw_size or state_payload.get("file_size") or 0))
+    except (TypeError, ValueError):
+        size_bytes = 0
+
+    status_value = (
+        str(status_payload.get("status") or "").strip().lower()
+        or str(state_payload.get("job_status") or "").strip().lower()
+        or "queued"
+    )
+    progress_raw = status_payload.get("progress")
+    try:
+        progress = max(0, min(100, int(progress_raw or 0)))
+    except (TypeError, ValueError):
+        progress = 0
+
+    return {
+        "job_id": job_id,
+        "original_filename": str(meta_payload.get("original_filename") or state_payload.get("file_name") or ""),
+        "file_name": str(meta_payload.get("original_filename") or state_payload.get("file_name") or ""),
+        "size_bytes": size_bytes,
+        "owner_username": owner_username,
+        "owner_role": owner_role,
+        "status": status_value,
+        "step": str(status_payload.get("step") or "").strip(),
+        "progress": progress,
+        "parse_mode": str(status_payload.get("parse_mode") or meta_payload.get("requested_mode") or "auto").strip().lower() or "auto",
+        "requested_mode": str(meta_payload.get("requested_mode") or "").strip().lower(),
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "process_started": str(status_payload.get("process_started") or state_payload.get("process_started") or created_at),
+        "process_end": str(status_payload.get("process_end") or state_payload.get("process_end") or ""),
+        "source_tag": str(meta_payload.get("source_tag") or "").strip().upper(),
+        "source_category": str(meta_payload.get("source_category") or "").strip().lower(),
+        "volume_set_name": str(meta_payload.get("volume_set_name") or "").strip(),
+        "volume_file_name": str(meta_payload.get("volume_file_name") or "").strip(),
+        "is_reversed": bool(state_payload.get("is_reversed") or meta_payload.get("is_reversed", False)),
+    }
+
+
+def list_jobs_for_owner(
+    owner_username: str,
+    *,
+    page: int = 1,
+    limit: int = 100,
+    source_tag: str | None = None,
+) -> dict[str, Any]:
+    """List persisted jobs that belong to one uploader/evaluator."""
+    normalized_owner = str(owner_username or "").strip().lower()
+    if not normalized_owner:
+        return {
+            "rows": [],
+            "pagination": {
+                "page": 1,
+                "per_page": max(1, min(100, int(limit or 100))),
+                "total_rows": 0,
+                "total_pages": 1,
+                "has_prev": False,
+                "has_next": False,
+            },
+            "filters": {"owner": "", "source_tag": str(source_tag or "").strip().upper()},
+        }
+
+    jobs_dir = Path(DATA_DIR) / "jobs"
+    rows: list[dict[str, Any]] = []
+    state_repo = JobStateRepository(DATA_DIR)
+    tag_filter = str(source_tag or "").strip().upper()
+    if jobs_dir.exists():
+        for job_dir in jobs_dir.iterdir():
+            if not job_dir.is_dir():
+                continue
+            row = _build_owned_job_row(job_dir, state_repo=state_repo)
+            owner_value = str(row.get("owner_username") or "").strip().lower()
+            if owner_value != normalized_owner:
+                continue
+            if tag_filter and str(row.get("source_tag") or "").strip().upper() != tag_filter:
+                continue
+            rows.append(row)
+
+    rows.sort(
+        key=lambda item: (
+            _parse_iso_datetime(item.get("updated_at"))
+            or _parse_iso_datetime(item.get("created_at"))
+            or dt.datetime.fromtimestamp(0, tz=dt.timezone.utc)
+        ),
+        reverse=True,
+    )
+
+    safe_page = max(1, int(page or 1))
+    safe_limit = max(1, min(100, int(limit or 100)))
+    total_rows = len(rows)
+    total_pages = max(1, (total_rows + safe_limit - 1) // safe_limit) if total_rows else 1
+    start = (safe_page - 1) * safe_limit
+    end = start + safe_limit
+    return {
+        "rows": rows[start:end],
+        "pagination": {
+            "page": safe_page,
+            "per_page": safe_limit,
+            "total_rows": total_rows,
+            "total_pages": total_pages,
+            "has_prev": safe_page > 1,
+            "has_next": safe_page < total_pages,
+        },
+        "filters": {"owner": normalized_owner, "source_tag": tag_filter},
+    }
+
+
 def cancel_job(job_id: str) -> Dict[str, Any]:
     """Revoke active Celery work and mark the job plus any page tasks as cancelled."""
     repo = JobsRepository(DATA_DIR)

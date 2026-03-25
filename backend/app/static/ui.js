@@ -207,6 +207,69 @@
     }
   }
 
+  function uploadRowSortValue(row) {
+    const candidates = [row?.lastModified, row?.processStarted, row?.createdAt];
+    for (const candidate of candidates) {
+      const text = String(candidate || '').trim();
+      if (!text) continue;
+      const parsed = new Date(text);
+      if (!Number.isNaN(parsed.getTime())) return parsed.getTime();
+    }
+    return 0;
+  }
+
+  function normalizeBackendOwnedJob(row = {}) {
+    const jobId = String(row.job_id || row.jobId || '').trim();
+    if (!jobId) return null;
+    const sizeValue = Number(row.size_bytes ?? row.file_size ?? 0);
+    const progressValue = Number(row.progress ?? 0);
+    return {
+      jobId,
+      fileName: String(row.file_name || row.original_filename || 'document.pdf').trim() || 'document.pdf',
+      sizeBytes: Number.isFinite(sizeValue) && sizeValue >= 0 ? sizeValue : 0,
+      createdAt: String(row.created_at || '').trim() || null,
+      lastModified: String(row.updated_at || row.created_at || '').trim() || null,
+      processStarted: String(row.process_started || row.created_at || '').trim() || null,
+      processEnd: String(row.process_end || '').trim() || null,
+      status: String(row.status || 'queued').trim() || 'queued',
+      step: String(row.step || '').trim(),
+      progress: Number.isFinite(progressValue) ? progressValue : 0,
+      parseMode: String(row.parse_mode || row.requested_mode || '').trim(),
+      isReversed: Boolean(row.is_reversed),
+      sourceTag: String(row.source_tag || '').trim().toUpperCase(),
+      sourceCategory: String(row.source_category || '').trim().toLowerCase(),
+      volumeSetName: String(row.volume_set_name || '').trim(),
+      volumeFileName: String(row.volume_file_name || '').trim()
+    };
+  }
+
+  function mergeUploadedJobs(rows = []) {
+    const mergedByJobId = new Map();
+    for (const existing of Array.isArray(state.uploadedJobs) ? state.uploadedJobs : []) {
+      const jobId = String(existing?.jobId || '').trim();
+      if (!jobId) continue;
+      mergedByJobId.set(jobId, { ...existing });
+    }
+    for (const item of Array.isArray(rows) ? rows : []) {
+      const normalized = normalizeBackendOwnedJob(item);
+      if (!normalized) continue;
+      const existing = mergedByJobId.get(normalized.jobId) || {};
+      mergedByJobId.set(normalized.jobId, { ...existing, ...normalized });
+    }
+    state.uploadedJobs = Array.from(mergedByJobId.values())
+      .sort((left, right) => uploadRowSortValue(right) - uploadRowSortValue(left))
+      .slice(0, 100);
+    saveStoredJobs();
+    renderUploadedRows();
+  }
+
+  async function syncOwnedJobs() {
+    const payload = await api('/jobs/mine?limit=100');
+    const rows = Array.isArray(payload?.rows) ? payload.rows : [];
+    mergeUploadedJobs(rows);
+    return rows;
+  }
+
   function normalizeRequestedProcessMode(value) {
     const mode = String(value || '').trim().toLowerCase();
     return SUPPORTED_PROCESS_MODES.has(mode) ? mode : 'auto';
@@ -258,6 +321,11 @@
   }
 
   async function reconcileStoredJobsStatuses() {
+    try {
+      await syncOwnedJobs();
+    } catch {
+      // best-effort sync only
+    }
     if (!Array.isArray(state.uploadedJobs) || state.uploadedJobs.length === 0) return;
 
     const next = [];
@@ -542,7 +610,7 @@
     const search = state.uploadSearch.toLowerCase();
     const rows = state.uploadedJobs.filter((row) => {
       if (!search) return true;
-      return `${row.fileName || ''} ${row.jobId || ''}`.toLowerCase().includes(search);
+      return `${row.fileName || ''} ${row.jobId || ''} ${row.sourceTag || ''} ${row.volumeSetName || ''}`.toLowerCase().includes(search);
     });
     if (els.uploadsBadge) els.uploadsBadge.textContent = String(state.uploadedJobs.length || 0);
     const hasAnyUploads = state.uploadedJobs.length > 0;
@@ -555,6 +623,15 @@
       const normalizedStatus = normalizeProcessStatus(row.status || 'queued');
       const progress = Math.max(0, Math.min(100, Number(row.progress ?? 0)));
       const showProgress = normalizedStatus === 'queued' || normalizedStatus === 'processing';
+      const sourceTag = String(row.sourceTag || '').trim().toUpperCase();
+      const sourceMeta = sourceTag
+        ? `
+            <div class="file-meta-row">
+              <span class="job-source-chip job-source-${escapeHtml(sourceTag.toLowerCase())}">${escapeHtml(sourceTag)}</span>
+              ${sourceTag === 'VT' && row.volumeSetName ? `<span class="job-source-meta">Set: ${escapeHtml(row.volumeSetName)}</span>` : ''}
+            </div>
+          `
+        : '';
       const actionButtons =
         normalizedStatus === 'processing'
           ? `
@@ -581,6 +658,7 @@
         <td class="file-name-cell">
           <strong>${escapeHtml(row.fileName || 'document.pdf')}</strong>
           <div class="subtle-id">${escapeHtml(row.jobId || '')}</div>
+          ${sourceMeta}
         </td>
         <td>${escapeHtml(formatBytes(row.sizeBytes))}</td>
         <td>${escapeHtml(formatDate(row.lastModified || row.createdAt))}</td>
@@ -1070,8 +1148,16 @@
     if (els.menuUploads) els.menuUploads.setAttribute('aria-current', state.view === 'uploads' ? 'page' : 'false');
     if (els.menuProcessing) els.menuProcessing.setAttribute('aria-current', state.view === 'processing' ? 'page' : 'false');
     const canAccessCrmAttachments = state.authRole === 'evaluator' || state.authRole === 'admin';
-    if (state.view === 'uploads' && canAccessCrmAttachments) startCrmStatusPolling();
-    else stopCrmStatusPolling();
+    if (state.view === 'uploads') {
+      if (canAccessCrmAttachments) startCrmStatusPolling();
+      if (state.authRole) {
+        syncOwnedJobs().catch(() => {
+          // best-effort sync only
+        });
+      }
+    } else {
+      stopCrmStatusPolling();
+    }
     setGoogleVisionReparseVisibility(state.parseDiagnostics || null);
   }
 
