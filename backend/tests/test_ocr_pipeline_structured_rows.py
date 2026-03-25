@@ -3,6 +3,7 @@ from pathlib import Path
 from app.bank_profiles import PROFILES
 from app.ocr import pipeline as ocr_pipeline
 from app.ocr.pipeline import _filter_rows_and_bounds, _normalize_structured_ai_rows, _normalize_structured_row_date
+from PIL import Image
 
 
 def test_normalize_structured_row_date_to_mdy():
@@ -164,6 +165,37 @@ def test_run_pipeline_text_fallback_uses_modern_ocr_pipeline(monkeypatch, tmp_pa
     assert result["parse_mode"] == "google_vision"
     assert "page_001" in result["parsed_rows"]
     assert result["diagnostics"]["job"]["ocr_backend"] == "openai_vision"
+
+
+def test_prepare_ocr_pages_renders_once_and_reuses_rendered_pages(monkeypatch, tmp_path: Path):
+    input_pdf = tmp_path / "statement.pdf"
+    input_pdf.write_bytes(b"%PDF-1.4\n%%EOF")
+    pages_dir = tmp_path / "pages"
+    cleaned_dir = tmp_path / "cleaned"
+
+    render_calls = []
+
+    def _fake_convert_from_path(pdf_path: str, dpi: int, fmt: str):
+        render_calls.append({"pdf_path": pdf_path, "dpi": dpi, "fmt": fmt})
+        return [Image.new("RGB", (100, 200), color="white"), Image.new("RGB", (100, 200), color="white")]
+
+    monkeypatch.setattr(ocr_pipeline, "pdfinfo_from_path", lambda _path: {"Pages": 2})
+    monkeypatch.setattr(ocr_pipeline, "convert_from_path", _fake_convert_from_path)
+    monkeypatch.setattr(ocr_pipeline, "scanned_render_dpi", lambda: 180)
+
+    page_files = ocr_pipeline.prepare_ocr_pages(
+        input_pdf=input_pdf,
+        pages_dir=pages_dir,
+        cleaned_dir=cleaned_dir,
+        report=lambda *_args, **_kwargs: None,
+    )
+
+    assert page_files == ["page_001.png", "page_002.png"]
+    assert render_calls == [{"pdf_path": str(input_pdf), "dpi": 180, "fmt": "png"}]
+    assert (pages_dir / "page_001.png").exists()
+    assert (pages_dir / "page_002.png").exists()
+    assert not (cleaned_dir / "page_001.png").exists()
+    assert not (cleaned_dir / "page_002.png").exists()
 
 
 def _ocr_item(text: str, x1: int, y1: int, x2: int, y2: int) -> dict:

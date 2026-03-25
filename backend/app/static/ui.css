@@ -1411,6 +1411,12 @@ button:active,
   color: #1c5a31;
 }
 
+.parsed-header-icon-btn.is-busy {
+  border-color: #d8c38f;
+  background: #fff8e7;
+  color: #8b6412;
+}
+
 .parsed-header-icon {
   width: 18px;
   height: 18px;
@@ -1436,6 +1442,10 @@ button:active,
   background: #ffffff;
   box-shadow: 0 24px 60px rgba(28, 40, 76, 0.22);
   padding: 18px;
+}
+
+.ui-modal-card-lg {
+  width: min(100%, 760px);
 }
 
 .ui-modal-head {
@@ -1501,6 +1511,38 @@ button:active,
   justify-content: flex-end;
   gap: 8px;
   margin-top: 14px;
+}
+
+.ui-modal-status {
+  margin-top: 14px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid #d7deef;
+  background: #f6f8fd;
+  color: #31405f;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.ui-modal-status.is-error {
+  border-color: #ebc2c7;
+  background: #fff3f4;
+  color: #8d2332;
+}
+
+.ui-modal-code {
+  margin: 0;
+  max-height: 360px;
+  overflow: auto;
+  padding: 14px;
+  border-radius: 14px;
+  border: 1px solid #d6deef;
+  background: #0f1726;
+  color: #e8eefc;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .parsed-json-wrap {

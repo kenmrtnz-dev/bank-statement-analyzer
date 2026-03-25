@@ -25,3 +25,42 @@ def test_compute_summary_includes_monthly_credit_and_disposable_income_and_avera
     assert jan["debit_count"] == 2
     assert jan["credit_count"] == 2
     assert jan["adb"] == expected_adb
+
+
+def test_compute_summary_excludes_opening_balance_rows_from_transaction_counts():
+    rows = [
+        {
+            "date": "01/01/2026",
+            "description": "Beginning balance",
+            "debit": None,
+            "credit": 1000,
+            "balance": 1000,
+            "row_type": "opening_balance",
+        },
+        {
+            "date": "01/02/2026",
+            "description": "Deposit",
+            "debit": None,
+            "credit": 300,
+            "balance": 1300,
+            "row_type": "transaction",
+        },
+        {
+            "date": "01/03/2026",
+            "description": "Withdrawal",
+            "debit": 50,
+            "credit": None,
+            "balance": 1250,
+            "row_type": "transaction",
+        },
+    ]
+
+    summary = compute_summary(rows)
+
+    assert summary["total_transactions"] == 2
+    assert summary["credit_transactions"] == 1
+    assert summary["debit_transactions"] == 1
+    assert summary["total_credit"] == 300.0
+    assert summary["total_debit"] == 50.0
+    assert summary["ending_balance"] == 1250.0
+    assert summary["adb"] == round((1000 + 1300 + 1250) / 3, 2)

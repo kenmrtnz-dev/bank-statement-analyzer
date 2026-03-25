@@ -22,6 +22,7 @@ from app.jobs.service import (
     get_ocr_openai_raw_page,
     get_parse_diagnostics,
     get_page_bounds,
+    get_page_ai_fix,
     get_page_notes,
     get_page_rows,
     get_pages_status,
@@ -158,6 +159,11 @@ def get_parsed_page_endpoint(job_id: uuid.UUID, page: str):
 @router.get("/jobs/{job_id}/pages/{page}/notes")
 def get_page_notes_endpoint(job_id: uuid.UUID, page: str):
     return get_page_notes(str(job_id), page)
+
+
+@router.post("/jobs/{job_id}/pages/{page}/ai-fix")
+def get_page_ai_fix_endpoint(job_id: uuid.UUID, page: str):
+    return get_page_ai_fix(str(job_id), page)
 
 
 @router.put("/jobs/{job_id}/pages/{page}/notes")

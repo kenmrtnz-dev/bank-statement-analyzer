@@ -1,6 +1,5 @@
 services:
   migrate:
-    platform: linux/amd64
     build:
       context: .
     container_name: ocr_migrate
@@ -16,7 +15,6 @@ services:
     restart: "no"
 
   api:
-    platform: linux/amd64
     build:
       context: .
     container_name: ocr_api
@@ -39,7 +37,6 @@ services:
     command: ["./scripts/run-api.sh"]
 
   worker:
-    platform: linux/amd64
     build:
       context: .
     container_name: ocr_worker
