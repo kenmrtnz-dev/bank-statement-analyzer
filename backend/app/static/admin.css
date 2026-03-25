@@ -717,6 +717,100 @@ label {
   min-width: 1060px;
 }
 
+.users-admin-table {
+  min-width: 980px;
+  table-layout: fixed;
+}
+
+.users-admin-table-wrap {
+  max-height: 420px;
+}
+
+.users-row-meta {
+  display: grid;
+  gap: 6px;
+}
+
+.user-row-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.user-row-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  border-radius: 999px;
+  border: 1px solid #d8dced;
+  background: #f6f8ff;
+  color: #556183;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 0 7px;
+}
+
+.user-row-badge.current {
+  border-color: #bfdbff;
+  background: #ebf4ff;
+  color: #2f568d;
+}
+
+.user-row-badge.protected {
+  border-color: #eed9a4;
+  background: #fff8e5;
+  color: #8a6700;
+}
+
+.users-admin-table input,
+.users-admin-table select {
+  width: 100%;
+  min-height: 34px;
+  border-radius: 8px;
+  border: 1px solid #d7dced;
+  background: #fff;
+  color: #1f2944;
+  font-size: 12px;
+  padding: 0 10px;
+  box-shadow: none;
+}
+
+.users-admin-table input:focus,
+.users-admin-table select:focus {
+  border-color: #c8cdfc;
+  box-shadow: 0 0 0 3px rgba(80, 70, 229, 0.08);
+  outline: none;
+}
+
+.user-row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.user-row-actions button {
+  min-width: 82px;
+}
+
+.user-row-delete-btn {
+  border-color: #dfb1be;
+  background: #fff6f8;
+  color: #ab3d53;
+  box-shadow: none;
+}
+
+.user-row-delete-btn:hover {
+  transform: none;
+  box-shadow: none;
+  border-color: #d99dae;
+}
+
+.user-row-delete-btn:disabled {
+  border-color: #e6e8ef;
+  background: #f7f8fb;
+  color: #98a1b8;
+}
+
 .jobs-status-pill {
   display: inline-flex;
   align-items: center;
@@ -1311,6 +1405,39 @@ textarea {
   width: 10%;
 }
 
+.admin-panel[data-tab-panel="accounts"] .users-admin-table th,
+.admin-panel[data-tab-panel="accounts"] .users-admin-table td {
+  font-size: 11px;
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+}
+
+.admin-panel[data-tab-panel="accounts"] .users-admin-table th:nth-child(1),
+.admin-panel[data-tab-panel="accounts"] .users-admin-table td:nth-child(1) {
+  width: 23%;
+}
+
+.admin-panel[data-tab-panel="accounts"] .users-admin-table th:nth-child(2),
+.admin-panel[data-tab-panel="accounts"] .users-admin-table td:nth-child(2) {
+  width: 23%;
+}
+
+.admin-panel[data-tab-panel="accounts"] .users-admin-table th:nth-child(3),
+.admin-panel[data-tab-panel="accounts"] .users-admin-table td:nth-child(3) {
+  width: 14%;
+}
+
+.admin-panel[data-tab-panel="accounts"] .users-admin-table th:nth-child(4),
+.admin-panel[data-tab-panel="accounts"] .users-admin-table td:nth-child(4) {
+  width: 22%;
+}
+
+.admin-panel[data-tab-panel="accounts"] .users-admin-table th:nth-child(5),
+.admin-panel[data-tab-panel="accounts"] .users-admin-table td:nth-child(5) {
+  width: 18%;
+}
+
 .admin-panel[data-tab-panel="transactions"] .transactions-cell-description,
 .admin-panel[data-tab-panel="transactions"] .transactions-cell-bounds {
   min-width: 0;
@@ -1458,6 +1585,14 @@ textarea {
 }
 
 @media (max-width: 760px) {
+  .admin-panel[data-tab-panel="accounts"] .users-admin-table-wrap {
+    overflow-x: auto;
+  }
+
+  .admin-panel[data-tab-panel="accounts"] .users-admin-table {
+    min-width: 920px;
+  }
+
   .admin-panel[data-tab-panel="jobs"] .jobs-admin-table-wrap,
   .admin-panel[data-tab-panel="jobs"] .jobs-result-table-wrap {
     overflow-x: auto;

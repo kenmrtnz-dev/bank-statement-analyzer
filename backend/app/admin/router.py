@@ -17,8 +17,8 @@ from app.admin.service import (
     set_bank_code_flags,
     set_upload_testing_enabled,
 )
-from app.auth.deps import require_admin
-from app.auth.service import create_evaluator_account
+from app.auth.deps import get_current_user, require_admin
+from app.auth.service import create_evaluator_account, delete_user_account, list_users, update_user_account
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin)])
 
@@ -26,6 +26,12 @@ router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(requir
 class CreateEvaluatorPayload(BaseModel):
     username: str
     password: str
+
+
+class UpdateUserPayload(BaseModel):
+    username: str | None = None
+    password: str | None = None
+    role: str | None = None
 
 
 class UploadTestingTogglePayload(BaseModel):
@@ -47,6 +53,30 @@ class BankCodeFlagsPayload(BaseModel):
 def create_evaluator(payload: CreateEvaluatorPayload):
     create_evaluator_account(payload.username, payload.password)
     return {"ok": True, "username": payload.username, "role": "evaluator"}
+
+
+@router.get("/users")
+def get_users(current_user=Depends(get_current_user)):
+    rows = list_users(acting_username=str(current_user.get("username") or "").strip())
+    return {"ok": True, "rows": rows, "count": len(rows)}
+
+
+@router.patch("/users/{username}")
+def update_user(username: str, payload: UpdateUserPayload, current_user=Depends(get_current_user)):
+    updated = update_user_account(
+        username,
+        acting_username=str(current_user.get("username") or "").strip(),
+        next_username=payload.username,
+        next_password=payload.password,
+        next_role=payload.role,
+    )
+    return {"ok": True, "user": updated}
+
+
+@router.delete("/users/{username}")
+def delete_user(username: str, current_user=Depends(get_current_user)):
+    delete_user_account(username, acting_username=str(current_user.get("username") or "").strip())
+    return {"ok": True}
 
 
 @router.post("/clear-store")

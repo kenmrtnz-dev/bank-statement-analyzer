@@ -67,6 +67,79 @@ def test_admin_can_update_bank_code_flags_and_preserve_toggle(client):
     assert flat_rows == [{"bank_id": "TEST_BANK", "bank_name": "TEST BANK", "tx_code": "AB1", "particulars": ""}]
 
 
+def test_admin_can_list_users_with_management_flags(client):
+    client.post("/auth/logout")
+    login_admin = client.post("/auth/login", data={"username": "admin", "password": "admin123"})
+    assert login_admin.status_code == 200
+
+    res = client.get("/admin/users")
+    assert res.status_code == 200
+    payload = res.json()
+    assert payload.get("ok") is True
+    assert payload.get("count") == 2
+
+    rows = {row["username"]: row for row in payload.get("rows", [])}
+    assert rows["admin"]["role"] == "admin"
+    assert rows["admin"]["is_current_user"] is True
+    assert rows["admin"]["can_change_role"] is False
+    assert rows["admin"]["can_delete"] is False
+    assert rows["admin"]["is_last_admin"] is True
+
+    assert rows["eval_test"]["role"] == "evaluator"
+    assert rows["eval_test"]["is_current_user"] is False
+    assert rows["eval_test"]["can_change_role"] is True
+    assert rows["eval_test"]["can_delete"] is True
+
+
+def test_admin_can_update_user_username_password_and_role(client):
+    client.post("/auth/logout")
+    login_admin = client.post("/auth/login", data={"username": "admin", "password": "admin123"})
+    assert login_admin.status_code == 200
+
+    update_res = client.patch(
+        "/admin/users/eval_test",
+        json={"username": "eval_manager", "password": "newpass9", "role": "admin"},
+    )
+    assert update_res.status_code == 200
+    update_payload = update_res.json()
+    assert update_payload.get("ok") is True
+    assert update_payload["user"]["username"] == "eval_manager"
+    assert update_payload["user"]["role"] == "admin"
+
+    client.post("/auth/logout")
+    old_login = client.post("/auth/login", data={"username": "eval_test", "password": "evalpass1"})
+    assert old_login.status_code == 401
+
+    new_login = client.post("/auth/login", data={"username": "eval_manager", "password": "newpass9"})
+    assert new_login.status_code == 200
+    assert new_login.json()["role"] == "admin"
+
+
+def test_admin_can_delete_other_users_but_not_delete_or_demote_self(client):
+    client.post("/auth/logout")
+    login_admin = client.post("/auth/login", data={"username": "admin", "password": "admin123"})
+    assert login_admin.status_code == 200
+
+    delete_res = client.delete("/admin/users/eval_test")
+    assert delete_res.status_code == 200
+    assert delete_res.json().get("ok") is True
+
+    client.post("/auth/logout")
+    deleted_login = client.post("/auth/login", data={"username": "eval_test", "password": "evalpass1"})
+    assert deleted_login.status_code == 401
+
+    login_admin = client.post("/auth/login", data={"username": "admin", "password": "admin123"})
+    assert login_admin.status_code == 200
+
+    self_delete = client.delete("/admin/users/admin")
+    assert self_delete.status_code == 400
+    assert self_delete.json()["detail"] == "current_admin_delete_forbidden"
+
+    self_demote = client.patch("/admin/users/admin", json={"role": "evaluator"})
+    assert self_demote.status_code == 400
+    assert self_demote.json()["detail"] == "current_admin_role_change_forbidden"
+
+
 def test_admin_can_list_paginated_job_transactions_with_filters(client, tmp_path):
     repo = JobTransactionsRepository(tmp_path)
     repo.replace_job_rows(

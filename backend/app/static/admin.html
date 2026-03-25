@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Admin Console · Bank Statement Analyzer</title>
-    <link rel="stylesheet" href="/static/admin.css?v=20260305a" />
+    <link rel="stylesheet" href="/static/admin.css?v=20260325a" />
   </head>
   <body>
     <main class="admin-shell">
@@ -22,7 +22,7 @@
             <span class="nav-icon" aria-hidden="true">AC</span>
             <span class="nav-copy">
               <strong>Accounts</strong>
-              <small>Create evaluator access</small>
+              <small>Create and manage users</small>
             </span>
           </button>
           <button class="admin-nav-btn" type="button" data-tab-target="jobs">
@@ -90,65 +90,104 @@
         </div>
 
         <section class="admin-panel is-active" data-tab-panel="accounts">
-          <div class="panel-grid">
-            <article class="admin-card user-mgmt-card">
-              <div class="card-head">
-                <h2>Create Evaluator Account</h2>
-                <span class="card-tag">Accounts</span>
+          <div class="panel-stack">
+            <div class="panel-grid">
+              <article class="admin-card user-mgmt-card">
+                <div class="card-head">
+                  <h2>Create Evaluator Account</h2>
+                  <span class="card-tag">Accounts</span>
+                </div>
+                <p>Provision evaluator credentials for upload, parsing, and review workflows.</p>
+                <form id="createEvaluatorForm" class="stack">
+                  <label>
+                    Username
+                    <input id="evUsername" type="text" placeholder="evaluator_username" required />
+                  </label>
+                  <label>
+                    Password
+                    <input
+                      id="evPassword"
+                      type="password"
+                      minlength="6"
+                      placeholder="minimum 6 characters"
+                      autocomplete="new-password"
+                      required
+                    />
+                  </label>
+                  <button type="submit">Create Evaluator</button>
+                </form>
+                <p id="createEvaluatorFeedback" class="inline-feedback hidden"></p>
+              </article>
+
+              <div class="panel-stack">
+                <article class="admin-card">
+                  <div class="card-head">
+                    <h2>Access Model</h2>
+                    <span class="card-tag">Policy</span>
+                  </div>
+                  <ul class="admin-list">
+                    <li>Admin accounts manage evaluator credentials and backend controls.</li>
+                    <li>Evaluator accounts access upload, parsing, and review workflows.</li>
+                    <li>Passwords remain write-only and can be replaced without exposing stored secrets.</li>
+                  </ul>
+                </article>
+
+                <article class="admin-card">
+                  <div class="card-head">
+                    <h2>Session Guardrails</h2>
+                    <span class="card-tag">Live</span>
+                  </div>
+                  <div class="detail-grid">
+                    <div class="detail-item">
+                      <span>Signed in as</span>
+                      <strong id="sessionSummaryUser">-</strong>
+                    </div>
+                    <div class="detail-item">
+                      <span>Role</span>
+                      <strong>admin</strong>
+                    </div>
+                    <div class="detail-item">
+                      <span>Route Access</span>
+                      <strong>/admin</strong>
+                    </div>
+                    <div class="detail-item">
+                      <span>Auth Method</span>
+                      <strong>Cookie Session</strong>
+                    </div>
+                  </div>
+                </article>
               </div>
-              <p>Provision evaluator credentials for upload, parsing, and review workflows.</p>
-              <form id="createEvaluatorForm" class="stack">
-                <label>
-                  Username
-                  <input id="evUsername" type="text" placeholder="evaluator_username" required />
-                </label>
-                <label>
-                  Password
-                  <input id="evPassword" type="password" minlength="6" placeholder="minimum 6 characters" required />
-                </label>
-                <button type="submit">Create Evaluator</button>
-              </form>
-              <p id="createEvaluatorFeedback" class="inline-feedback hidden"></p>
-            </article>
-
-            <div class="panel-stack">
-              <article class="admin-card">
-                <div class="card-head">
-                  <h2>Access Model</h2>
-                  <span class="card-tag">Policy</span>
-                </div>
-                <ul class="admin-list">
-                  <li>Admin accounts manage evaluator credentials and backend controls.</li>
-                  <li>Evaluator accounts access upload, parsing, and review workflows.</li>
-                  <li>Credentials are write-only from this console to avoid exposing stored secrets.</li>
-                </ul>
-              </article>
-
-              <article class="admin-card">
-                <div class="card-head">
-                  <h2>Session Guardrails</h2>
-                  <span class="card-tag">Live</span>
-                </div>
-                <div class="detail-grid">
-                  <div class="detail-item">
-                    <span>Signed in as</span>
-                    <strong id="sessionSummaryUser">-</strong>
-                  </div>
-                  <div class="detail-item">
-                    <span>Role</span>
-                    <strong>admin</strong>
-                  </div>
-                  <div class="detail-item">
-                    <span>Route Access</span>
-                    <strong>/admin</strong>
-                  </div>
-                  <div class="detail-item">
-                    <span>Auth Method</span>
-                    <strong>Cookie Session</strong>
-                  </div>
-                </div>
-              </article>
             </div>
+
+            <article class="admin-card">
+              <div class="card-head">
+                <div class="card-title-group">
+                  <h2>User Management</h2>
+                  <p>Review current accounts, update usernames or passwords, change roles, and remove access.</p>
+                </div>
+                <span id="usersResultCount" class="card-tag">Loading…</span>
+              </div>
+
+              <div class="transactions-admin-table-wrap users-admin-table-wrap">
+                <table class="transactions-admin-table users-admin-table">
+                  <thead>
+                    <tr>
+                      <th>User</th>
+                      <th>Edit Username</th>
+                      <th>Role</th>
+                      <th>New Password</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody id="usersRowsBody">
+                    <tr>
+                      <td colspan="5">Loading users…</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+              <p id="usersFeedback" class="inline-feedback hidden"></p>
+            </article>
           </div>
         </section>
 
@@ -551,6 +590,6 @@
         </div>
       </div>
     </div>
-    <script src="/static/admin.js?v=20260305d"></script>
+    <script src="/static/admin.js?v=20260325a"></script>
   </body>
 </html>

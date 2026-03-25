@@ -55,6 +55,9 @@
   const flagCodeRuleCountTag = document.getElementById('flagCodeRuleCountTag');
   const createForm = document.getElementById('createEvaluatorForm');
   const createFeedback = document.getElementById('createEvaluatorFeedback');
+  const usersResultCount = document.getElementById('usersResultCount');
+  const usersRowsBody = document.getElementById('usersRowsBody');
+  const usersFeedback = document.getElementById('usersFeedback');
   const clearForm = document.getElementById('clearStoreForm');
   const featureToggleForm = document.getElementById('featureToggleForm');
   const uploadTestingToggle = document.getElementById('uploadTestingToggle');
@@ -92,7 +95,7 @@
   const TAB_META = {
     accounts: {
       label: 'Accounts',
-      description: 'Provision evaluator access and review the authentication model.'
+      description: 'Provision access, review active accounts, and maintain authentication settings.'
     },
     jobs: {
       label: 'Jobs',
@@ -194,6 +197,14 @@
     showInlineFeedback(createFeedback, message, isError);
   }
 
+  function showUsersFeedback(message, isError = false) {
+    showInlineFeedback(usersFeedback, message, isError);
+  }
+
+  function clearUsersFeedback() {
+    usersFeedback?.classList.add('hidden');
+  }
+
   function showFeatureFeedback(message, isError = false) {
     showInlineFeedback(featureToggleFeedback, message, isError);
   }
@@ -208,6 +219,22 @@
 
   function clearTransactionsFeedback() {
     transactionsFeedback?.classList.add('hidden');
+  }
+
+  function formatAuthError(detail) {
+    const normalized = String(detail || '').trim();
+    if (!normalized) return 'Unknown error.';
+    if (normalized === 'username_required') return 'Username is required.';
+    if (normalized === 'username_no_spaces') return 'Username cannot contain spaces.';
+    if (normalized === 'password_too_short') return 'Password must be at least 6 characters.';
+    if (normalized === 'username_exists') return 'That username is already in use.';
+    if (normalized === 'user_not_found') return 'That user no longer exists.';
+    if (normalized === 'invalid_role') return 'Role must be either admin or evaluator.';
+    if (normalized === 'current_admin_delete_forbidden') return 'You cannot delete the admin account currently signed in.';
+    if (normalized === 'current_admin_role_change_forbidden') return 'You cannot change the role of the admin account currently signed in.';
+    if (normalized === 'last_admin_delete_forbidden') return 'The last admin account cannot be deleted.';
+    if (normalized === 'last_admin_role_change_forbidden') return 'The last admin account must remain an admin.';
+    return normalized;
   }
 
   async function apiJson(url, options = {}) {
@@ -332,6 +359,114 @@
     const role = String(row.owner_role || '').trim();
     if (!role) return escapeHtml(owner);
     return `${escapeHtml(owner)} <span class="transactions-cell-muted">(${escapeHtml(role)})</span>`;
+  }
+
+  function formatUserRoleLabel(role) {
+    const normalized = String(role || '').trim().toLowerCase();
+    if (normalized === 'admin') return 'Admin';
+    if (normalized === 'evaluator') return 'Evaluator';
+    return normalized || 'Unknown';
+  }
+
+  function renderUserBadges(row = {}) {
+    const badges = [`<span class="user-row-badge">${escapeHtml(formatUserRoleLabel(row.role))}</span>`];
+    if (row.is_current_user) {
+      badges.push('<span class="user-row-badge current">Current Session</span>');
+    }
+    if (row.is_last_admin) {
+      badges.push('<span class="user-row-badge protected">Protected</span>');
+    }
+    return badges.join('');
+  }
+
+  function buildUserRowHint(row = {}) {
+    if (row.is_current_user) {
+      return 'You can rename this account or replace its password here. Role and delete actions stay locked for the signed-in admin.';
+    }
+    if (row.is_last_admin) {
+      return 'This is the last admin account, so delete and role changes are blocked.';
+    }
+    return 'Leave the password blank to keep the existing secret.';
+  }
+
+  function renderUsersTable(payload = {}) {
+    if (!usersRowsBody) return;
+    const rows = Array.isArray(payload.rows) ? payload.rows : [];
+    const count = Number(payload.count ?? rows.length) || 0;
+    setText(usersResultCount, pluralize(count, 'user'));
+
+    if (!rows.length) {
+      usersRowsBody.innerHTML = '<tr><td colspan="5">No users found.</td></tr>';
+      return;
+    }
+
+    usersRowsBody.innerHTML = rows.map((row) => {
+      const username = String(row.username || '').trim();
+      const role = String(row.role || '').trim().toLowerCase();
+      const roleDisabled = row.can_change_role ? '' : 'disabled';
+      const deleteDisabled = row.can_delete ? '' : 'disabled';
+      return `
+        <tr data-username="${escapeHtml(username)}">
+          <td>
+            <div class="users-row-meta">
+              <div>
+                <strong>${escapeHtml(username || '-')}</strong>
+                <div class="subtle-id">${escapeHtml(buildUserRowHint(row))}</div>
+              </div>
+              <div class="user-row-badges">${renderUserBadges(row)}</div>
+            </div>
+          </td>
+          <td>
+            <input
+              class="user-row-username-input"
+              type="text"
+              value="${escapeHtml(username)}"
+              spellcheck="false"
+              autocomplete="off"
+            />
+          </td>
+          <td>
+            <select class="user-row-role-select" ${roleDisabled}>
+              <option value="admin" ${role === 'admin' ? 'selected' : ''}>Admin</option>
+              <option value="evaluator" ${role === 'evaluator' ? 'selected' : ''}>Evaluator</option>
+            </select>
+          </td>
+          <td>
+            <input
+              class="user-row-password-input"
+              type="password"
+              placeholder="Leave blank to keep current"
+              autocomplete="new-password"
+            />
+          </td>
+          <td>
+            <div class="user-row-actions">
+              <button class="user-save-btn" type="button">Save</button>
+              <button class="ghost-button user-row-delete-btn user-delete-btn" type="button" ${deleteDisabled}>Delete</button>
+            </div>
+          </td>
+        </tr>
+      `;
+    }).join('');
+  }
+
+  function setUsersLoadingState(message = 'Loading users…') {
+    if (!usersRowsBody) return;
+    usersRowsBody.innerHTML = `<tr><td colspan="5">${escapeHtml(message)}</td></tr>`;
+    setText(usersResultCount, message === 'Loading users…' ? 'Loading…' : 'Unavailable');
+  }
+
+  async function loadUsers() {
+    if (!usersRowsBody) return;
+    setUsersLoadingState();
+    clearUsersFeedback();
+    try {
+      const payload = await apiJson(`/admin/users?_=${Date.now()}`, { cache: 'no-store' });
+      renderUsersTable(payload);
+    } catch (err) {
+      setUsersLoadingState('Failed to load users.');
+      showUsersFeedback(`Failed to load users: ${formatAuthError(err.message)}`, true);
+    }
   }
 
   function showJobsFeedback(message, isError = false) {
@@ -1028,10 +1163,87 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       });
-      showCreateFeedback(`Evaluator "${payload.username}" created.`);
       createForm.reset();
+      await loadUsers();
+      showCreateFeedback(`Evaluator "${payload.username}" created.`);
+      showUsersFeedback(`Added "${payload.username}" to the user list.`);
     } catch (err) {
-      showCreateFeedback(`Failed to create evaluator: ${err.message}`, true);
+      showCreateFeedback(`Failed to create evaluator: ${formatAuthError(err.message)}`, true);
+    }
+  });
+
+  usersRowsBody?.addEventListener('click', async (e) => {
+    const target = e.target;
+    if (!(target instanceof HTMLElement)) return;
+
+    const saveBtn = target.closest('.user-save-btn');
+    if (saveBtn instanceof HTMLButtonElement) {
+      const row = saveBtn.closest('tr');
+      if (!(row instanceof HTMLTableRowElement)) return;
+      const originalUsername = String(row.dataset.username || '').trim();
+      const usernameInput = row.querySelector('.user-row-username-input');
+      const roleSelect = row.querySelector('.user-row-role-select');
+      const passwordInput = row.querySelector('.user-row-password-input');
+      if (!(usernameInput instanceof HTMLInputElement)) return;
+      if (!(roleSelect instanceof HTMLSelectElement)) return;
+      if (!(passwordInput instanceof HTMLInputElement)) return;
+
+      const payload = {
+        username: String(usernameInput.value || '').trim(),
+        role: String(roleSelect.value || '').trim()
+      };
+      const nextPassword = String(passwordInput.value || '');
+      if (nextPassword) {
+        payload.password = nextPassword;
+      }
+
+      const deleteBtn = row.querySelector('.user-delete-btn');
+      saveBtn.disabled = true;
+      if (deleteBtn instanceof HTMLButtonElement) deleteBtn.disabled = true;
+      clearUsersFeedback();
+
+      try {
+        await apiJson(`/admin/users/${encodeURIComponent(originalUsername)}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        await loadUsers();
+        showUsersFeedback(
+          payload.username && payload.username !== originalUsername
+            ? `Updated "${originalUsername}" as "${payload.username}".`
+            : `Updated "${originalUsername}".`
+        );
+      } catch (err) {
+        showUsersFeedback(`Failed to update "${originalUsername}": ${formatAuthError(err.message)}`, true);
+        saveBtn.disabled = false;
+        if (deleteBtn instanceof HTMLButtonElement) deleteBtn.disabled = false;
+      }
+      return;
+    }
+
+    const deleteBtn = target.closest('.user-delete-btn');
+    if (!(deleteBtn instanceof HTMLButtonElement)) return;
+    const row = deleteBtn.closest('tr');
+    if (!(row instanceof HTMLTableRowElement)) return;
+    const originalUsername = String(row.dataset.username || '').trim();
+    if (!originalUsername) return;
+    const confirmed = window.confirm(`Delete user "${originalUsername}"?\n\nThis will revoke access immediately.`);
+    if (!confirmed) return;
+
+    const saveButton = row.querySelector('.user-save-btn');
+    deleteBtn.disabled = true;
+    if (saveButton instanceof HTMLButtonElement) saveButton.disabled = true;
+    clearUsersFeedback();
+
+    try {
+      await apiJson(`/admin/users/${encodeURIComponent(originalUsername)}`, { method: 'DELETE' });
+      await loadUsers();
+      showUsersFeedback(`Deleted "${originalUsername}".`);
+    } catch (err) {
+      showUsersFeedback(`Failed to delete "${originalUsername}": ${formatAuthError(err.message)}`, true);
+      deleteBtn.disabled = false;
+      if (saveButton instanceof HTMLButtonElement) saveButton.disabled = false;
     }
   });
 
@@ -1294,7 +1506,7 @@
   requireAdmin()
     .then((ok) => {
       if (!ok) return;
-      return loadSettings().then(() => Promise.all([loadJobs(1), loadVolumeSets(), loadTransactions(1)]));
+      return loadSettings().then(() => Promise.all([loadUsers(), loadJobs(1), loadVolumeSets(), loadTransactions(1)]));
     })
     .catch(() => show('Failed to verify admin session.', true));
 })();

@@ -54,6 +54,70 @@ def _write_users(users: Dict[str, dict]):
     os.replace(tmp, USERS_FILE)
 
 
+def _normalize_username(username: str) -> str:
+    cleaned = str(username or "").strip()
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="username_required")
+    if " " in cleaned:
+        raise HTTPException(status_code=400, detail="username_no_spaces")
+    return cleaned
+
+
+def _validate_password(password: str | None, *, required: bool) -> str | None:
+    normalized = None if password is None else str(password)
+    if not required and (normalized is None or normalized == ""):
+        return None
+    if len(normalized or "") < 6:
+        raise HTTPException(status_code=400, detail="password_too_short")
+    return normalized
+
+
+def _count_admins(users: Dict[str, dict]) -> int:
+    return sum(1 for item in users.values() if str(item.get("role") or "").strip().lower() == "admin")
+
+
+def _build_user_row(
+    username: str,
+    user: dict,
+    *,
+    acting_username: str | None = None,
+    admin_count: int | None = None,
+) -> dict:
+    role = str(user.get("role") or "").strip().lower()
+    total_admins = admin_count if admin_count is not None else (1 if role == "admin" else 0)
+    is_current_user = bool(acting_username) and username == acting_username
+    is_admin = role == "admin"
+    is_last_admin = is_admin and total_admins <= 1
+    return {
+        "username": username,
+        "role": role,
+        "is_current_user": is_current_user,
+        "is_admin": is_admin,
+        "is_last_admin": is_last_admin,
+        "can_change_role": not is_current_user and not is_last_admin,
+        "can_delete": not is_current_user and not is_last_admin,
+    }
+
+
+def _sync_sessions_for_user(
+    username: str,
+    *,
+    new_username: str | None = None,
+    new_role: str | None = None,
+    delete: bool = False,
+):
+    for token, payload in list(_SESSIONS.items()):
+        if str(payload.get("username") or "") != username:
+            continue
+        if delete:
+            _SESSIONS.pop(token, None)
+            continue
+        if new_username is not None:
+            payload["username"] = new_username
+        if new_role is not None:
+            payload["role"] = new_role
+
+
 def ensure_admin_exists():
     """Seed the default admin account once so a fresh install is always accessible."""
     if not load_settings().seed_default_users:
@@ -110,13 +174,8 @@ def get_user_by_session(token: str | None) -> Optional[dict]:
 
 def create_evaluator_account(username: str, password: str):
     """Validate and store a new evaluator login in the JSON-backed user store."""
-    cleaned = str(username or "").strip()
-    if not cleaned:
-        raise HTTPException(status_code=400, detail="username_required")
-    if " " in cleaned:
-        raise HTTPException(status_code=400, detail="username_no_spaces")
-    if len(password or "") < 6:
-        raise HTTPException(status_code=400, detail="password_too_short")
+    cleaned = _normalize_username(username)
+    validated_password = _validate_password(password, required=True)
 
     with _LOCK:
         users = _load_users()
@@ -127,9 +186,103 @@ def create_evaluator_account(username: str, password: str):
             "username": cleaned,
             "role": "evaluator",
             "salt": salt,
-            "password_hash": _hash_password(password, salt),
+            "password_hash": _hash_password(validated_password or "", salt),
         }
         _write_users(users)
+
+
+def list_users(*, acting_username: str | None = None) -> list[dict]:
+    ensure_admin_exists()
+    with _LOCK:
+        users = _load_users()
+        admin_count = _count_admins(users)
+        rows = [
+            _build_user_row(username, user, acting_username=acting_username, admin_count=admin_count)
+            for username, user in users.items()
+        ]
+    return sorted(rows, key=lambda item: (item["role"] != "admin", item["username"].lower()))
+
+
+def update_user_account(
+    target_username: str,
+    *,
+    acting_username: str,
+    next_username: str | None = None,
+    next_password: str | None = None,
+    next_role: str | None = None,
+) -> dict:
+    ensure_admin_exists()
+    cleaned_target = _normalize_username(target_username)
+    cleaned_username = _normalize_username(next_username) if next_username is not None else None
+    validated_password = _validate_password(next_password, required=False)
+    normalized_role = None if next_role is None else str(next_role or "").strip().lower()
+    if normalized_role is not None and normalized_role not in {"admin", "evaluator"}:
+        raise HTTPException(status_code=400, detail="invalid_role")
+
+    with _LOCK:
+        users = _load_users()
+        existing = users.get(cleaned_target)
+        if not existing:
+            raise HTTPException(status_code=404, detail="user_not_found")
+
+        current_role = str(existing.get("role") or "").strip().lower()
+        desired_role = normalized_role if normalized_role is not None else current_role
+        desired_username = cleaned_username or cleaned_target
+
+        if desired_username != cleaned_target and desired_username in users:
+            raise HTTPException(status_code=400, detail="username_exists")
+
+        if cleaned_target == acting_username and desired_role != current_role:
+            raise HTTPException(status_code=400, detail="current_admin_role_change_forbidden")
+
+        admin_count = _count_admins(users)
+        if current_role == "admin" and desired_role != "admin" and admin_count <= 1:
+            raise HTTPException(status_code=400, detail="last_admin_role_change_forbidden")
+
+        updated = dict(existing)
+        updated["username"] = desired_username
+        updated["role"] = desired_role
+        if validated_password:
+            salt = secrets.token_hex(16)
+            updated["salt"] = salt
+            updated["password_hash"] = _hash_password(validated_password, salt)
+
+        if desired_username != cleaned_target:
+            users.pop(cleaned_target, None)
+        users[desired_username] = updated
+        _write_users(users)
+        _sync_sessions_for_user(
+            cleaned_target,
+            new_username=desired_username if desired_username != cleaned_target else None,
+            new_role=desired_role if desired_role != current_role else None,
+        )
+        return _build_user_row(
+            desired_username,
+            updated,
+            acting_username=desired_username if acting_username == cleaned_target else acting_username,
+            admin_count=_count_admins(users),
+        )
+
+
+def delete_user_account(target_username: str, *, acting_username: str) -> None:
+    ensure_admin_exists()
+    cleaned_target = _normalize_username(target_username)
+
+    with _LOCK:
+        users = _load_users()
+        existing = users.get(cleaned_target)
+        if not existing:
+            raise HTTPException(status_code=404, detail="user_not_found")
+        if cleaned_target == acting_username:
+            raise HTTPException(status_code=400, detail="current_admin_delete_forbidden")
+
+        role = str(existing.get("role") or "").strip().lower()
+        if role == "admin" and _count_admins(users) <= 1:
+            raise HTTPException(status_code=400, detail="last_admin_delete_forbidden")
+
+        users.pop(cleaned_target, None)
+        _write_users(users)
+        _sync_sessions_for_user(cleaned_target, delete=True)
 
 
 def clear_all_sessions():
