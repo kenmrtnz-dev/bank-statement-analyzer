@@ -376,6 +376,7 @@ def process_ocr_page(
     *,
     ocr_router=None,
     rate_limit_heartbeat=None,
+    raw_result_callback=None,
     header_hint: Dict | None = None,
     last_date_hint: str | None = None,
     previous_balance_hint=None,
@@ -402,16 +403,16 @@ def process_ocr_page(
             if ai_rows:
                 ai_rows = _repair_page_flow_columns(ai_rows, previous_balance_hint=previous_balance_hint)
                 _write_json_atomic(ocr_dir / f"{page_name}.json", [])
-                _write_json_atomic(
-                    ocr_dir / f"{page_name}.raw.json",
-                    {
-                        "provider": ocr_router.engine_name,
-                        "source_type": "ocr",
-                        "page": page_name,
-                        "structured_rows": structured.get("rows") or [],
-                        "ocr_items": [],
-                    },
-                )
+                raw_result_payload = {
+                    "provider": ocr_router.engine_name,
+                    "source_type": "ocr",
+                    "page": page_name,
+                    "structured_rows": structured.get("rows") or [],
+                    "ocr_items": [],
+                }
+                _write_json_atomic(ocr_dir / f"{page_name}.raw.json", raw_result_payload)
+                if raw_result_callback is not None:
+                    raw_result_callback(raw_result_payload)
                 diag = {
                     "source_type": "ocr",
                     "ocr_backend": ocr_router.engine_name,
@@ -426,16 +427,16 @@ def process_ocr_page(
 
     ocr_items = ocr_router.ocr_page(page_path)
     _write_json_atomic(ocr_dir / f"{page_name}.json", ocr_items)
-    _write_json_atomic(
-        ocr_dir / f"{page_name}.raw.json",
-        {
-            "provider": ocr_router.engine_name,
-            "source_type": "ocr",
-            "page": page_name,
-            "text": " ".join((item.get("text") or "") for item in ocr_items if isinstance(item, dict)),
-            "ocr_items": ocr_items,
-        },
-    )
+    raw_result_payload = {
+        "provider": ocr_router.engine_name,
+        "source_type": "ocr",
+        "page": page_name,
+        "text": " ".join((item.get("text") or "") for item in ocr_items if isinstance(item, dict)),
+        "ocr_items": ocr_items,
+    }
+    _write_json_atomic(ocr_dir / f"{page_name}.raw.json", raw_result_payload)
+    if raw_result_callback is not None:
+        raw_result_callback(raw_result_payload)
     if ocr_router.engine_name == "openai_vision" and ocr_router.openai_client is not None:
         raw_openai = ocr_router.openai_client.consume_last_openai_response()
         if raw_openai is not None:
@@ -817,15 +818,6 @@ def _normalize_flow_amount_decimal(value):
     if amount is None:
         return None
     if abs(amount) <= FLOW_AMOUNT_TOLERANCE:
-        return None
-    return amount
-
-
-def _normalize_flow_amount_value(value):
-    amount = _normalize_amount_value(value)
-    if amount is None:
-        return None
-    if abs(amount) <= float(FLOW_AMOUNT_TOLERANCE):
         return None
     return amount
 

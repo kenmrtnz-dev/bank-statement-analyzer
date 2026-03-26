@@ -338,6 +338,17 @@ label {
   border-color: #cfd6eb;
 }
 
+.danger-outline-button {
+  border-color: #e8bcc9;
+  color: var(--danger-strong);
+  background: #fff8fa;
+}
+
+.danger-outline-button:hover {
+  border-color: #dea1b3;
+  box-shadow: none;
+}
+
 .admin-workspace {
   padding: 18px;
   display: grid;

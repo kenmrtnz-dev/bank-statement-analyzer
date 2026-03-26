@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.exc import OperationalError
 
 from app.infra.db.models import BankCodeFlagRecord, Base, JobPageRecord, JobRecord, JobResultRawRecord, TransactionRecord
+from app.parser.validation import balance_validator
 from app.json_utils import json_default, make_json_safe
 from app.settings import load_settings
 
@@ -28,6 +29,11 @@ _DB_ENGINE_CACHE: dict[str, Engine] = {}
 _DB_ENGINE_CACHE_GUARD = threading.Lock()
 _DB_SCHEMA_READY: set[str] = set()
 logger = logging.getLogger(__name__)
+_JOB_PAGE_TYPES = {"digital", "scanned"}
+_JOB_PAGE_PROCESSING_STATUSES = {"pending", "processing", "done", "failed"}
+_JOB_ACTIVE_STATUSES = {"queued", "splitting", "processing", "parsing"}
+_JOB_TERMINAL_SUCCESS_STATUSES = {"done", "done_with_warnings", "completed"}
+_JOB_TERMINAL_STATUSES = _JOB_TERMINAL_SUCCESS_STATUSES | {"failed", "cancelled"}
 
 
 class JobsRepository:
@@ -206,12 +212,55 @@ def ensure_job_pages_schema(data_dir: str | Path) -> None:
                     conn.execute(text("ALTER TABLE job_pages RENAME COLUMN ocr_result TO raw_result"))
                     existing_columns.discard("ocr_result")
                     existing_columns.add("raw_result")
+                if "page_type" not in existing_columns:
+                    conn.execute(text("ALTER TABLE job_pages ADD COLUMN page_type VARCHAR(16) NOT NULL DEFAULT 'digital'"))
+                    existing_columns.add("page_type")
+                if "raw_text" not in existing_columns:
+                    conn.execute(text("ALTER TABLE job_pages ADD COLUMN raw_text TEXT NULL"))
+                    existing_columns.add("raw_text")
+                if "processing_status" not in existing_columns:
+                    conn.execute(
+                        text("ALTER TABLE job_pages ADD COLUMN processing_status VARCHAR(32) NOT NULL DEFAULT 'pending'")
+                    )
+                    existing_columns.add("processing_status")
             if "notes" not in existing_columns:
                 with engine.begin() as conn:
                     conn.execute(text("ALTER TABLE job_pages ADD COLUMN notes TEXT NULL"))
             if "raw_result" not in existing_columns:
                 with engine.begin() as conn:
                     conn.execute(text("ALTER TABLE job_pages ADD COLUMN raw_result JSONB NULL"))
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        """
+                        UPDATE job_pages
+                        SET page_type = CASE
+                            WHEN COALESCE(is_digital, FALSE) THEN 'digital'
+                            ELSE 'scanned'
+                        END
+                        """
+                    )
+                )
+                conn.execute(
+                    text(
+                        """
+                        UPDATE job_pages
+                        SET raw_text = NULLIF(raw_result ->> 'text', '')
+                        WHERE raw_text IS NULL
+                        """
+                    )
+                )
+                conn.execute(
+                    text(
+                        """
+                        UPDATE job_pages
+                        SET processing_status = CASE
+                            WHEN raw_result IS NOT NULL OR raw_text IS NOT NULL THEN 'done'
+                            ELSE COALESCE(NULLIF(processing_status, ''), 'pending')
+                        END
+                        """
+                    )
+                )
         with _DB_ENGINE_CACHE_GUARD:
             _DB_SCHEMA_READY.add(key)
 
@@ -347,6 +396,30 @@ def _to_decimal(value: Any) -> Decimal | None:
         return Decimal(cleaned)
     except (InvalidOperation, ValueError):
         return None
+
+
+def _normalize_job_page_type(value: Any, *, is_digital: Any | None = None) -> str:
+    text_value = str(value or "").strip().lower()
+    if text_value in _JOB_PAGE_TYPES:
+        return text_value
+    if is_digital is not None:
+        return "digital" if bool(is_digital) else "scanned"
+    return "digital"
+
+
+def _normalize_job_page_processing_status(value: Any, *, fallback: str = "pending") -> str:
+    text_value = str(value or "").strip().lower()
+    if text_value in _JOB_PAGE_PROCESSING_STATUSES:
+        return text_value
+    fallback_value = str(fallback or "").strip().lower()
+    if fallback_value in _JOB_PAGE_PROCESSING_STATUSES:
+        return fallback_value
+    return "pending"
+
+
+def _normalize_job_page_raw_text(value: Any) -> str | None:
+    text_value = str(value or "").strip()
+    return text_value or None
 
 
 def _to_float(value: Any) -> float | None:
@@ -513,76 +586,57 @@ def _compute_is_flagged(description: Any, codes: set[str]) -> bool:
     return any(_description_contains_flag_code(description, code) for code in codes)
 
 
-def _infer_balance_flow_direction(rows: list[dict[str, Any]]) -> str:
-    if len(rows) < 2:
-        return "ascending"
-    ascending_hits = 0
-    descending_hits = 0
-    for idx in range(1, len(rows)):
-        prev = rows[idx - 1] or {}
-        current = rows[idx] or {}
-        prev_bal = _to_float(prev.get("balance"))
-        curr_bal = _to_float(current.get("balance"))
-        debit = _to_float(current.get("debit"))
-        credit = _to_float(current.get("credit"))
-        if prev_bal is None or curr_bal is None:
-            continue
-        if debit is not None and credit is None:
-            if abs((prev_bal - debit) - curr_bal) <= 0.01:
-                ascending_hits += 1
-            if abs((prev_bal + debit) - curr_bal) <= 0.01:
-                descending_hits += 1
-        elif credit is not None and debit is None:
-            if abs((prev_bal + credit) - curr_bal) <= 0.01:
-                ascending_hits += 1
-            if abs((prev_bal - credit) - curr_bal) <= 0.01:
-                descending_hits += 1
-    if descending_hits > ascending_hits:
-        return "descending"
-    return "ascending"
+def _compute_disbalance_fields_by_page(
+    rows_by_page: dict[str, list[dict[str, Any]]],
+    *,
+    is_reversed: bool,
+) -> dict[str, list[dict[str, Any]]]:
+    prepared_rows_by_page: dict[str, list[dict[str, Any]]] = {}
+    ordered_rows: list[dict[str, Any]] = []
+    ordered_targets: list[tuple[str, int]] = []
 
+    for page_key, rows in (rows_by_page or {}).items():
+        page_rows: list[dict[str, Any]] = []
+        for row in rows or []:
+            payload = dict(row or {})
+            payload["is_disbalanced"] = False
+            payload["disbalance_expected_balance"] = None
+            payload["disbalance_delta"] = None
+            page_rows.append(payload)
+        prepared_rows_by_page[page_key] = page_rows
 
-def _expected_balance_for_flow(prev_balance: float | None, debit: float | None, credit: float | None, flow_direction: str) -> float | None:
-    if prev_balance is None:
-        return None
-    debit_value = debit if debit is not None else 0.0
-    credit_value = credit if credit is not None else 0.0
-    if flow_direction == "descending":
-        return prev_balance + debit_value - credit_value
-    return prev_balance - debit_value + credit_value
+    page_keys = sorted(prepared_rows_by_page.keys(), key=_page_sort_value, reverse=bool(is_reversed))
+    for page_key in page_keys:
+        page_number = _page_number_from_key(page_key)
+        page_rows = prepared_rows_by_page.get(page_key) or []
+        row_positions = range(len(page_rows) - 1, -1, -1) if is_reversed else range(len(page_rows))
+        for position in row_positions:
+            row = page_rows[position]
+            ordered_rows.append(
+                {
+                    "page_number": page_number,
+                    "row_index": position + 1,
+                    "row_number": _normalize_row_number_value(row.get("row_number"), fallback=row.get("rownumber")),
+                    "debit": row.get("debit"),
+                    "credit": row.get("credit"),
+                    "balance": row.get("balance"),
+                }
+            )
+            ordered_targets.append((page_key, position))
 
+    computed_rows = balance_validator.evaluate_ordered_balance_rows(ordered_rows, balance_logger=logger)
+    for (page_key, position), computed in zip(ordered_targets, computed_rows):
+        payload = prepared_rows_by_page[page_key][position]
+        payload["is_disbalanced"] = bool(computed.get("is_disbalanced", False))
+        if computed.get("is_disbalanced"):
+            payload["disbalance_expected_balance"] = _to_float(
+                computed.get("expected_balance").quantize(balance_validator.BALANCE_TOLERANCE)
+            )
+            payload["disbalance_delta"] = _to_float(
+                computed.get("difference").quantize(balance_validator.BALANCE_TOLERANCE)
+            )
 
-def _compute_disbalance_fields(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    output: list[dict[str, Any]] = []
-    flow_direction = _infer_balance_flow_direction(rows)
-    for idx, row in enumerate(rows):
-        payload = dict(row or {})
-        payload["is_disbalanced"] = False
-        payload["disbalance_expected_balance"] = None
-        payload["disbalance_delta"] = None
-        if idx == 0:
-            output.append(payload)
-            continue
-        prev = rows[idx - 1] or {}
-        prev_bal = _to_float(prev.get("balance"))
-        curr_bal = _to_float(payload.get("balance"))
-        debit = _to_float(payload.get("debit"))
-        credit = _to_float(payload.get("credit"))
-        has_flow = debit is not None or credit is not None
-        if prev_bal is None or curr_bal is None or not has_flow:
-            output.append(payload)
-            continue
-        expected = _expected_balance_for_flow(prev_bal, debit, credit, flow_direction)
-        if expected is None:
-            output.append(payload)
-            continue
-        delta = curr_bal - expected
-        if abs(delta) > 0.01:
-            payload["is_disbalanced"] = True
-            payload["disbalance_expected_balance"] = round(expected, 2)
-            payload["disbalance_delta"] = round(delta, 2)
-        output.append(payload)
-    return output
+    return prepared_rows_by_page
 
 
 class JobResultsRawRepository:
@@ -671,14 +725,37 @@ class JobTransactionsRepository:
             )
             return session.execute(stmt).scalar_one_or_none() is not None
 
+    def _load_job_reversal_map(self, job_ids: list[str] | set[str] | tuple[str, ...]) -> dict[str, bool]:
+        normalized_ids = sorted({str(job_id).strip() for job_id in (job_ids or []) if str(job_id).strip()})
+        if not normalized_ids:
+            return {}
+        with Session(self.engine) as session:
+            stmt = select(JobRecord.id, JobRecord.is_reversed).where(JobRecord.id.in_(normalized_ids))
+            rows = session.execute(stmt).all()
+        reversal_map = {job_id: False for job_id in normalized_ids}
+        for job_id, is_reversed in rows:
+            reversal_map[str(job_id)] = bool(is_reversed)
+        return reversal_map
+
+    def _get_job_is_reversed(self, job_id: str) -> bool:
+        return bool(self._load_job_reversal_map([str(job_id)]).get(str(job_id), False))
+
     def get_rows_by_job(self, job_id: str) -> Dict[str, list[dict[str, Any]]]:
         records = self._fetch_records(job_id, include_deleted=False)
-        rows_by_page, _ = self._records_to_payload(records, include_deleted=False)
+        rows_by_page, _ = self._records_to_payload(
+            records,
+            include_deleted=False,
+            is_reversed=self._get_job_is_reversed(job_id),
+        )
         return rows_by_page
 
     def get_bounds_by_job(self, job_id: str) -> Dict[str, list[dict[str, Any]]]:
         records = self._fetch_records(job_id, include_deleted=False)
-        _, bounds_by_page = self._records_to_payload(records, include_deleted=False)
+        _, bounds_by_page = self._records_to_payload(
+            records,
+            include_deleted=False,
+            is_reversed=self._get_job_is_reversed(job_id),
+        )
         return bounds_by_page
 
     def replace_job_rows(
@@ -690,12 +767,14 @@ class JobTransactionsRepository:
         page_metadata_by_page: Dict[str, dict[str, Any]] | None = None,
         is_manual_edit: bool = False,
     ) -> None:
+        is_reversed = self._get_job_is_reversed(job_id)
         page_payloads, tx_payloads = self._build_payloads(
             job_id=str(job_id),
             rows_by_page=rows_by_page,
             bounds_by_page=bounds_by_page or {},
             page_metadata_by_page=page_metadata_by_page or {},
             is_manual_edit=is_manual_edit,
+            is_reversed=is_reversed,
         )
         with Session(self.engine) as session:
             self._ensure_job_record(session, str(job_id))
@@ -718,12 +797,14 @@ class JobTransactionsRepository:
         is_manual_edit: bool = True,
     ) -> None:
         output_page_key = _output_page_key(page_key)
+        is_reversed = self._get_job_is_reversed(job_id)
         existing_active_rows = self.get_rows_by_job(job_id)
         existing_active_bounds = self.get_bounds_by_job(job_id)
         existing_page_metadata = self._load_page_metadata_by_job(job_id)
         existing_all_rows, existing_all_bounds = self._records_to_payload(
             self._fetch_records(job_id, include_deleted=True),
             include_deleted=True,
+            is_reversed=is_reversed,
         )
 
         page_existing_rows = existing_active_rows.get(output_page_key, [])
@@ -889,31 +970,51 @@ class JobTransactionsRepository:
         bounds_by_page: Dict[str, list[dict[str, Any]]],
         page_metadata_by_page: Dict[str, dict[str, Any]],
         is_manual_edit: bool,
+        is_reversed: bool,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         now = dt.datetime.now(dt.timezone.utc)
         page_payloads: list[dict[str, Any]] = []
         tx_payloads: list[dict[str, Any]] = []
         global_row_index = 0
         canonical_page_metadata: dict[str, dict[str, Any]] = {}
+        computed_rows_by_page = _compute_disbalance_fields_by_page(rows_by_page, is_reversed=is_reversed)
         for key, value in (page_metadata_by_page or {}).items():
             canonical_page_metadata[_output_page_key(key)] = dict(value or {})
+        existing_page_metadata = self._load_page_metadata_by_job(job_id)
 
         page_keys = set(canonical_page_metadata)
         page_keys.update(_output_page_key(key) for key in (rows_by_page or {}).keys())
+        page_keys.update(existing_page_metadata.keys())
 
         for page_key in sorted(page_keys, key=_page_sort_value):
-            rows = _compute_disbalance_fields(rows_by_page.get(page_key) or [])
+            rows = computed_rows_by_page.get(page_key) or []
             bounds_state = _prepare_bounds_state(bounds_by_page.get(page_key))
-            metadata = canonical_page_metadata.get(page_key) or {}
+            metadata = dict(existing_page_metadata.get(page_key) or {})
+            supplied_metadata = canonical_page_metadata.get(page_key) or {}
+            for meta_key, meta_value in supplied_metadata.items():
+                if meta_value is not None or meta_key not in metadata:
+                    metadata[meta_key] = meta_value
             page_number = _page_number_from_key(page_key)
             page_id = str(metadata.get("id") or uuid.uuid4())
+            page_type = _normalize_job_page_type(metadata.get("page_type"), is_digital=metadata.get("is_digital"))
+            raw_result = metadata.get("raw_result") if isinstance(metadata.get("raw_result"), (dict, list)) else None
+            raw_text = _normalize_job_page_raw_text(metadata.get("raw_text"))
+            supplied_processing_status = str(metadata.get("processing_status") or "").strip().lower()
+            processing_status = (
+                supplied_processing_status
+                if supplied_processing_status in _JOB_PAGE_PROCESSING_STATUSES
+                else ("done" if (rows or raw_result or raw_text) else "pending")
+            )
             page_payloads.append(
                 {
                     "id": page_id,
                     "job_id": str(job_id),
                     "page_number": page_number,
-                    "is_digital": bool(metadata.get("is_digital", False)),
-                    "raw_result": metadata.get("raw_result") if isinstance(metadata.get("raw_result"), (dict, list)) else None,
+                    "page_type": page_type,
+                    "raw_text": raw_text,
+                    "processing_status": processing_status,
+                    "is_digital": page_type == "digital",
+                    "raw_result": raw_result,
                     "notes": str(metadata.get("notes")) if metadata.get("notes") is not None else None,
                 }
             )
@@ -1036,6 +1137,7 @@ class JobTransactionsRepository:
         records: list[TransactionRecord],
         *,
         include_deleted: bool,
+        is_reversed: bool,
     ) -> tuple[Dict[str, list[dict[str, Any]]], Dict[str, list[dict[str, Any]]]]:
         raw_rows_by_page: Dict[str, list[dict[str, Any]]] = {}
         bounds_by_page: Dict[str, list[dict[str, Any]]] = {}
@@ -1089,13 +1191,11 @@ class JobTransactionsRepository:
                 "balance_bounds": record.balance_bounds,
             }
             bounds_by_page.setdefault(page_key, []).append(bounds_payload)
-        enriched_rows_by_page: Dict[str, list[dict[str, Any]]] = {}
+        enriched_rows_by_page = _compute_disbalance_fields_by_page(raw_rows_by_page, is_reversed=is_reversed)
         flag_codes = self._load_flag_codes()
-        for page_key, rows in raw_rows_by_page.items():
-            enriched = _compute_disbalance_fields(rows)
-            for row in enriched:
+        for rows in enriched_rows_by_page.values():
+            for row in rows:
                 row["is_flagged"] = _compute_is_flagged(row.get("description"), flag_codes)
-            enriched_rows_by_page[page_key] = enriched
         return enriched_rows_by_page, bounds_by_page
 
     def _load_flag_codes(self) -> set[str]:
@@ -1104,23 +1204,153 @@ class JobTransactionsRepository:
             rows = session.execute(stmt).scalars().all()
         return {_normalize_bank_flag_code(value) for value in rows if _normalize_bank_flag_code(value)}
 
+    @staticmethod
+    def _serialize_page_metadata(record: JobPageRecord) -> dict[str, Any]:
+        page_type = _normalize_job_page_type(getattr(record, "page_type", None), is_digital=getattr(record, "is_digital", None))
+        raw_text = _normalize_job_page_raw_text(getattr(record, "raw_text", None))
+        processing_status = _normalize_job_page_processing_status(
+            getattr(record, "processing_status", None),
+            fallback="done" if (getattr(record, "raw_result", None) is not None or raw_text) else "pending",
+        )
+        return {
+            "id": str(record.id),
+            "page_number": int(record.page_number),
+            "page_type": page_type,
+            "raw_text": raw_text,
+            "processing_status": processing_status,
+            "is_digital": page_type == "digital",
+            "raw_result": record.raw_result,
+            "notes": record.notes,
+        }
+
     def _load_page_metadata_by_job(self, job_id: str) -> dict[str, dict[str, Any]]:
         with Session(self.engine) as session:
             stmt = select(JobPageRecord).where(JobPageRecord.job_id == str(job_id)).order_by(JobPageRecord.page_number.asc())
             records = session.execute(stmt).scalars().all()
         return {
-            _page_key_from_number(int(record.page_number)): {
-                "id": str(record.id),
-                "page_number": int(record.page_number),
-                "is_digital": bool(record.is_digital),
-                "raw_result": record.raw_result,
-                "notes": record.notes,
-            }
+            _page_key_from_number(int(record.page_number)): self._serialize_page_metadata(record)
             for record in records
         }
 
     def get_page_metadata_by_job(self, job_id: str) -> dict[str, dict[str, Any]]:
         return self._load_page_metadata_by_job(job_id)
+
+    def upsert_page_metadata(
+        self,
+        job_id: str,
+        page_number: int,
+        *,
+        page_type: str | None = None,
+        is_digital: bool | None = None,
+        raw_text: str | None = None,
+        processing_status: str | None = None,
+        raw_result: dict[str, Any] | list[Any] | None = None,
+        notes: str | None = None,
+    ) -> dict[str, Any]:
+        page_number = int(page_number)
+        if page_number <= 0:
+            raise KeyError(page_number)
+
+        page_type_supplied = page_type is not None or is_digital is not None
+        normalized_page_type = _normalize_job_page_type(page_type, is_digital=is_digital) if page_type_supplied else None
+        normalized_raw_text = _normalize_job_page_raw_text(raw_text) if raw_text is not None else None
+        normalized_processing_status = (
+            _normalize_job_page_processing_status(processing_status) if processing_status is not None else None
+        )
+        note_value = None
+        if notes is not None:
+            note_value = str(notes or "").strip() or None
+
+        with Session(self.engine) as session:
+            self._ensure_job_record(session, str(job_id))
+            stmt = (
+                select(JobPageRecord)
+                .where(
+                    JobPageRecord.job_id == str(job_id),
+                    JobPageRecord.page_number == int(page_number),
+                )
+                .limit(1)
+            )
+            record = session.execute(stmt).scalar_one_or_none()
+            if record is None:
+                record = JobPageRecord(
+                    id=str(uuid.uuid4()),
+                    job_id=str(job_id),
+                    page_number=int(page_number),
+                    page_type=normalized_page_type or "digital",
+                    raw_text=normalized_raw_text,
+                    processing_status=normalized_processing_status or "pending",
+                    is_digital=(normalized_page_type or "digital") == "digital",
+                    raw_result=raw_result if raw_result is not None else None,
+                    notes=note_value,
+                )
+                session.add(record)
+            else:
+                if page_type_supplied:
+                    record.page_type = normalized_page_type or "digital"
+                    record.is_digital = record.page_type == "digital"
+                if raw_text is not None:
+                    record.raw_text = normalized_raw_text
+                if processing_status is not None:
+                    record.processing_status = normalized_processing_status or "pending"
+                if raw_result is not None:
+                    record.raw_result = raw_result
+                if notes is not None:
+                    record.notes = note_value
+                if not page_type_supplied:
+                    record.is_digital = _normalize_job_page_type(getattr(record, "page_type", None), is_digital=record.is_digital) == "digital"
+            session.commit()
+            return self._serialize_page_metadata(record)
+
+    def update_page_intake_fields(
+        self,
+        job_id: str,
+        page_number: int,
+        *,
+        page_type: str | None = None,
+        is_digital: bool | None = None,
+        raw_text: str | None = None,
+        processing_status: str | None = None,
+        raw_result: dict[str, Any] | list[Any] | None = None,
+    ) -> dict[str, Any]:
+        page_number = int(page_number)
+        if page_number <= 0:
+            raise KeyError(page_number)
+
+        page_type_supplied = page_type is not None or is_digital is not None
+        normalized_page_type = _normalize_job_page_type(page_type, is_digital=is_digital) if page_type_supplied else None
+        normalized_raw_text = _normalize_job_page_raw_text(raw_text) if raw_text is not None else None
+        normalized_processing_status = (
+            _normalize_job_page_processing_status(processing_status) if processing_status is not None else None
+        )
+
+        with Session(self.engine) as session:
+            stmt = (
+                select(JobPageRecord)
+                .where(
+                    JobPageRecord.job_id == str(job_id),
+                    JobPageRecord.page_number == int(page_number),
+                )
+                .limit(1)
+            )
+            record = session.execute(stmt).scalar_one_or_none()
+            if record is None:
+                raise KeyError(f"{job_id}:{page_number}")
+
+            if page_type_supplied:
+                record.page_type = normalized_page_type or "digital"
+                record.is_digital = record.page_type == "digital"
+            if raw_text is not None:
+                record.raw_text = normalized_raw_text
+            if processing_status is not None:
+                record.processing_status = normalized_processing_status or "pending"
+            if raw_result is not None:
+                record.raw_result = raw_result
+            if not page_type_supplied:
+                record.is_digital = _normalize_job_page_type(getattr(record, "page_type", None), is_digital=record.is_digital) == "digital"
+
+            session.commit()
+            return self._serialize_page_metadata(record)
 
     def get_page_notes(self, job_id: str, page_key: str) -> str | None:
         page_number = _page_number_from_key(page_key)
@@ -1160,6 +1390,9 @@ class JobTransactionsRepository:
                     id=str(uuid.uuid4()),
                     job_id=str(job_id),
                     page_number=int(page_number),
+                    page_type="scanned",
+                    raw_text=None,
+                    processing_status="pending",
                     is_digital=False,
                     raw_result=None,
                     notes=note_value,
@@ -1176,50 +1409,52 @@ class JobTransactionsRepository:
 
     def _compute_record_extras(self, records: list[TransactionRecord]) -> dict[str, dict[str, Any]]:
         extras_by_id: dict[str, dict[str, Any]] = {}
-        grouped: dict[str, list[tuple[TransactionRecord, dict[str, Any]]]] = {}
-        page_counters: dict[str, int] = {}
-        for record in records:
-            page_number = int(record.page.page_number if record.page else 0)
-            page_key = _page_key_from_number(page_number)
-            page_counters[page_key] = page_counters.get(page_key, 0) + 1
-            row_payload = {
-                "row_id": f"{page_counters[page_key]:03}",
-                "rownumber": record.row_number,
-                "row_number": str(record.row_number or ""),
-                "date": str(record.date or ""),
-                "description": str(record.description or ""),
-                "debit": _to_float(record.debit),
-                "credit": _to_float(record.credit),
-                "balance": _to_float(record.balance),
-                "row_type": str(record.row_type or "transaction"),
-                "is_new_row": bool(record.is_new_row),
-                "is_modified": bool(record.is_modified),
-                "is_deleted": bool(record.is_deleted),
-            }
-            grouped.setdefault(page_key, []).append((record, row_payload))
-
+        if not records:
+            return extras_by_id
         flag_codes = self._load_flag_codes()
-        for page_key, items in grouped.items():
-            computed_rows = _compute_disbalance_fields([payload for _, payload in items])
-            page_number = _page_number_from_key(page_key)
-            for (record, row_payload), computed in zip(items, computed_rows):
-                extras_by_id[str(record.id)] = {
-                    "page_number": page_number,
-                    "row_id": row_payload["row_id"],
-                    "is_flagged": _compute_is_flagged(computed.get("description"), flag_codes),
-                    "is_disbalanced": bool(computed.get("is_disbalanced", False)),
-                    "disbalance_expected_balance": computed.get("disbalance_expected_balance"),
-                    "disbalance_delta": computed.get("disbalance_delta"),
-                }
-        return extras_by_id
+        reversal_map = self._load_job_reversal_map({str(record.job_id) for record in records})
 
-    def _sync_flagged_status(
-        self,
-        job_id: str | None = None,
-        *,
-        session: Session | None = None,
-    ) -> None:
-        return None
+        for job_id in sorted({str(record.job_id) for record in records}):
+            full_records = self._fetch_records(job_id, include_deleted=True)
+            grouped: dict[str, list[tuple[TransactionRecord, dict[str, Any]]]] = {}
+            page_counters: dict[str, int] = {}
+            for record in full_records:
+                page_number = int(record.page.page_number if record.page else 0)
+                page_key = _page_key_from_number(page_number)
+                page_counters[page_key] = page_counters.get(page_key, 0) + 1
+                row_payload = {
+                    "row_id": f"{page_counters[page_key]:03}",
+                    "rownumber": record.row_number,
+                    "row_number": str(record.row_number or ""),
+                    "date": str(record.date or ""),
+                    "description": str(record.description or ""),
+                    "debit": _to_float(record.debit),
+                    "credit": _to_float(record.credit),
+                    "balance": _to_float(record.balance),
+                    "row_type": str(record.row_type or "transaction"),
+                    "is_new_row": bool(record.is_new_row),
+                    "is_modified": bool(record.is_modified),
+                    "is_deleted": bool(record.is_deleted),
+                }
+                grouped.setdefault(page_key, []).append((record, row_payload))
+
+            computed_rows_by_page = _compute_disbalance_fields_by_page(
+                {page_key: [payload for _, payload in items] for page_key, items in grouped.items()},
+                is_reversed=reversal_map.get(job_id, False),
+            )
+            for page_key, items in grouped.items():
+                page_number = _page_number_from_key(page_key)
+                computed_rows = computed_rows_by_page.get(page_key) or []
+                for (record, row_payload), computed in zip(items, computed_rows):
+                    extras_by_id[str(record.id)] = {
+                        "page_number": page_number,
+                        "row_id": row_payload["row_id"],
+                        "is_flagged": _compute_is_flagged(computed.get("description"), flag_codes),
+                        "is_disbalanced": bool(computed.get("is_disbalanced", False)),
+                        "disbalance_expected_balance": computed.get("disbalance_expected_balance"),
+                        "disbalance_delta": computed.get("disbalance_delta"),
+                    }
+        return extras_by_id
 
 
 def _parse_iso_datetime(value: Any) -> dt.datetime | None:
@@ -1286,11 +1521,11 @@ class JobStateRepository:
                 record.pages = page_count
                 record.is_reversed = is_reversed
 
-            if record.started_at is None and job_status in {"queued", "processing", "done", "done_with_warnings", "failed", "cancelled"}:
+            if record.started_at is None and job_status in (_JOB_ACTIVE_STATUSES | _JOB_TERMINAL_STATUSES):
                 record.started_at = status_updated_at or now_utc
-            if job_status in {"done", "done_with_warnings", "failed", "cancelled"}:
+            if job_status in _JOB_TERMINAL_STATUSES:
                 record.ended_at = explicit_cancelled_at or status_updated_at or now_utc
-            elif job_status in {"queued", "processing"}:
+            elif job_status in _JOB_ACTIVE_STATUSES:
                 record.ended_at = None
             session.commit()
 

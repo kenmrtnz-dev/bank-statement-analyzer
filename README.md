@@ -5,14 +5,14 @@ Minimal bank-statement workflow:
 - Auto-select parser (`text` when PDF has text layer, otherwise `ocr`)
 - Extract transaction rows + row bounds
 - View parsed output + summary
-- Export PDF summary or CSV rows
+- Export PDF summary or XLSX rows
 
 ## Kept Features
 - File upload
 - PDF text parsing
 - OCR parsing for scanned docs (separate OCR module)
 - Row bounds endpoint for table-row click highlighting
-- Exports (PDF + CSV)
+- Exports (PDF + XLSX)
 - Summary metrics
 
 ## Auth and Roles
@@ -158,6 +158,8 @@ On Apple Silicon, the compose stack now runs native `arm64` images by default in
 - `mode=pdftotext` forces the modern text-layer pipeline.
 - `mode=google_vision` forces the modern OCR pipeline.
 - Data is stored in `${DATA_DIR:-<repo>/storage}/jobs/<job_id>/...`.
+- Volume-test uploads are stored in `${DATA_DIR:-<repo>/storage}/.volume_sets/<set_name>/...`.
+- Each VT set keeps uploader metadata in `${DATA_DIR:-<repo>/storage}/.volume_sets/<set_name>/.volume-set.json`.
 - Scanned PDFs route to Google Vision OCR:
   - `SCANNED_RENDER_DPI=180`
   - `GOOGLE_VISION_API_KEY` (or `GOOGLE_APPLICATION_CREDENTIALS`)

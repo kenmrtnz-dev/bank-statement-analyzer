@@ -1,7 +1,5 @@
-import json
 import os
 from decimal import Decimal
-from pathlib import Path
 
 from app.jobs import service as jobs_service
 from sqlalchemy import create_engine, text
@@ -93,27 +91,12 @@ def test_job_flow_with_mocked_pipeline(client, monkeypatch):
         jobs_service.process_job(job_id=job_id, parse_mode=parse_mode, task_id="inline-task-1")
         return "inline-task-1"
 
-    def _prepare_pages(*, input_pdf, pages_dir, cleaned_dir, report):
-        pages_dir.mkdir(parents=True, exist_ok=True)
-        cleaned_dir.mkdir(parents=True, exist_ok=True)
-        (pages_dir / "page_001.png").write_bytes(b"png")
-        return ["page_001.png"]
-
-    def _prepare_page_routing_inputs(*, repo, job_id, input_pdf, page_files, requested_mode):
-        repo.write_json(
-            jobs_service._page_raw_result_path(repo, job_id, "page_001"),
-            {
-                "provider": "pdftotext",
-                "source_type": "text",
-                "page_number": 1,
-                "width": 1000.0,
-                "height": 1400.0,
-                "text": "Deposit",
-                "words": [{"text": "Deposit", "x1": 100.0, "y1": 200.0, "x2": 900.0, "y2": 250.0}],
-                "is_digital": True,
-            },
-        )
-        return {"page_001": "text"}
+    def _split_pdf_into_page_pdfs(*, repo, job_id, input_pdf):
+        del input_pdf
+        split_dir = repo.path(job_id, "split")
+        split_dir.mkdir(parents=True, exist_ok=True)
+        (split_dir / "page_001.pdf").write_bytes(b"%PDF-1.4\n")
+        return ["page_001"]
 
     def _enqueue_page_job(job_id: str, parse_mode: str, page_name: str, page_index: int, page_count: int) -> str:
         task_id = f"task-{page_name}"
@@ -155,8 +138,21 @@ def test_job_flow_with_mocked_pipeline(client, monkeypatch):
     monkeypatch.setattr(jobs_service, "_repair_page_flow_columns", lambda rows, previous_balance_hint=None: rows)
 
     monkeypatch.setattr(jobs_service, "_enqueue_job", _run_inline_enqueue)
-    monkeypatch.setattr(jobs_service, "prepare_ocr_pages", _prepare_pages)
-    monkeypatch.setattr(jobs_service, "_prepare_page_routing_inputs", _prepare_page_routing_inputs)
+    monkeypatch.setattr(
+        jobs_service,
+        "_extract_text_page_raw_result",
+        lambda **_kwargs: {
+            "provider": "pdftotext",
+            "source_type": "text",
+            "page_number": 1,
+            "width": 1000.0,
+            "height": 1400.0,
+            "text": "Deposit",
+            "words": [{"text": "Deposit", "x1": 100.0, "y1": 200.0, "x2": 900.0, "y2": 250.0}],
+            "is_digital": True,
+        },
+    )
+    monkeypatch.setattr(jobs_service, "_split_pdf_into_page_pdfs", _split_pdf_into_page_pdfs)
     monkeypatch.setattr(jobs_service, "_enqueue_page_job", _enqueue_page_job)
     monkeypatch.setattr(jobs_service, "_enqueue_finalize_job", _enqueue_finalize_job)
 
@@ -178,7 +174,7 @@ def test_job_flow_with_mocked_pipeline(client, monkeypatch):
 
     status = client.get(f"/jobs/{job_id}")
     assert status.status_code == 200
-    assert status.json().get("status") == "done"
+    assert status.json().get("status") == "completed"
 
     pages_status = client.get(f"/jobs/{job_id}/pages/status")
     assert pages_status.status_code == 200
@@ -259,12 +255,12 @@ def test_job_flow_with_google_vision_uses_modern_pipeline(client, monkeypatch):
         jobs_service.process_job(job_id=job_id, parse_mode=parse_mode, task_id="inline-task-google")
         return "inline-task-google"
 
-    def _prepare_pages(*, input_pdf, pages_dir, cleaned_dir, report):
-        pages_dir.mkdir(parents=True, exist_ok=True)
-        cleaned_dir.mkdir(parents=True, exist_ok=True)
-        (pages_dir / "page_001.png").write_bytes(b"png")
-        (cleaned_dir / "page_001.png").write_bytes(b"png")
-        return ["page_001.png"]
+    def _split_pdf_into_page_pdfs(*, repo, job_id, input_pdf):
+        del input_pdf
+        split_dir = repo.path(job_id, "split")
+        split_dir.mkdir(parents=True, exist_ok=True)
+        (split_dir / "page_001.pdf").write_bytes(b"%PDF-1.4\n")
+        return ["page_001"]
 
     def _enqueue_page_job(job_id: str, parse_mode: str, page_name: str, page_index: int, page_count: int) -> str:
         task_id = f"task-{page_name}"
@@ -284,10 +280,25 @@ def test_job_flow_with_google_vision_uses_modern_pipeline(client, monkeypatch):
 
     monkeypatch.setattr(jobs_service, "_enqueue_job", _run_inline_enqueue)
     monkeypatch.setattr(jobs_service, "resolve_parse_mode", lambda *_args, **_kwargs: "google_vision")
+    monkeypatch.setattr(jobs_service, "_split_pdf_into_page_pdfs", _split_pdf_into_page_pdfs)
     monkeypatch.setattr(
         jobs_service,
-        "prepare_ocr_pages",
-        _prepare_pages,
+        "_extract_text_page_raw_result",
+        lambda **_kwargs: {
+            "provider": "pdftotext",
+            "source_type": "ocr",
+            "page_number": 1,
+            "width": 1000.0,
+            "height": 1400.0,
+            "text": "",
+            "words": [],
+            "is_digital": False,
+        },
+    )
+    monkeypatch.setattr(
+        jobs_service,
+        "_render_split_pdf_page_to_png",
+        lambda **_kwargs: None,
     )
     monkeypatch.setattr(
         jobs_service,
@@ -339,7 +350,7 @@ def test_job_flow_with_google_vision_uses_modern_pipeline(client, monkeypatch):
     status = client.get(f"/jobs/{job_id}")
     assert status.status_code == 200
     status_payload = status.json()
-    assert status_payload["status"] == "done"
+    assert status_payload["status"] == "completed"
     assert status_payload["parse_mode"] == "google_vision"
 
     parsed = client.get(f"/jobs/{job_id}/parsed")
@@ -422,7 +433,7 @@ def test_get_status_reconciles_stale_google_vision_page_tasks(client, monkeypatc
     status = client.get(f"/jobs/{job_id}")
     assert status.status_code == 200
     payload = status.json()
-    assert payload["status"] == "done"
+    assert payload["status"] == "completed"
     assert payload["step"] == "completed"
     assert payload["progress"] == 100
     assert payload["pages_done"] == 2

@@ -593,44 +593,6 @@ def parse_page_with_profile_fallback(
     return selected_rows, selected_bounds, selected_diag
 
 
-def evaluate_quality(rows: List[Dict]) -> Dict:
-    total = len(rows)
-    if total == 0:
-        return {
-            "rows": 0,
-            "date_ratio": 0.0,
-            "balance_ratio": 0.0,
-            "flow_ratio": 0.0,
-            "passes": False,
-            "reasons": ["no_rows"],
-        }
-
-    date_ok = sum(1 for r in rows if r.get("date"))
-    balance_ok = sum(1 for r in rows if r.get("balance"))
-    flow_ok = sum(1 for r in rows if r.get("debit") or r.get("credit"))
-
-    date_ratio = date_ok / total
-    balance_ratio = balance_ok / total
-    flow_ratio = flow_ok / total
-
-    reasons = []
-    if total < 3:
-        reasons.append("few_rows")
-    if date_ratio < 0.8:
-        reasons.append("low_date_ratio")
-    if balance_ratio < 0.8:
-        reasons.append("low_balance_ratio")
-
-    return {
-        "rows": total,
-        "date_ratio": round(date_ratio, 3),
-        "balance_ratio": round(balance_ratio, 3),
-        "flow_ratio": round(flow_ratio, 3),
-        "passes": len(reasons) == 0,
-        "reasons": reasons,
-    }
-
-
 def is_transaction_row(row: Dict, profile: BankProfile) -> bool:
     if not row.get("date") or not row.get("balance"):
         return False
@@ -657,19 +619,6 @@ def is_transaction_row(row: Dict, profile: BankProfile) -> bool:
             return False
 
     return True
-
-
-def should_fallback_to_ocr(
-    text_word_count: int,
-    rows: List[Dict],
-    diagnostics: Dict,
-) -> Tuple[bool, Optional[str]]:
-    if text_word_count <= 0:
-        return True, "no_text_layer"
-
-    # Text-first speed mode: any text layer keeps the page in text parsing.
-    # OCR is reserved only for pages without extractable text.
-    return False, None
 
 
 def _rows_conversion_ratio(rows: List[Dict], diagnostics: Dict) -> float:

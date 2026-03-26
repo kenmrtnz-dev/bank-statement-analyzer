@@ -45,6 +45,7 @@
   const volumeSetReadyTag = document.getElementById('volumeSetReadyTag');
   const refreshVolumeSetDetailBtn = document.getElementById('refreshVolumeSetDetailBtn');
   const startNextVolumeFileBtn = document.getElementById('startNextVolumeFileBtn');
+  const deleteSelectedVolumeSetBtn = document.getElementById('deleteSelectedVolumeSetBtn');
   const volumeSetUploader = document.getElementById('volumeSetUploader');
   const volumeSetNextFile = document.getElementById('volumeSetNextFile');
   const volumeSetPendingCount = document.getElementById('volumeSetPendingCount');
@@ -59,6 +60,8 @@
   const usersRowsBody = document.getElementById('usersRowsBody');
   const usersFeedback = document.getElementById('usersFeedback');
   const clearForm = document.getElementById('clearStoreForm');
+  const clearVolumeSetsForm = document.getElementById('clearVolumeSetsForm');
+  const clearVolumeSetsFeedbackEl = document.getElementById('clearVolumeSetsFeedback');
   const featureToggleForm = document.getElementById('featureToggleForm');
   const uploadTestingToggle = document.getElementById('uploadTestingToggle');
   const featureToggleFeedback = document.getElementById('featureToggleFeedback');
@@ -207,6 +210,14 @@
 
   function showFeatureFeedback(message, isError = false) {
     showInlineFeedback(featureToggleFeedback, message, isError);
+  }
+
+  function showClearVolumeSetsFeedback(message, isError = false) {
+    showInlineFeedback(clearVolumeSetsFeedbackEl, message, isError);
+  }
+
+  function clearClearVolumeSetsFeedback() {
+    clearVolumeSetsFeedbackEl?.classList.add('hidden');
   }
 
   function showBankCodeFeedback(message, isError = false) {
@@ -729,6 +740,7 @@
     setText(volumeSetActiveCount, '0');
     if (refreshVolumeSetDetailBtn) refreshVolumeSetDetailBtn.disabled = !selectedVolumeSetName;
     if (startNextVolumeFileBtn) startNextVolumeFileBtn.disabled = true;
+    if (deleteSelectedVolumeSetBtn) deleteSelectedVolumeSetBtn.disabled = !selectedVolumeSetName;
     if (volumeFilesRowsBody) {
       volumeFilesRowsBody.innerHTML = `<tr><td colspan="6">${escapeHtml(message)}</td></tr>`;
     }
@@ -761,6 +773,9 @@
             <button class="volume-start-next-btn" type="button" data-set-name="${escapeHtml(row.set_name || '')}" ${row.next_file_name ? '' : 'disabled'}>
               Start Next
             </button>
+            <button class="ghost-button danger-outline-button volume-delete-set-btn" type="button" data-set-name="${escapeHtml(row.set_name || '')}">
+              Delete Set
+            </button>
           </div>
         </td>
       </tr>
@@ -789,6 +804,7 @@
     setText(volumeSetActiveCount, String(item.active_count ?? 0));
     if (refreshVolumeSetDetailBtn) refreshVolumeSetDetailBtn.disabled = !selectedVolumeSetName;
     if (startNextVolumeFileBtn) startNextVolumeFileBtn.disabled = !selectedVolumeSetName || !String(item.next_file_name || '').trim();
+    if (deleteSelectedVolumeSetBtn) deleteSelectedVolumeSetBtn.disabled = !selectedVolumeSetName;
 
     if (!files.length) {
       if (volumeFilesRowsBody) volumeFilesRowsBody.innerHTML = '<tr><td colspan="6">This set has no files.</td></tr>';
@@ -915,6 +931,49 @@
       showVolumeSetsFeedback(`Started ${payload.file_name} as VT job ${payload.job_id}.`);
     } catch (err) {
       showVolumeSetsFeedback(`Failed to start the next VT file: ${err.message}`, true);
+    }
+  }
+
+  async function deleteVolumeSet(setName) {
+    const cleanedSetName = String(setName || '').trim();
+    if (!cleanedSetName) return;
+    const confirmed = window.confirm(
+      `Delete VT set "${cleanedSetName}"?\n\nThis removes the saved source PDFs for that set. Existing jobs will be kept.`
+    );
+    if (!confirmed) return;
+    clearVolumeSetsFeedback();
+    try {
+      const payload = await apiJson(`/admin/volume-sets/${encodeURIComponent(cleanedSetName)}`, { method: 'DELETE' });
+      const nextSelectedSet = selectedVolumeSetName === cleanedSetName ? '' : selectedVolumeSetName;
+      selectedVolumeSetName = nextSelectedSet;
+      await loadVolumeSets(nextSelectedSet, { skipDetail: false });
+      if (!nextSelectedSet) {
+        setVolumeSetLoadingState('Set deleted. Select a saved set to review its files and start the next VT job.');
+      }
+      showVolumeSetsFeedback(`Deleted VT set "${cleanedSetName}" (${Number(payload.deleted_files || 0)} file(s)).`);
+    } catch (err) {
+      showVolumeSetsFeedback(`Failed to delete "${cleanedSetName}": ${err.message}`, true);
+    }
+  }
+
+  async function clearAllVolumeSets() {
+    const confirmed = window.confirm(
+      'Delete all saved VT sets?\n\nThis removes all VT source PDFs and set metadata. Existing jobs will be kept.'
+    );
+    if (!confirmed) return;
+    clearClearVolumeSetsFeedback();
+    clearVolumeSetsFeedback();
+    try {
+      const payload = await apiJson('/admin/volume-sets', { method: 'DELETE' });
+      selectedVolumeSetName = '';
+      await loadVolumeSets('', { skipDetail: true });
+      setVolumeSetLoadingState('No saved VT sets found.');
+      showClearVolumeSetsFeedback(
+        `Cleared ${Number(payload.cleared_sets || 0)} VT set(s) and ${Number(payload.cleared_files || 0)} file(s).`
+      );
+      showVolumeSetsFeedback('All saved VT sets were deleted.');
+    } catch (err) {
+      showClearVolumeSetsFeedback(`Failed to clear VT sets: ${err.message}`, true);
     }
   }
 
@@ -1124,6 +1183,7 @@
       show('Admin access required.', true);
       if (createForm) createForm.style.display = 'none';
       if (clearForm) clearForm.style.display = 'none';
+      if (clearVolumeSetsForm) clearVolumeSetsForm.style.display = 'none';
       if (featureToggleForm) featureToggleForm.style.display = 'none';
       if (flagCodesFilterForm) flagCodesFilterForm.style.display = 'none';
       if (bankCodeFlagsForm) bankCodeFlagsForm.style.display = 'none';
@@ -1250,6 +1310,11 @@
   clearForm?.addEventListener('submit', async (e) => {
     e.preventDefault();
     openConfirmModal();
+  });
+
+  clearVolumeSetsForm?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    await clearAllVolumeSets();
   });
 
   featureToggleForm?.addEventListener('submit', async (e) => {
@@ -1390,6 +1455,11 @@
     await startNextVolumeFile();
   });
 
+  deleteSelectedVolumeSetBtn?.addEventListener('click', async () => {
+    if (!selectedVolumeSetName) return;
+    await deleteVolumeSet(selectedVolumeSetName);
+  });
+
   volumeSetsRowsBody?.addEventListener('click', async (e) => {
     const target = e.target;
     if (!(target instanceof HTMLElement)) return;
@@ -1407,6 +1477,14 @@
       if (!setName) return;
       selectedVolumeSetName = setName;
       await startNextVolumeFile();
+      return;
+    }
+
+    const deleteBtn = target.closest('.volume-delete-set-btn');
+    if (deleteBtn instanceof HTMLElement) {
+      const setName = String(deleteBtn.dataset.setName || '').trim();
+      if (!setName) return;
+      await deleteVolumeSet(setName);
     }
   });
 

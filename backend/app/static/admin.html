@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Admin Console · Bank Statement Analyzer</title>
-    <link rel="stylesheet" href="/static/admin.css?v=20260325a" />
+    <link rel="stylesheet" href="/static/admin.css?v=20260326a" />
   </head>
   <body>
     <main class="admin-shell">
@@ -374,6 +374,7 @@
               <div class="volume-inline-actions">
                 <button id="refreshVolumeSetDetailBtn" type="button" class="ghost-button" disabled>Refresh Set</button>
                 <button id="startNextVolumeFileBtn" type="button" disabled>Start Next Pending</button>
+                <button id="deleteSelectedVolumeSetBtn" type="button" class="ghost-button danger-outline-button" disabled>Delete Set</button>
               </div>
 
               <div class="detail-grid volume-set-summary-grid">
@@ -573,6 +574,18 @@
                 <button type="submit" class="danger-button">Clear Jobs and Files</button>
               </form>
             </article>
+
+            <article class="admin-card danger-zone">
+              <div class="card-head">
+                <h2>Clear VT Sets</h2>
+                <span class="card-tag danger-tag">High Impact</span>
+              </div>
+              <p>Permanently remove all saved VT sets and uploaded source PDFs. Existing jobs are kept.</p>
+              <form id="clearVolumeSetsForm" class="stack">
+                <button type="submit" class="danger-button">Clear All VT Sets</button>
+              </form>
+              <p id="clearVolumeSetsFeedback" class="inline-feedback hidden"></p>
+            </article>
           </div>
         </section>
 
@@ -590,6 +603,6 @@
         </div>
       </div>
     </div>
-    <script src="/static/admin.js?v=20260325a"></script>
+    <script src="/static/admin.js?v=20260326b"></script>
   </body>
 </html>

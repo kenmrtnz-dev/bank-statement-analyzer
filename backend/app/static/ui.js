@@ -1381,11 +1381,33 @@
     return state.reversePageOrder ? rows.slice().reverse() : rows;
   }
 
+  function getOrderedRowId(row, index = 0) {
+    return String(row?.row_id || '').trim() || String(index + 1).padStart(3, '0');
+  }
+
   function getOrderedPages() {
     const pages = Array.isArray(state.pages) && state.pages.length
       ? state.pages.slice()
       : Object.keys(state.parsedByPage || {}).sort((a, b) => pageSortValue(a) - pageSortValue(b));
     return state.reversePageOrder ? pages.slice().sort((a, b) => pageSortValue(b) - pageSortValue(a)) : pages;
+  }
+
+  function getAllOrderedRowEntries() {
+    const entries = [];
+    for (const page of getOrderedPages()) {
+      const rows = getOrderedRows(page);
+      for (let idx = 0; idx < rows.length; idx += 1) {
+        const row = rows[idx] || {};
+        entries.push({
+          page,
+          rows,
+          index: idx,
+          row,
+          rowId: getOrderedRowId(row, idx),
+        });
+      }
+    }
+    return entries;
   }
 
   function collectDisbalanceEntries() {
@@ -1394,7 +1416,7 @@
       const rows = getOrderedRows(page);
       for (let idx = 0; idx < rows.length; idx += 1) {
         const current = rows[idx] || {};
-        const rowId = String(current?.row_id || '').trim() || String(idx + 1).padStart(3, '0');
+        const rowId = getOrderedRowId(current, idx);
         if (!current?.is_disbalanced) continue;
 
         const expected = toFiniteNumber(current?.disbalance_expected_balance, null);
@@ -1429,7 +1451,7 @@
 
         entries.push({
           page,
-          rowId: String(row?.row_id || '').trim() || String(idx + 1).padStart(3, '0'),
+          rowId: getOrderedRowId(row, idx),
           date: normalizeEditableCellValue(row?.date).trim(),
           description,
           bank: match?.bank || '',
@@ -1575,6 +1597,19 @@
     }
   }
 
+  async function refreshAllParsedPagesFromServer() {
+    if (!state.jobId) return;
+    const payload = await api(`/jobs/${state.jobId}/parsed`).catch(() => ({}));
+    const rowsByPage = payload && typeof payload === 'object' ? payload : {};
+    state.parsedByPage = rowsByPage;
+    state.baselineParsedByPage = {};
+    for (const page of state.pages || []) {
+      if (!Array.isArray(state.parsedByPage[page])) state.parsedByPage[page] = [];
+    }
+    state.disbalanceLoading = false;
+    state.disbalanceLoadPromise = null;
+  }
+
   function setPreviewPanelTab(tab) {
     const next = normalizePreviewPanelTab(tab);
     const wasSupplemental = state.previewPanelTab !== 'preview';
@@ -1659,7 +1694,7 @@
     const targetRowId = String(rowId || '').trim();
     if (!targetRowId) return false;
     return rows.some((row, idx) => {
-      const currentRowId = String(row?.row_id || '').trim() || String(idx + 1).padStart(3, '0');
+      const currentRowId = getOrderedRowId(row, idx);
       return currentRowId === targetRowId && Boolean(row?.is_disbalanced);
     });
   }
@@ -1920,18 +1955,25 @@
   }
 
   function findOrderedRowContext(page, rowId) {
-    const rows = getOrderedRows(page);
-    const index = rows.findIndex((row, idx) => {
-      const currentRowId = String(row?.row_id || '').trim() || String(idx + 1).padStart(3, '0');
-      return currentRowId === String(rowId || '').trim();
-    });
-    if (index < 0) return null;
-    return {
-      rows,
-      index,
-      row: rows[index],
-      prevRow: index > 0 ? rows[index - 1] : null,
-    };
+    const targetPage = String(page || '').trim();
+    const targetRowId = String(rowId || '').trim();
+    if (!targetPage || !targetRowId) return null;
+
+    let previousEntry = null;
+    for (const entry of getAllOrderedRowEntries()) {
+      if (entry.page === targetPage && entry.rowId === targetRowId) {
+        return {
+          page: entry.page,
+          rows: entry.rows,
+          index: entry.index,
+          row: entry.row,
+          prevRow: previousEntry?.row || null,
+          prevPage: previousEntry?.page || null,
+        };
+      }
+      previousEntry = entry;
+    }
+    return null;
   }
 
   function hasUsableAmountValue(raw, parsed) {
@@ -1942,92 +1984,59 @@
     return Number.isFinite(left) && Number.isFinite(right) && Math.abs(left - right) <= tolerance;
   }
 
-  function inferBalanceFlowDirection(rows) {
-    if (!Array.isArray(rows) || rows.length < 2) return null;
-
-    let ascendingHits = 0;
-    let descendingHits = 0;
-    for (let idx = 1; idx < rows.length; idx += 1) {
-      const prev = rows[idx - 1] || {};
-      const current = rows[idx] || {};
-      const prevBal = parseAmountForFormatting(prev.balance);
-      const currBal = parseAmountForFormatting(current.balance);
-      const debit = parseAmountForFormatting(current.debit);
-      const credit = parseAmountForFormatting(current.credit);
-      if (!Number.isFinite(prevBal) || !Number.isFinite(currBal)) continue;
-
-      if (Number.isFinite(debit) && !Number.isFinite(credit)) {
-        if (amountsRoughlyEqual(prevBal - debit, currBal)) ascendingHits += 1;
-        if (amountsRoughlyEqual(prevBal + debit, currBal)) descendingHits += 1;
-      } else if (Number.isFinite(credit) && !Number.isFinite(debit)) {
-        if (amountsRoughlyEqual(prevBal + credit, currBal)) ascendingHits += 1;
-        if (amountsRoughlyEqual(prevBal - credit, currBal)) descendingHits += 1;
-      }
-    }
-
-    if (ascendingHits > descendingHits) return 'ascending';
-    if (descendingHits > ascendingHits) return 'descending';
-    return null;
-  }
-
-  function expectedBalanceForFlow(prevBalance, debit, credit, flowDirection) {
+  function expectedBalanceForFlow(prevBalance, debit, credit) {
     if (!Number.isFinite(prevBalance)) return null;
-    const debitValue = Number.isFinite(debit) ? debit : 0;
-    const creditValue = Number.isFinite(credit) ? credit : 0;
-    if (flowDirection === 'descending') {
-      return prevBalance + debitValue - creditValue;
-    }
+    const debitValue = Number.isFinite(debit) ? Math.abs(debit) : 0;
+    const creditValue = Number.isFinite(credit) ? Math.abs(credit) : 0;
     return prevBalance - debitValue + creditValue;
   }
 
-  function getFlowDirectionForPage(page) {
-    return inferBalanceFlowDirection(getOrderedRows(page)) || 'ascending';
-  }
-
-  function recomputeLocalDisbalanceState(page) {
-    const rows = Array.isArray(state.parsedByPage[page]) ? state.parsedByPage[page] : [];
-    if (!rows.length) return new Set();
-    const flowDirection = inferBalanceFlowDirection(rows) || 'ascending';
+  function recomputeLocalDisbalanceState() {
     const mismatches = new Set();
-    for (let idx = 0; idx < rows.length; idx += 1) {
-      const current = rows[idx] || {};
-      current.is_disbalanced = false;
-      current.disbalance_expected_balance = null;
-      current.disbalance_delta = null;
-      if (idx === 0) continue;
-      const prev = rows[idx - 1] || {};
-      const rowId = String(current?.row_id || '').trim() || String(idx + 1).padStart(3, '0');
-      const prevBal = parseAmountForFormatting(prev.balance);
+    for (const rows of Object.values(state.parsedByPage || {})) {
+      for (const row of Array.isArray(rows) ? rows : []) {
+        const current = row || {};
+        current.is_disbalanced = false;
+        current.disbalance_expected_balance = null;
+        current.disbalance_delta = null;
+      }
+    }
+
+    let previousBalance = null;
+    for (const entry of getAllOrderedRowEntries()) {
+      const current = entry.row || {};
+      const rowId = `${entry.page}:${entry.rowId}`;
       const currBal = parseAmountForFormatting(current.balance);
       const debit = parseAmountForFormatting(current.debit);
       const credit = parseAmountForFormatting(current.credit);
       const hasFlow = Number.isFinite(debit) || Number.isFinite(credit);
-      if (!Number.isFinite(prevBal) || !Number.isFinite(currBal) || !hasFlow) continue;
-      const expected = expectedBalanceForFlow(prevBal, debit, credit, flowDirection);
-      if (!Number.isFinite(expected)) continue;
-      const delta = currBal - expected;
-      if (Math.abs(delta) > 0.01) {
-        current.is_disbalanced = true;
-        current.disbalance_expected_balance = Number(expected.toFixed(2));
-        current.disbalance_delta = Number(delta.toFixed(2));
-        mismatches.add(rowId);
+      if (Number.isFinite(previousBalance) && Number.isFinite(currBal) && hasFlow) {
+        const expected = expectedBalanceForFlow(previousBalance, debit, credit);
+        if (Number.isFinite(expected)) {
+          const delta = currBal - expected;
+          if (Math.abs(delta) > 0.01) {
+            current.is_disbalanced = true;
+            current.disbalance_expected_balance = Number(expected.toFixed(2));
+            current.disbalance_delta = Number(delta.toFixed(2));
+            mismatches.add(rowId);
+          }
+        }
+      }
+      if (Number.isFinite(currBal)) {
+        previousBalance = currBal;
       }
     }
     return mismatches;
   }
 
-  function computeAmountForBalanceTarget(prevBalance, currentBalance, flowDirection, targetField) {
+  function computeAmountForBalanceTarget(prevBalance, currentBalance, targetField) {
     if (!Number.isFinite(prevBalance) || !Number.isFinite(currentBalance)) return null;
 
     let amount = null;
     if (targetField === 'debit') {
-      amount = flowDirection === 'descending'
-        ? currentBalance - prevBalance
-        : prevBalance - currentBalance;
+      amount = prevBalance - currentBalance;
     } else if (targetField === 'credit') {
-      amount = flowDirection === 'descending'
-        ? prevBalance - currentBalance
-        : currentBalance - prevBalance;
+      amount = currentBalance - prevBalance;
     }
 
     if (!Number.isFinite(amount)) return null;
@@ -2056,7 +2065,7 @@
     const credit = parseAmountForFormatting(row.credit);
     if (!hasUsableAmountValue(debitRaw, debit) || !hasUsableAmountValue(creditRaw, credit)) return false;
 
-    const nextBalance = expectedBalanceForFlow(prevBalance, debit, credit, getFlowDirectionForPage(page));
+    const nextBalance = expectedBalanceForFlow(prevBalance, debit, credit);
     if (!Number.isFinite(nextBalance)) return false;
     row.balance = formatAmountCellValue(nextBalance);
     return true;
@@ -2074,9 +2083,8 @@
       return false;
     }
 
-    const flowDirection = getFlowDirectionForPage(page);
     if (preferredField === 'debit' || preferredField === 'credit') {
-      const nextAmount = computeAmountForBalanceTarget(prevBalance, balance, flowDirection, preferredField);
+      const nextAmount = computeAmountForBalanceTarget(prevBalance, balance, preferredField);
       if (nextAmount === null) return false;
       if (preferredField === 'debit') {
         setRowAmountColumns(row, nextAmount, null);
@@ -2086,8 +2094,8 @@
       return true;
     }
 
-    const nextDebit = computeAmountForBalanceTarget(prevBalance, balance, flowDirection, 'debit');
-    const nextCredit = computeAmountForBalanceTarget(prevBalance, balance, flowDirection, 'credit');
+    const nextDebit = computeAmountForBalanceTarget(prevBalance, balance, 'debit');
+    const nextCredit = computeAmountForBalanceTarget(prevBalance, balance, 'credit');
     if (nextDebit === null && nextCredit === null && !amountsRoughlyEqual(prevBalance, balance)) return false;
     setRowAmountColumns(row, nextDebit, nextCredit);
     return true;
@@ -2159,7 +2167,7 @@
 
     if (editedField === 'debit' || editedField === 'credit') {
       if (!hasUsableAmountValue(debitRaw, debit) || !hasUsableAmountValue(creditRaw, credit)) return;
-      const nextBalance = expectedBalanceForFlow(prevBalance, debit, credit, getFlowDirectionForPage(page));
+      const nextBalance = expectedBalanceForFlow(prevBalance, debit, credit);
       if (Number.isFinite(nextBalance)) {
         row.balance = formatAmountCellValue(nextBalance);
       }
@@ -2616,6 +2624,10 @@
   async function reverseAllPagesRows() {
     if (state.reverseRowsBusy) return;
     if (!state.jobId) return;
+    const previousReversePageOrder = state.reversePageOrder;
+    const previousPages = Array.isArray(state.pages) ? state.pages.slice() : [];
+    const previousCurrentPage = state.currentPage;
+    const previousSelectedRowId = state.selectedRowId;
     state.reverseRowsBusy = true;
     updateReverseRowsActionState();
     try {
@@ -2628,8 +2640,18 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ is_reversed: state.reversePageOrder })
       });
+      await refreshAllParsedPagesFromServer();
       renderPages();
       await loadCurrentPageData();
+      renderDisbalanceTable();
+      renderFlaggedTransactionsTable();
+    } catch (err) {
+      state.reversePageOrder = previousReversePageOrder;
+      state.pages = previousPages;
+      state.currentPage = previousCurrentPage;
+      state.selectedRowId = previousSelectedRowId;
+      renderPages();
+      alert(`Reverse order failed: ${normalizeApiErrorMessage(err?.message)}`);
     } finally {
       state.reverseRowsBusy = false;
       updateReverseRowsActionState();

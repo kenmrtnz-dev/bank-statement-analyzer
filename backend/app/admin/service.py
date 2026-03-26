@@ -263,24 +263,6 @@ def _default_profile_aliases(bank: str) -> list[str]:
     return out
 
 
-def _default_bank_id(bank: str) -> str:
-    normalized = _normalize_bank(bank)
-    if not normalized:
-        return ""
-    ordered_banks = [
-        "BDO",
-        "BPI",
-        "METROBANK",
-        "AUB",
-        "RCBC",
-        "SECB",
-        "CHINABANK",
-    ]
-    if normalized in ordered_banks:
-        return str(ordered_banks.index(normalized) + 1)
-    return ""
-
-
 def _seed_workbook_path() -> Path | None:
     configured = str(os.getenv("BANK_CODE_SEED_XLSX") or "").strip()
     if configured:

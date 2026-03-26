@@ -1,0 +1,83 @@
+# Page snapshot
+
+```yaml
+- main [ref=e2]:
+  - generic [ref=e3]:
+    - navigation "Primary navigation" [ref=e4]:
+      - link "Uploads 0" [ref=e5] [cursor=pointer]:
+        - /url: /uploads
+        - generic [ref=e6]: ⬆
+        - generic [ref=e7]: Uploads
+        - generic [ref=e8]: "0"
+      - link "Processing 1" [ref=e9] [cursor=pointer]:
+        - /url: /processing
+        - generic [ref=e10]: ⋯
+        - generic [ref=e11]: Processing
+        - generic [ref=e12]: "1"
+    - generic [ref=e13]:
+      - paragraph [ref=e14]: Start parsing from file actions.
+      - generic [ref=e15]: evaluator
+      - button "Logout" [ref=e16] [cursor=pointer]
+  - generic [ref=e18]:
+    - generic [ref=e19]:
+      - generic [ref=e21]:
+        - heading "Upload Test PDF" [level=2] [ref=e22]
+        - paragraph [ref=e23]: Testing feature for direct PDF upload and parser job creation.
+      - generic [ref=e26]:
+        - paragraph [ref=e27]:
+          - text: Drop PDF here
+          - text: or click to browse
+        - paragraph [ref=e28]: Single file upload for parser validation.
+        - paragraph [ref=e29]: "Accepted format: .pdf"
+        - generic [ref=e30] [cursor=pointer]: Choose PDF
+      - generic [ref=e31]:
+        - heading "Uploaded Files" [level=3] [ref=e32]
+        - generic [ref=e34]:
+          - generic [ref=e35]: ⌕
+          - textbox "Search uploads..." [ref=e36]
+      - generic [ref=e37]:
+        - generic [ref=e38]: ◌
+        - paragraph [ref=e39]: No uploaded files yet.
+        - generic [ref=e40]: Upload a PDF above to create a test parsing job.
+    - generic [ref=e41]:
+      - generic [ref=e42]:
+        - generic [ref=e43]:
+          - heading "CRM Bank Statements" [level=2] [ref=e44]
+          - paragraph [ref=e45]: "Auto-loaded from EspoCRM Lead + Account attachments (`cBankStatementsIds`)."
+        - generic [ref=e46]:
+          - generic [ref=e47]:
+            - generic [ref=e48]: ⌕
+            - textbox "Search CRM files..." [ref=e49]
+          - button "Refresh CRM Files" [ref=e50] [cursor=pointer]
+      - tablist "CRM process status tabs" [ref=e51]:
+        - tab "Not Started (1)" [selected] [ref=e52] [cursor=pointer]
+        - tab "Queued (0)" [ref=e53] [cursor=pointer]
+        - tab "Completed (0)" [ref=e54] [cursor=pointer]
+      - table [ref=e56]:
+        - rowgroup [ref=e57]:
+          - row "Account Name Type Date Created Assigned User File Name Status Actions" [ref=e58]:
+            - columnheader "Account Name" [ref=e59]
+            - columnheader "Type" [ref=e60]
+            - columnheader "Date Created" [ref=e61]
+            - columnheader "Assigned User" [ref=e62]
+            - columnheader "File Name" [ref=e63]
+            - columnheader "Status" [ref=e64]
+            - columnheader "Actions" [ref=e65]
+        - rowgroup [ref=e66]:
+          - row "Business 25 Lead 2026-02-26 QA User statement-25.pdf Not Started Begin Process" [ref=e67]:
+            - cell "Business 25" [ref=e68]:
+              - link "Business 25" [ref=e69] [cursor=pointer]:
+                - /url: https://staging-crm.discoverycsc.com/#Lead/view/lead-25
+            - cell "Lead" [ref=e70]
+            - cell "2026-02-26" [ref=e71]
+            - cell "QA User" [ref=e72]
+            - cell "statement-25.pdf" [ref=e73]
+            - cell "Not Started" [ref=e74]:
+              - generic [ref=e75]: Not Started
+            - cell "Begin Process" [ref=e76]:
+              - button "Begin Process" [ref=e77] [cursor=pointer]
+      - generic [ref=e78]:
+        - button "Previous" [ref=e79] [cursor=pointer]
+        - generic [ref=e80]: Showing 25-25
+        - button "Next" [disabled] [ref=e81] [cursor=pointer]
+```

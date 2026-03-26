@@ -4,6 +4,7 @@ import datetime as dt
 import io
 import json
 import re
+import shutil
 import zipfile
 from pathlib import Path
 
@@ -13,12 +14,13 @@ from fastapi.responses import HTMLResponse, Response
 from app.auth.deps import require_admin, require_evaluator_or_admin
 from app.jobs.repository import JobsRepository
 from app.jobs.service import create_job, get_status
-from app.paths import get_data_dir, get_project_root
+from app.paths import get_data_dir, get_legacy_volume_storage_dir, get_volume_storage_dir
 
 router = APIRouter(dependencies=[Depends(require_evaluator_or_admin)])
 
 STATIC_DIR = Path(__file__).resolve().parents[1] / "static"
-STORAGE_ROOT = get_project_root() / "storage"
+STORAGE_ROOT = get_volume_storage_dir()
+LEGACY_STORAGE_ROOT = get_legacy_volume_storage_dir()
 _SET_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,127}$")
 _SET_META_FILENAME = ".volume-set.json"
 _VOLUME_ACTIVE_STATES = {"queued", "processing"}
@@ -88,6 +90,92 @@ def _is_volume_set_dir(target_dir: Path) -> bool:
     if _set_meta_path(target_dir).exists():
         return True
     return any(entry.suffix.lower() == ".pdf" for entry in _visible_set_files(target_dir))
+
+
+def _resolve_volume_set_dir(set_name: str) -> Path:
+    target_dir = STORAGE_ROOT / set_name
+    if target_dir.exists():
+        return target_dir
+
+    legacy_dir = LEGACY_STORAGE_ROOT / set_name
+    if not _is_volume_set_dir(legacy_dir):
+        return target_dir
+
+    target_dir.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.move(str(legacy_dir), str(target_dir))
+        return target_dir
+    except Exception:
+        if target_dir.exists():
+            return target_dir
+        return legacy_dir
+
+
+def _migrate_legacy_volume_sets() -> None:
+    if not LEGACY_STORAGE_ROOT.exists() or not LEGACY_STORAGE_ROOT.is_dir():
+        return
+    for directory in LEGACY_STORAGE_ROOT.iterdir():
+        if directory == STORAGE_ROOT:
+            continue
+        if not _is_volume_set_dir(directory):
+            continue
+        _resolve_volume_set_dir(directory.name)
+
+
+def _volume_storage_roots() -> list[Path]:
+    roots = [STORAGE_ROOT]
+    if LEGACY_STORAGE_ROOT != STORAGE_ROOT:
+        roots.append(LEGACY_STORAGE_ROOT)
+    return roots
+
+
+def _delete_volume_set_dir(target_dir: Path) -> int:
+    file_count = len(_visible_set_files(target_dir))
+    shutil.rmtree(target_dir, ignore_errors=True)
+    return file_count
+
+
+def _delete_volume_set(set_name: str) -> dict[str, object]:
+    normalized_set_name = _sanitize_set_name(set_name)
+    target_dir = _resolve_volume_set_dir(normalized_set_name)
+    if not _is_volume_set_dir(target_dir):
+        raise HTTPException(status_code=404, detail="set_not_found")
+
+    deleted_files = _delete_volume_set_dir(target_dir)
+    deleted_paths = 1
+
+    legacy_dir = LEGACY_STORAGE_ROOT / normalized_set_name
+    if legacy_dir != target_dir and _is_volume_set_dir(legacy_dir):
+        deleted_files += _delete_volume_set_dir(legacy_dir)
+        deleted_paths += 1
+
+    return {
+        "set_name": normalized_set_name,
+        "deleted": True,
+        "deleted_files": deleted_files,
+        "deleted_paths": deleted_paths,
+    }
+
+
+def _clear_all_volume_sets() -> dict[str, object]:
+    _migrate_legacy_volume_sets()
+    deleted_sets = 0
+    deleted_files = 0
+
+    for root in _volume_storage_roots():
+        if not root.exists() or not root.is_dir():
+            continue
+        for directory in list(root.iterdir()):
+            if not _is_volume_set_dir(directory):
+                continue
+            deleted_files += _delete_volume_set_dir(directory)
+            deleted_sets += 1
+
+    return {
+        "deleted": True,
+        "cleared_sets": deleted_sets,
+        "cleared_files": deleted_files,
+    }
 
 
 def _read_set_meta(target_dir: Path) -> dict[str, object]:
@@ -260,6 +348,7 @@ def _build_volume_set_payload(target_dir: Path) -> dict[str, object]:
 
 
 def _list_volume_sets() -> list[dict[str, object]]:
+    _migrate_legacy_volume_sets()
     if not STORAGE_ROOT.exists():
         return []
 
@@ -275,7 +364,7 @@ def _list_volume_sets() -> list[dict[str, object]]:
 
 def _get_volume_set_payload(set_name: str) -> dict[str, object]:
     normalized_set_name = _sanitize_set_name(set_name)
-    target_dir = STORAGE_ROOT / normalized_set_name
+    target_dir = _resolve_volume_set_dir(normalized_set_name)
     if not _is_volume_set_dir(target_dir):
         raise HTTPException(status_code=404, detail="set_not_found")
     return _build_volume_set_payload(target_dir)
@@ -311,7 +400,7 @@ def _update_job_meta_for_volume(
 def _start_volume_file(*, set_name: str, file_name: str, admin_user: dict[str, object]) -> dict[str, object]:
     normalized_set_name = _sanitize_set_name(set_name)
     normalized_file_name = _safe_filename(file_name)
-    target_dir = STORAGE_ROOT / normalized_set_name
+    target_dir = _resolve_volume_set_dir(normalized_set_name)
     if not target_dir.exists() or not target_dir.is_dir():
         raise HTTPException(status_code=404, detail="set_not_found")
 
@@ -416,7 +505,7 @@ def list_volume_sets():
 @router.get("/volume/sets/{set_name}/download")
 def download_volume_set(set_name: str):
     normalized_set_name = _sanitize_set_name(set_name)
-    target_dir = STORAGE_ROOT / normalized_set_name
+    target_dir = _resolve_volume_set_dir(normalized_set_name)
     if not target_dir.exists() or not target_dir.is_dir():
         raise HTTPException(status_code=404, detail="set_not_found")
 
@@ -447,7 +536,7 @@ async def upload_volume_files(
     if not files:
         raise HTTPException(status_code=400, detail="files_required")
 
-    target_dir = STORAGE_ROOT / normalized_set_name
+    target_dir = _resolve_volume_set_dir(normalized_set_name)
     target_dir.mkdir(parents=True, exist_ok=True)
     meta_payload = _read_set_meta(target_dir)
     if not str(meta_payload.get("created_at") or "").strip():
@@ -492,9 +581,19 @@ def list_admin_volume_sets():
     return {"ok": True, "items": _list_volume_sets()}
 
 
+@router.delete("/admin/volume-sets", dependencies=[Depends(require_admin)])
+def clear_admin_volume_sets():
+    return {"ok": True, **_clear_all_volume_sets()}
+
+
 @router.get("/admin/volume-sets/{set_name}", dependencies=[Depends(require_admin)])
 def get_admin_volume_set(set_name: str):
     return {"ok": True, "item": _get_volume_set_payload(set_name)}
+
+
+@router.delete("/admin/volume-sets/{set_name}", dependencies=[Depends(require_admin)])
+def delete_admin_volume_set(set_name: str):
+    return {"ok": True, **_delete_volume_set(set_name)}
 
 
 @router.post("/admin/volume-sets/{set_name}/start-next", dependencies=[Depends(require_admin)])

@@ -131,3 +131,163 @@ def test_rebuild_ocr_outputs_from_saved_artifacts_reuses_previous_page_header_hi
     assert parsed_output["page_002"][0]["credit"] == "50000.00"
     assert bounds_output["page_002"][0]["row_id"] == "001"
     assert page_diags["page_002"]["header_hint_used"] is True
+
+
+def test_process_job_skips_pdf_rasterization_for_text_only_documents(monkeypatch, tmp_path):
+    job_id = "job-text-only"
+    repo = jobs_service.JobsRepository(tmp_path)
+    repo.ensure_job_layout(job_id)
+    repo.write_bytes(repo.path(job_id, "input", "document.pdf"), b"%PDF-1.4\n")
+
+    enqueued_pages = []
+
+    monkeypatch.setattr(jobs_service, "DATA_DIR", str(tmp_path))
+
+    def _unexpected_prepare(**_kwargs):
+        raise AssertionError("text-only documents should not be rasterized")
+
+    def _split_pdf_into_page_pdfs(*, repo, job_id, input_pdf):
+        del input_pdf
+        split_dir = repo.path(job_id, "split")
+        split_dir.mkdir(parents=True, exist_ok=True)
+        for page_name in ("page_001", "page_002"):
+            (split_dir / f"{page_name}.pdf").write_bytes(b"%PDF-1.4\n")
+        return ["page_001", "page_002"]
+
+    monkeypatch.setattr(jobs_service, "prepare_ocr_pages", _unexpected_prepare)
+    monkeypatch.setattr(jobs_service, "_split_pdf_into_page_pdfs", _split_pdf_into_page_pdfs)
+    monkeypatch.setattr(
+        jobs_service,
+        "_enqueue_page_job",
+        lambda job_id, parse_mode, page_name, page_index, page_count: enqueued_pages.append(
+            (job_id, parse_mode, page_name, page_index, page_count)
+        ) or f"task-{page_name}",
+    )
+
+    payload = jobs_service.process_job(job_id=job_id, parse_mode="auto", task_id="task-root")
+
+    assert payload["pages_total"] == 2
+    assert payload["pages_inflight"] == 2
+    assert enqueued_pages == [
+        (job_id, "auto", "page_001", 1, 2),
+        (job_id, "auto", "page_002", 2, 2),
+    ]
+    assert repo.read_json(repo.path(job_id, "result", "pages_manifest.json"), default={})["pages"] == [
+        "page_001",
+        "page_002",
+    ]
+    assert repo.path(job_id, "split", "page_001.pdf").exists()
+    assert repo.path(job_id, "split", "page_002.pdf").exists()
+    assert not repo.path(job_id, "pages", "page_001.png").exists()
+
+
+def test_process_job_does_not_rasterize_pages_during_split_for_mixed_documents(monkeypatch, tmp_path):
+    job_id = "job-mixed-routing"
+    repo = jobs_service.JobsRepository(tmp_path)
+    repo.ensure_job_layout(job_id)
+    repo.write_bytes(repo.path(job_id, "input", "document.pdf"), b"%PDF-1.4\n")
+
+    enqueued_pages = []
+
+    monkeypatch.setattr(jobs_service, "DATA_DIR", str(tmp_path))
+
+    def _unexpected_prepare(**_kwargs):
+        raise AssertionError("mixed documents should not rasterize pages during the split phase")
+
+    def _split_pdf_into_page_pdfs(*, repo, job_id, input_pdf):
+        del input_pdf
+        split_dir = repo.path(job_id, "split")
+        split_dir.mkdir(parents=True, exist_ok=True)
+        for page_name in ("page_001", "page_002", "page_003"):
+            (split_dir / f"{page_name}.pdf").write_bytes(b"%PDF-1.4\n")
+        return ["page_001", "page_002", "page_003"]
+
+    monkeypatch.setattr(jobs_service, "prepare_ocr_pages", _unexpected_prepare)
+    monkeypatch.setattr(jobs_service, "_split_pdf_into_page_pdfs", _split_pdf_into_page_pdfs)
+    monkeypatch.setattr(
+        jobs_service,
+        "_enqueue_page_job",
+        lambda job_id, parse_mode, page_name, page_index, page_count: enqueued_pages.append(
+            (job_id, parse_mode, page_name, page_index, page_count)
+        ) or f"task-{page_name}",
+    )
+
+    payload = jobs_service.process_job(job_id=job_id, parse_mode="auto", task_id="task-root")
+
+    assert payload["pages_total"] == 3
+    assert repo.path(job_id, "split", "page_001.pdf").exists()
+    assert repo.path(job_id, "split", "page_002.pdf").exists()
+    assert repo.path(job_id, "split", "page_003.pdf").exists()
+    assert not repo.path(job_id, "pages", "page_002.png").exists()
+    assert not repo.path(job_id, "pages", "page_001.png").exists()
+    assert not repo.path(job_id, "ocr", "page_002.raw.json").exists()
+    assert enqueued_pages == [
+        (job_id, "auto", "page_001", 1, 3),
+        (job_id, "auto", "page_002", 2, 3),
+        (job_id, "auto", "page_003", 3, 3),
+    ]
+
+
+def test_process_job_page_uses_text_raw_result_without_rendered_image(monkeypatch, tmp_path):
+    job_id = "job-text-page"
+    repo = jobs_service.JobsRepository(tmp_path)
+    repo.ensure_job_layout(job_id)
+    repo.write_bytes(repo.path(job_id, "input", "document.pdf"), b"%PDF-1.4\n")
+    repo.write_json(repo.path(job_id, "result", "pages_manifest.json"), {"pages": ["page_001.png"]})
+    split_dir = repo.path(job_id, "split")
+    split_dir.mkdir(parents=True, exist_ok=True)
+    (split_dir / "page_001.pdf").write_bytes(b"%PDF-1.4\n")
+
+    monkeypatch.setattr(jobs_service, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        jobs_service,
+        "_extract_text_page_raw_result",
+        lambda **_kwargs: {
+            "provider": "pdftotext",
+            "source_type": "text",
+            "page_number": 1,
+            "width": 1000.0,
+            "height": 1400.0,
+            "text": "Deposit",
+            "words": [{"text": "Deposit", "x1": 100.0, "y1": 200.0, "x2": 900.0, "y2": 250.0}],
+            "is_digital": True,
+        },
+    )
+    monkeypatch.setattr(jobs_service, "detect_bank_profile", lambda _text: type("Profile", (), {"name": "GENERIC"})())
+    monkeypatch.setattr(
+        jobs_service,
+        "parse_page_with_profile_fallback",
+        lambda *_args, **_kwargs: (
+            [
+                {
+                    "row_id": "001",
+                    "date": "2026-02-01",
+                    "description": "Deposit",
+                    "debit": None,
+                    "credit": "1000.00",
+                    "balance": "1000.00",
+                    "row_type": "transaction",
+                }
+            ],
+            [{"row_id": "001", "x1": 0.1, "y1": 0.2, "x2": 0.9, "y2": 0.25}],
+            {"profile_detected": "GENERIC", "profile_selected": "GENERIC", "rows_parsed": 1},
+        ),
+    )
+    monkeypatch.setattr(jobs_service, "_filter_rows_and_bounds", lambda rows, bounds, _profile: (rows, bounds))
+    monkeypatch.setattr(jobs_service, "_repair_page_flow_columns", lambda rows, previous_balance_hint=None: rows)
+    monkeypatch.setattr(jobs_service, "_upsert_page_intake_record", lambda **_kwargs: None, raising=False)
+
+    payload = jobs_service.process_job_page(
+        job_id=job_id,
+        parse_mode="auto",
+        page_name="page_001",
+        page_index=1,
+        page_count=1,
+        task_id="page-task",
+    )
+
+    fragment = repo.read_json(repo.path(job_id, "result", "page_fragments", "page_001.json"), default={})
+
+    assert payload["status"] == "done"
+    assert fragment["diag"]["source_type"] == "text"
+    assert fragment["rows"][0]["description"] == "Deposit"

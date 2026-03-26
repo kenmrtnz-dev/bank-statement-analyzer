@@ -1,16 +1,14 @@
 """Core job orchestration for uploads, parsing, status tracking, and exports."""
 
-from __future__ import annotations
-
-import csv
-import datetime as dt
 import calendar
+import datetime as dt
 import fcntl
 import io
 import json
 import logging
 import math
 import os
+import shutil
 import threading
 import uuid
 import zipfile
@@ -22,7 +20,7 @@ from xml.sax.saxutils import escape as xml_escape
 from fastapi import HTTPException
 from pdf2image import convert_from_path
 from PIL import Image
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter
 
 from app.bank_profiles import detect_bank_profile
 from app.json_utils import make_json_safe
@@ -37,8 +35,9 @@ from app.ocr.pipeline import (
     _repair_page_flow_columns,
     resolve_ocr_page_path,
 )
-from app.paths import get_data_dir
-from app.pdf_text_extract import extract_pdf_layout_pages, extract_pdf_layout_xml, layout_page_to_json_payload
+from app.paths import get_data_dir, get_legacy_volume_storage_dir, get_volume_storage_dir
+from app.pdf_text_extract import extract_pdf_layout_pages, layout_page_to_json_payload
+from app.services.ocr.router import build_scanned_ocr_router, scanned_render_dpi
 from app.services.openai_page_fix import (
     OpenAIPageFixError,
     OpenAIPageFixNotConfiguredError,
@@ -48,12 +47,15 @@ from app.services.openai_page_fix import (
 from app.statement_parser import normalize_date, parse_page_with_profile_fallback
 
 DATA_DIR = get_data_dir()
+VOLUME_STORAGE_ROOT = get_volume_storage_dir()
+LEGACY_VOLUME_STORAGE_ROOT = get_legacy_volume_storage_dir()
 logger = logging.getLogger(__name__)
 FALLBACK_PREVIEW_DPI = int(os.getenv("FALLBACK_PREVIEW_DPI", "130"))
 PREVIEW_MAX_PIXELS = int(os.getenv("PREVIEW_MAX_PIXELS", "6000000"))
 _ACTIVE_CELERY_STATES = {"PENDING", "RECEIVED", "STARTED", "RETRY"}
 _PAGE_TERMINAL_STATES = {"done", "failed", "cancelled"}
-_PAGE_ACTIVE_STATES = {"queued", "processing", "retrying"}
+_PAGE_ACTIVE_STATES = {"pending", "processing", "retrying"}
+_VOLUME_AUTO_ADVANCE_TERMINAL_STATES = {"completed"}
 _JOB_UPDATE_LOCKS: Dict[str, threading.Lock] = {}
 _JOB_UPDATE_LOCKS_GUARD = threading.Lock()
 _SUPPORTED_PARSE_MODES = {"auto", "text", "ocr", "google_vision", "pdftotext"}
@@ -92,9 +94,237 @@ def _build_export_filename(job_id: str, ext: str) -> str:
     return f"{ts}-{business}-6MOS-BANKSTATEMENTS.{clean_ext}"
 
 
+def _utcnow_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _resolve_volume_set_dir(set_name: str) -> Path:
+    target_dir = VOLUME_STORAGE_ROOT / set_name
+    if target_dir.exists():
+        return target_dir
+
+    legacy_dir = LEGACY_VOLUME_STORAGE_ROOT / set_name
+    if not legacy_dir.exists() or not legacy_dir.is_dir():
+        return target_dir
+
+    target_dir.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.move(str(legacy_dir), str(target_dir))
+        return target_dir
+    except Exception:
+        if target_dir.exists():
+            return target_dir
+        return legacy_dir
+
+
+def _read_volume_set_meta(set_dir: Path) -> dict[str, Any]:
+    payload = {
+        "set_name": set_dir.name,
+        "uploader_username": "",
+        "uploader_role": "",
+        "created_at": "",
+        "updated_at": "",
+        "files": {},
+    }
+    meta_path = set_dir / ".volume-set.json"
+    if not meta_path.exists():
+        return payload
+    raw = JobsRepository(DATA_DIR).read_json(meta_path, default={})
+    if not isinstance(raw, dict):
+        return payload
+    payload.update(raw)
+    files_payload = payload.get("files")
+    payload["files"] = files_payload if isinstance(files_payload, dict) else {}
+    payload["uploader_username"] = str(payload.get("uploader_username") or payload.get("uploaded_by") or "").strip()
+    payload["uploader_role"] = str(payload.get("uploader_role") or "").strip().lower()
+    return payload
+
+
+def _write_volume_set_meta(set_dir: Path, payload: dict[str, Any]) -> None:
+    safe_payload = dict(payload or {})
+    safe_payload["set_name"] = set_dir.name
+    files_payload = safe_payload.get("files")
+    safe_payload["files"] = files_payload if isinstance(files_payload, dict) else {}
+    JobsRepository(DATA_DIR).write_json(set_dir / ".volume-set.json", safe_payload)
+
+
+@contextmanager
+def _lock_volume_set(set_dir: Path):
+    lock_path = set_dir / ".volume-set.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _visible_volume_set_files(set_dir: Path) -> list[Path]:
+    if not set_dir.exists() or not set_dir.is_dir():
+        return []
+    return sorted(
+        [entry for entry in set_dir.iterdir() if entry.is_file() and not entry.name.startswith(".")],
+        key=lambda entry: entry.name.lower(),
+    )
+
+
+def _volume_file_last_job_id(file_payload: dict[str, Any]) -> str:
+    last_job_id = str(file_payload.get("last_job_id") or "").strip()
+    if last_job_id:
+        return last_job_id
+    job_ids = file_payload.get("job_ids")
+    if not isinstance(job_ids, list):
+        return ""
+    for candidate in reversed(job_ids):
+        cleaned = str(candidate or "").strip()
+        if cleaned:
+            return cleaned
+    return ""
+
+
+def _raw_volume_job_status(repo: JobsRepository, job_id: str) -> str:
+    cleaned_job_id = str(job_id or "").strip()
+    if not cleaned_job_id:
+        return ""
+    status_payload = repo.read_status(cleaned_job_id)
+    return str((status_payload or {}).get("status") or "").strip().lower()
+
+
+def _update_job_meta_for_volume(
+    *,
+    repo: JobsRepository,
+    job_id: str,
+    set_name: str,
+    file_name: str,
+    owner_username: str,
+    owner_role: str,
+    started_by: str,
+) -> None:
+    existing_meta = repo.read_json(repo.path(job_id, "meta.json"), default={})
+    if not isinstance(existing_meta, dict):
+        existing_meta = {}
+    existing_meta["source_tag"] = "VT"
+    existing_meta["source_category"] = "volume_test"
+    existing_meta["volume_set_name"] = set_name
+    existing_meta["volume_file_name"] = file_name
+    if owner_username:
+        existing_meta["uploaded_by"] = owner_username
+        existing_meta.setdefault("created_by", owner_username)
+    if owner_role:
+        existing_meta.setdefault("created_role", owner_role)
+    if started_by:
+        existing_meta["volume_started_by"] = started_by
+    repo.write_json(repo.path(job_id, "meta.json"), existing_meta)
+
+
+def _maybe_start_next_volume_file(job_id: str, *, terminal_status: str) -> dict[str, str] | None:
+    normalized_terminal_status = str(terminal_status or "").strip().lower()
+    if normalized_terminal_status not in _VOLUME_AUTO_ADVANCE_TERMINAL_STATES:
+        return None
+
+    repo = JobsRepository(DATA_DIR)
+    meta = repo.read_json(repo.path(job_id, "meta.json"), default={})
+    if not isinstance(meta, dict):
+        return None
+    if str(meta.get("source_category") or "").strip().lower() != "volume_test":
+        return None
+
+    set_name = str(meta.get("volume_set_name") or "").strip()
+    file_name = Path(str(meta.get("volume_file_name") or "").strip()).name.strip()
+    if not set_name or not file_name:
+        return None
+
+    set_dir = _resolve_volume_set_dir(set_name)
+    if not set_dir.exists() or not set_dir.is_dir():
+        return None
+
+    with _lock_volume_set(set_dir):
+        set_meta = _read_volume_set_meta(set_dir)
+        files_meta = set_meta.get("files")
+        if not isinstance(files_meta, dict):
+            files_meta = {}
+        current_payload = files_meta.get(file_name)
+        current_state = dict(current_payload) if isinstance(current_payload, dict) else {}
+        if _volume_file_last_job_id(current_state) != str(job_id).strip():
+            return None
+
+        has_active_job = False
+        next_file_name = ""
+        for entry in _visible_volume_set_files(set_dir):
+            is_pdf = entry.suffix.lower() == ".pdf"
+            file_state = files_meta.get(entry.name)
+            payload = dict(file_state) if isinstance(file_state, dict) else {}
+            last_job_id = _volume_file_last_job_id(payload)
+            raw_status = _raw_volume_job_status(repo, last_job_id)
+            if is_pdf and raw_status in {"queued", "splitting", "processing", "parsing"}:
+                has_active_job = True
+                break
+            if not next_file_name and is_pdf and not last_job_id:
+                next_file_name = entry.name
+
+        if has_active_job or not next_file_name:
+            return None
+
+        next_path = set_dir / next_file_name
+        owner_username = str(set_meta.get("uploader_username") or meta.get("uploaded_by") or meta.get("created_by") or "").strip()
+        owner_role = str(set_meta.get("uploader_role") or meta.get("created_role") or "").strip().lower()
+        started_by = str(meta.get("volume_started_by") or "").strip() or "system"
+        create_payload = create_job(
+            file_bytes=next_path.read_bytes(),
+            filename=next_file_name,
+            requested_mode="auto",
+            requested_parser="auto",
+            auto_start=True,
+            created_by=owner_username,
+            created_role=owner_role,
+        )
+        next_job_id = str(create_payload.get("job_id") or "").strip()
+        if not next_job_id:
+            return None
+
+        _update_job_meta_for_volume(
+            repo=repo,
+            job_id=next_job_id,
+            set_name=set_name,
+            file_name=next_file_name,
+            owner_username=owner_username,
+            owner_role=owner_role,
+            started_by=started_by,
+        )
+
+        next_file_state = files_meta.get(next_file_name)
+        next_payload = dict(next_file_state) if isinstance(next_file_state, dict) else {}
+        job_ids = next_payload.get("job_ids")
+        job_id_list = [str(item or "").strip() for item in job_ids] if isinstance(job_ids, list) else []
+        if next_job_id not in job_id_list:
+            job_id_list.append(next_job_id)
+        next_payload["job_ids"] = [item for item in job_id_list if item]
+        next_payload["last_job_id"] = next_job_id
+        next_payload["last_started_at"] = _utcnow_iso()
+        next_payload["last_started_by"] = started_by
+        next_payload["last_started_for"] = owner_username
+        files_meta[next_file_name] = next_payload
+        set_meta["files"] = files_meta
+        if owner_username and not str(set_meta.get("uploader_username") or "").strip():
+            set_meta["uploader_username"] = owner_username
+        if owner_role and not str(set_meta.get("uploader_role") or "").strip():
+            set_meta["uploader_role"] = owner_role
+        set_meta["updated_at"] = _utcnow_iso()
+        if not str(set_meta.get("created_at") or "").strip():
+            set_meta["created_at"] = set_meta["updated_at"]
+        _write_volume_set_meta(set_dir, set_meta)
+
+    logger.info("Auto-started next VT file %s/%s as job %s after %s completed.", set_name, next_file_name, next_job_id, job_id)
+    return {"job_id": next_job_id, "file_name": next_file_name}
+
+
 def normalize_page_name(page: str) -> str:
     """Convert page tokens into the canonical `page_###` name used on disk."""
-    value = str(page or "").strip().replace(".png", "")
+    value = str(page or "").strip()
+    for suffix in (".png", ".pdf"):
+        if value.lower().endswith(suffix):
+            value = value[: -len(suffix)]
     if not value:
         return ""
     if value.startswith("page_"):
@@ -105,6 +335,132 @@ def normalize_page_name(page: str) -> str:
     if value.isdigit():
         return f"page_{int(value):03}"
     return f"page_{value}"
+
+
+def _build_page_file_names(page_count: int) -> List[str]:
+    total = max(0, int(page_count))
+    return [f"page_{idx:03}.png" for idx in range(1, total + 1)]
+
+
+def _build_page_names(page_count: int) -> List[str]:
+    total = max(0, int(page_count))
+    return [f"page_{idx:03}" for idx in range(1, total + 1)]
+
+
+def _split_pages_dir(repo: JobsRepository, job_id: str) -> Path:
+    return repo.path(job_id, "split")
+
+
+def _split_page_pdf_path(repo: JobsRepository, job_id: str, page_name: str) -> Path:
+    return _split_pages_dir(repo, job_id) / f"{normalize_page_name(page_name)}.pdf"
+
+
+def _rendered_page_png_path(repo: JobsRepository, job_id: str, page_name: str) -> Path:
+    return repo.path(job_id, "pages", f"{normalize_page_name(page_name)}.png")
+
+
+def _split_pdf_into_page_pdfs(
+    *,
+    repo: JobsRepository,
+    job_id: str,
+    input_pdf: Path,
+) -> List[str]:
+    split_dir = _split_pages_dir(repo, job_id)
+    split_dir.mkdir(parents=True, exist_ok=True)
+
+    reader = PdfReader(str(input_pdf))
+    page_names: List[str] = []
+    expected_files: set[str] = set()
+
+    for idx, page in enumerate(reader.pages, start=1):
+        page_name = f"page_{idx:03}"
+        output_path = split_dir / f"{page_name}.pdf"
+        writer = PdfWriter()
+        writer.add_page(page)
+        with open(output_path, "wb") as handle:
+            writer.write(handle)
+        page_names.append(page_name)
+        expected_files.add(output_path.name)
+
+    for entry in split_dir.iterdir():
+        if entry.is_file() and entry.suffix.lower() == ".pdf" and entry.name not in expected_files:
+            entry.unlink(missing_ok=True)
+
+    return page_names
+
+
+def _page_number_from_page_file(page_file: str) -> int | None:
+    page_name = normalize_page_name(page_file)
+    token = page_name.replace("page_", "", 1)
+    if not token.isdigit():
+        return None
+    page_num = int(token)
+    if page_num <= 0:
+        return None
+    return page_num
+
+
+def _read_pdf_page_count(input_pdf: Path) -> int:
+    try:
+        reader = PdfReader(str(input_pdf))
+    except Exception:
+        return 0
+    return max(0, len(reader.pages or []))
+
+
+def _save_png_with_pixel_cap(page: Image.Image, output_path: Path, *, max_pixels: int = PREVIEW_MAX_PIXELS) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    w, h = page.size
+    pixels = max(1, w * h)
+    cap = max(1, int(max_pixels))
+    if pixels > cap:
+        scale = math.sqrt(cap / float(pixels))
+        page = page.resize(
+            (max(1, int(w * scale)), max(1, int(h * scale))),
+            resample=Image.Resampling.BILINEAR,
+        )
+    page.save(output_path, format="PNG")
+
+
+def _ocr_page_numbers_for_routing(page_files: List[str], page_routing: Dict[str, str]) -> List[int]:
+    page_numbers: List[int] = []
+    for page_file in page_files:
+        page_name = normalize_page_name(str(page_file).replace(".png", ""))
+        if str(page_routing.get(page_name) or "ocr").strip().lower() == "text":
+            continue
+        page_num = _page_number_from_page_file(page_file)
+        if page_num is not None:
+            page_numbers.append(page_num)
+    return page_numbers
+
+
+def _render_selected_ocr_pages(
+    *,
+    input_pdf: Path,
+    pages_dir: Path,
+    page_numbers: List[int],
+    dpi: int,
+) -> List[str]:
+    pages_dir.mkdir(parents=True, exist_ok=True)
+    rendered_files: List[str] = []
+    for page_num in sorted({int(num) for num in page_numbers if int(num) > 0}):
+        filename = f"page_{page_num:03}.png"
+        output_path = pages_dir / filename
+        if output_path.exists():
+            rendered_files.append(filename)
+            continue
+        pages = convert_from_path(
+            str(input_pdf),
+            dpi=max(72, int(dpi)),
+            fmt="png",
+            first_page=page_num,
+            last_page=page_num,
+        )
+        if not pages:
+            continue
+        _save_png_with_pixel_cap(pages[0], output_path)
+        rendered_files.append(filename)
+    return rendered_files
 
 
 def _normalize_requested_mode(requested_mode: str | None, *, field_name: str = "mode") -> str:
@@ -387,7 +743,7 @@ def cancel_job(job_id: str) -> Dict[str, Any]:
     has_active_pages = any(
         str(item.get("status") or "").strip().lower() in _PAGE_ACTIVE_STATES for item in page_status.values()
     )
-    if current_status in {"done", "done_with_warnings", "failed"} and not has_active_pages:
+    if current_status in {"completed", "failed"} and not has_active_pages:
         return {
             "job_id": job_id,
             "cancelled": False,
@@ -478,6 +834,71 @@ def cancel_job(job_id: str) -> Dict[str, Any]:
     }
 
 
+def _public_page_status(value: Any) -> str:
+    state = str(value or "").strip().lower()
+    if state in {"pending", "queued", "retrying"}:
+        return "pending"
+    if state in {"processing"}:
+        return "processing"
+    if state in {"done", "failed"}:
+        return state
+    return state or "pending"
+
+
+def _build_polling_pages_payload(
+    repo: JobsRepository,
+    job_id: str,
+) -> tuple[List[Dict[str, Any]], int]:
+    status_map = _load_page_status_map(repo, job_id)
+    manifest = _load_pages_manifest(repo, job_id)
+    manifest_pages = manifest.get("pages") if isinstance(manifest.get("pages"), list) else []
+
+    ordered_page_names = [normalize_page_name(item) for item in manifest_pages if normalize_page_name(item)]
+    if not ordered_page_names:
+        ordered_page_names = sorted(
+            status_map.keys(),
+            key=lambda value: _page_number_from_page_file(str(value)) or 0,
+        )
+
+    pages_payload: List[Dict[str, Any]] = []
+    for idx, page_name in enumerate(ordered_page_names, start=1):
+        item = dict(status_map.get(page_name) or {})
+        page_number = _page_number_from_page_file(page_name) or idx
+        pages_payload.append(
+            {
+                "page": page_number,
+                "status": _public_page_status(item.get("status") or "pending"),
+            }
+        )
+    return pages_payload, len(ordered_page_names)
+
+
+def _resolve_current_page(pages_payload: List[Dict[str, Any]], total_pages: int) -> int:
+    for item in pages_payload:
+        if str(item.get("status") or "") == "processing":
+            return int(item.get("page") or 0)
+    for item in pages_payload:
+        if str(item.get("status") or "") == "pending":
+            return int(item.get("page") or 0)
+    return int(total_pages or 0)
+
+
+def _attach_polling_payload(repo: JobsRepository, job_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return payload
+    pages_payload, total_pages = _build_polling_pages_payload(repo, job_id)
+    response = dict(payload)
+    response["job_id"] = job_id
+    response["total_pages"] = total_pages
+    response["current_page"] = _resolve_current_page(pages_payload, total_pages)
+    response["pages"] = pages_payload
+    status_value = str(response.get("status") or "").strip().lower()
+    if status_value in {"done", "done_with_warnings", "completed"}:
+        response["status"] = "completed"
+        response["step"] = "completed"
+    return response
+
+
 def get_status(job_id: str) -> Dict:
     """Return the latest job status, reconciling stale task state when possible."""
     repo = JobsRepository(DATA_DIR)
@@ -491,7 +912,9 @@ def get_status(job_id: str) -> Dict:
             job_state_repo.sync_job(job_id=job_id, meta=meta, status=status if isinstance(status, dict) else {})
             job_state = job_state_repo.get_job(job_id) or {}
     if not status:
-        return _augment_runtime_features({"status": "queued", "step": "queued", "progress": 0, **job_state})
+        return _augment_runtime_features(
+            _attach_polling_payload(repo, job_id, {"status": "queued", "step": "queued", "progress": 0, **job_state})
+        )
 
     def _merge_job_state_fields(target: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(target, dict):
@@ -501,13 +924,13 @@ def get_status(job_id: str) -> Dict:
         if job_state.get("process_end") and not target.get("process_end"):
             target["process_end"] = job_state["process_end"]
         target["is_reversed"] = bool(job_state.get("is_reversed", False))
-        return _augment_runtime_features(target)
+        return _augment_runtime_features(_attach_polling_payload(repo, job_id, target))
 
     payload = dict(status)
     parse_mode = str(payload.get("parse_mode") or "auto")
     runtime_status = str(payload.get("status") or "").strip().lower()
     # OCR jobs fan out into page tasks, so the parent job status is synthesized from page state.
-    if runtime_status in {"queued", "processing"}:
+    if runtime_status in {"queued", "splitting", "processing", "parsing"}:
         page_status = _load_page_status_map(repo, job_id)
         if page_status:
             changed = False
@@ -543,7 +966,7 @@ def get_status(job_id: str) -> Dict:
             return _merge_job_state_fields(payload)
 
     task_id = str(payload.get("task_id") or "").strip()
-    if runtime_status in {"queued", "processing"} and task_id:
+    if runtime_status in {"queued", "splitting", "processing", "parsing"} and task_id:
         task_state = _get_celery_task_state(task_id)
         if task_state in {"FAILURE", "REVOKED"}:
             mark_job_failed(
@@ -922,30 +1345,6 @@ def export_pdf(job_id: str) -> tuple[bytes, str]:
     return pdf_bytes, _build_export_filename(job_id, "pdf")
 
 
-def export_csv(job_id: str) -> tuple[bytes, str]:
-    """Flatten parsed rows into a CSV export."""
-    rows = _flatten_rows(get_all_rows(job_id))
-    out = io.StringIO()
-    writer = csv.DictWriter(
-        out,
-        fieldnames=["page", "row_id", "date", "description", "debit", "credit", "balance"],
-    )
-    writer.writeheader()
-    for row in rows:
-        writer.writerow(
-            {
-                "page": row.get("page"),
-                "row_id": row.get("row_id"),
-                "date": row.get("date"),
-                "description": row.get("description"),
-                "debit": row.get("debit"),
-                "credit": row.get("credit"),
-                "balance": row.get("balance"),
-            }
-        )
-    return out.getvalue().encode("utf-8"), f"{job_id}-rows.csv"
-
-
 def export_excel(job_id: str) -> tuple[bytes, str]:
     """Flatten parsed rows into the XLSX export used by downloads and CRM uploads."""
     rows = _flatten_rows(get_all_rows(job_id))
@@ -987,7 +1386,7 @@ def _start_job_worker(job_id: str, parse_mode: str) -> bool:
 
     latest_status = repo.read_status(job_id)
     latest_state = str((latest_status or {}).get("status") or "").strip().lower()
-    if latest_state in {"done", "failed"}:
+    if latest_state in {"completed", "failed"}:
         if task_id and not latest_status.get("task_id"):
             latest_payload = dict(latest_status)
             latest_payload["task_id"] = task_id
@@ -998,7 +1397,7 @@ def _start_job_worker(job_id: str, parse_mode: str) -> bool:
 
 
 def process_job(job_id: str, parse_mode: str, task_id: Optional[str] = None) -> Dict[str, Any]:
-    """Execute a job: parse inline for text PDFs or enqueue per-page OCR work."""
+    """Split the PDF into page PDFs, then enqueue independent per-page processing."""
     started_at = dt.datetime.now(dt.timezone.utc)
     repo = JobsRepository(DATA_DIR)
     _require_job(repo, job_id)
@@ -1015,76 +1414,58 @@ def process_job(job_id: str, parse_mode: str, task_id: Optional[str] = None) -> 
             payload["task_id"] = task_id
         repo.write_status(job_id, payload)
 
-    report("processing", "initializing", 1)
-    selected_mode = str(parse_mode or "auto").strip().lower()
-    meta = repo.read_json(repo.path(job_id, "meta.json"), default={})
-    if not isinstance(meta, dict):
-        meta = {}
-
+    report("splitting", "splitting", 1)
     input_pdf = repo.path(job_id, "input", "document.pdf")
-    pages_dir = repo.path(job_id, "pages")
-    cleaned_dir = repo.path(job_id, "cleaned")
     result_dir = repo.path(job_id, "result")
     fragments_dir = result_dir / "page_fragments"
     fragments_dir.mkdir(parents=True, exist_ok=True)
 
-    manifest = _load_pages_manifest(repo, job_id)
-    page_files = manifest.get("pages") if isinstance(manifest.get("pages"), list) else []
-    if not page_files:
-        # Generate page images once, then reuse the manifest on retries.
-        page_files = prepare_ocr_pages(input_pdf=input_pdf, pages_dir=pages_dir, cleaned_dir=cleaned_dir, report=report)
-        _write_pages_manifest(repo, job_id, page_files)
-        logger.info(
-            "Job %s prepared %s page images in %sms before enqueue.",
-            job_id,
-            len(page_files),
-            int((dt.datetime.now(dt.timezone.utc) - started_at).total_seconds() * 1000),
-        )
-    page_routing = _prepare_page_routing_inputs(
-        repo=repo,
-        job_id=job_id,
-        input_pdf=input_pdf,
-        page_files=page_files,
-        requested_mode=selected_mode,
+    page_names = _split_pdf_into_page_pdfs(repo=repo, job_id=job_id, input_pdf=input_pdf)
+    if not page_names:
+        raise RuntimeError("no_pages_split")
+    _write_pages_manifest(repo, job_id, page_names)
+    logger.info(
+        "Job %s split %s pages into individual PDFs in %sms before enqueue.",
+        job_id,
+        len(page_names),
+        int((dt.datetime.now(dt.timezone.utc) - started_at).total_seconds() * 1000),
     )
 
     page_status = _load_page_status_map(repo, job_id)
     pending_pages: List[str] = []
     active_task_ids: List[str] = []
     now_iso = dt.datetime.utcnow().isoformat() + "Z"
-    for idx, page_file in enumerate(page_files, start=1):
-        page_name = str(page_file).replace(".png", "")
+    for idx, page_name in enumerate(page_names, start=1):
+        normalized_page_name = normalize_page_name(page_name)
         page_payload = dict(page_status.get(page_name) or {})
-        existing_fragment = _page_fragment_path(repo, job_id, page_name)
+        existing_fragment = _page_fragment_path(repo, job_id, normalized_page_name)
         if existing_fragment.exists():
             # Completed page fragments survive retries, so they can be reused without re-running OCR.
             page_payload["status"] = "done"
             page_payload["updated_at"] = now_iso
         state = str(page_payload.get("status") or "").strip().lower()
         if state == "done":
-            page_status[page_name] = page_payload
+            page_status[normalized_page_name] = page_payload
             continue
         if state in _PAGE_ACTIVE_STATES and _is_celery_task_active(str(page_payload.get("task_id") or "")):
-            page_status[page_name] = page_payload
+            page_status[normalized_page_name] = page_payload
             task_ref = str(page_payload.get("task_id") or "").strip()
             if task_ref:
                 active_task_ids.append(task_ref)
             continue
-        pending_pages.append(page_name)
-        page_route = str(page_routing.get(page_name) or "ocr")
-        page_status[page_name] = {
-            "status": "queued",
+        pending_pages.append(normalized_page_name)
+        page_status[normalized_page_name] = {
+            "status": "pending",
             "page_index": idx,
-            "page_count": len(page_files),
-            "source_type": page_route,
-            "is_digital": page_route == "text",
+            "page_count": len(page_names),
             "retry_attempt": int(page_payload.get("retry_attempt") or 0),
+            "step": "pending",
             "updated_at": now_iso,
         }
 
     _write_page_status_map(repo, job_id, page_status)
 
-    # Only pages still missing successful fragments are queued for OCR work.
+    report("processing", "processing", 5)
     enqueue_started = dt.datetime.now(dt.timezone.utc)
     for page_name in pending_pages:
         page_payload = page_status.get(page_name) or {}
@@ -1094,10 +1475,11 @@ def process_job(job_id: str, parse_mode: str, task_id: Optional[str] = None) -> 
             parse_mode=parse_mode,
             page_name=page_name,
             page_index=page_index,
-            page_count=len(page_files),
+            page_count=len(page_names),
         )
         page_payload["task_id"] = task_id_page
-        page_payload["status"] = "queued"
+        page_payload["status"] = "pending"
+        page_payload["step"] = "pending"
         page_payload["updated_at"] = dt.datetime.utcnow().isoformat() + "Z"
         page_status[page_name] = page_payload
         active_task_ids.append(task_id_page)
@@ -1107,18 +1489,18 @@ def process_job(job_id: str, parse_mode: str, task_id: Optional[str] = None) -> 
         job_id,
         len(pending_pages),
         int((dt.datetime.now(dt.timezone.utc) - enqueue_started).total_seconds() * 1000),
-        len(page_files),
+        len(page_names),
     )
 
     done_pages, failed_pages = _count_page_states(page_status)
-    inflight_pages = max(0, len(page_files) - done_pages - failed_pages)
-    progress = _compute_page_progress(total=len(page_files), done=done_pages, failed=failed_pages)
+    inflight_pages = max(0, len(page_names) - done_pages - failed_pages)
+    progress = _compute_page_progress(total=len(page_names), done=done_pages, failed=failed_pages)
     queued_payload: Dict[str, Any] = {
         "status": "processing",
-        "step": "page_parsing",
+        "step": "processing",
         "progress": progress,
         "parse_mode": parse_mode,
-        "pages_total": len(page_files),
+        "pages_total": len(page_names),
         "pages_done": done_pages,
         "pages_failed": failed_pages,
         "pages_inflight": inflight_pages,
@@ -1133,6 +1515,23 @@ def process_job(job_id: str, parse_mode: str, task_id: Optional[str] = None) -> 
 
 def _page_raw_result_path(repo: JobsRepository, job_id: str, page_name: str) -> Path:
     return repo.path(job_id, "ocr", f"{normalize_page_name(page_name)}.raw.json")
+
+
+def _has_required_ocr_page_images(
+    *,
+    page_files: List[str],
+    page_routing: Dict[str, str],
+    pages_dir: Path,
+    cleaned_dir: Path,
+) -> bool:
+    for page_file in page_files:
+        page_name = normalize_page_name(str(page_file).replace(".png", ""))
+        if str(page_routing.get(page_name) or "ocr").strip().lower() == "text":
+            continue
+        page_path = resolve_ocr_page_path(page_file=page_file, pages_dir=pages_dir, cleaned_dir=cleaned_dir)
+        if not page_path.exists():
+            return False
+    return True
 
 
 def _prepare_page_routing_inputs(
@@ -1212,6 +1611,41 @@ def _parse_text_page_raw_result(
     return filtered_rows, filtered_bounds, diag
 
 
+def _extract_text_page_raw_result(*, page_pdf_path: Path, page_number: int) -> Dict[str, Any]:
+    try:
+        layout_pages = extract_pdf_layout_pages(str(page_pdf_path))
+    except Exception:
+        layout_pages = []
+    page_layout = layout_pages[0] if layout_pages else {}
+    if not isinstance(page_layout, dict):
+        page_layout = {}
+    return layout_page_to_json_payload(page_layout, page_number=page_number)
+
+
+def _extract_page_raw_text(raw_payload: Dict[str, Any] | None) -> str | None:
+    if not isinstance(raw_payload, dict):
+        return None
+    text = str(raw_payload.get("text") or "").strip()
+    return text or None
+
+
+def _render_split_pdf_page_to_png(*, page_pdf_path: Path, output_path: Path, dpi: int | None = None) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists():
+        return output_path
+    pages = convert_from_path(
+        str(page_pdf_path),
+        dpi=max(72, int(dpi or scanned_render_dpi())),
+        fmt="png",
+        first_page=1,
+        last_page=1,
+    )
+    if not pages:
+        raise RuntimeError(f"split_page_render_failed:{page_pdf_path.name}")
+    _save_png_with_pixel_cap(pages[0], output_path)
+    return output_path
+
+
 def process_job_page(
     job_id: str,
     parse_mode: str,
@@ -1227,21 +1661,23 @@ def process_job_page(
     cleaned_dir = repo.path(job_id, "cleaned")
     ocr_dir = repo.path(job_id, "ocr")
 
-    page_file = f"{normalize_page_name(page_name)}.png"
-    page_name = page_file.replace(".png", "")
-    page_path = resolve_ocr_page_path(page_file=page_file, pages_dir=pages_dir, cleaned_dir=cleaned_dir)
-    if not page_path.exists():
-        raise RuntimeError(f"page_image_missing:{page_file}")
+    page_name = normalize_page_name(page_name)
+    page_file = f"{page_name}.png"
+    page_number = _page_number_from_page_file(page_name) or int(page_index)
+    page_pdf_path = _split_page_pdf_path(repo, job_id, page_name)
+    if not page_pdf_path.exists():
+        raise RuntimeError(f"split_page_missing:{page_name}")
 
-    with _edit_page_status_map(repo, job_id) as page_status:
-        payload = dict(page_status.get(page_name) or {})
-        payload["status"] = "processing"
-        payload["page_index"] = int(page_index)
-        payload["page_count"] = int(page_count)
-        payload["updated_at"] = dt.datetime.utcnow().isoformat() + "Z"
-        if task_id:
-            payload["task_id"] = task_id
-        page_status[page_name] = payload
+    _update_page_runtime_status(
+        repo=repo,
+        job_id=job_id,
+        page_name=page_name,
+        page_index=page_index,
+        page_count=page_count,
+        status="processing",
+        step="detecting_page_type",
+        task_id=task_id,
+    )
     _refresh_job_progress(repo, job_id, parse_mode=parse_mode, active_task_id=task_id)
 
     def _heartbeat(wait_seconds: float):
@@ -1256,26 +1692,79 @@ def process_job_page(
             target["updated_at"] = dt.datetime.utcnow().isoformat() + "Z"
             current[page_name] = target
 
-    raw_result_path = _page_raw_result_path(repo, job_id, page_name)
-    raw_result = repo.read_json(raw_result_path, default=None) if raw_result_path.exists() else None
-    if isinstance(raw_result, dict) and str(raw_result.get("source_type") or "").strip().lower() == "text":
+    raw_result = _extract_text_page_raw_result(page_pdf_path=page_pdf_path, page_number=page_number)
+    page_type = "digital" if bool(raw_result.get("is_digital")) else "scanned"
+    persisted_raw_result: Dict[str, Any] | None = None
+
+    def _persist_raw_and_mark_parsing(raw_payload: Dict[str, Any], *, resolved_page_type: str) -> None:
+        nonlocal persisted_raw_result
+        persisted_raw_result = dict(raw_payload or {})
+        repo.write_json(_page_raw_result_path(repo, job_id, page_name), persisted_raw_result)
+        _upsert_page_intake_record(
+            job_id=job_id,
+            page_name=page_name,
+            page_type=resolved_page_type,
+            raw_text=_extract_page_raw_text(raw_payload),
+            processing_status="processing",
+            raw_result=raw_payload,
+        )
+        _update_page_runtime_status(
+            repo=repo,
+            job_id=job_id,
+            page_name=page_name,
+            page_index=page_index,
+            page_count=page_count,
+            status="processing",
+            step="parsing",
+            task_id=task_id,
+            page_type=resolved_page_type,
+        )
+        _refresh_job_progress(repo, job_id, parse_mode=parse_mode, active_task_id=task_id)
+
+    if page_type == "digital":
+        _persist_raw_and_mark_parsing(raw_result, resolved_page_type="digital")
         page_rows, page_bounds, page_diag = _parse_text_page_raw_result(raw_result)
     else:
+        _render_split_pdf_page_to_png(page_pdf_path=page_pdf_path, output_path=_rendered_page_png_path(repo, job_id, page_name))
         page_name, page_rows, page_bounds, page_diag = process_ocr_page(
             page_file=page_file,
             pages_dir=pages_dir,
             cleaned_dir=cleaned_dir,
             ocr_dir=ocr_dir,
             rate_limit_heartbeat=_heartbeat,
+            raw_result_callback=lambda payload: _persist_raw_and_mark_parsing(payload, resolved_page_type="scanned"),
         )
+        if persisted_raw_result is None:
+            raw_result_path = _page_raw_result_path(repo, job_id, page_name)
+            fallback_payload = repo.read_json(raw_result_path, default=None) if raw_result_path.exists() else None
+            if isinstance(fallback_payload, dict):
+                _persist_raw_and_mark_parsing(fallback_payload, resolved_page_type="scanned")
+    page_diag = dict(page_diag or {})
+    page_diag["page_type"] = page_type
     _write_page_fragment(repo, job_id, page_name, page_rows=page_rows, page_bounds=page_bounds, page_diag=page_diag)
+    if persisted_raw_result is not None:
+        _upsert_page_intake_record(
+            job_id=job_id,
+            page_name=page_name,
+            page_type=page_type,
+            raw_text=_extract_page_raw_text(persisted_raw_result),
+            processing_status="done",
+            raw_result=persisted_raw_result,
+        )
 
-    with _edit_page_status_map(repo, job_id) as page_status:
-        payload = dict(page_status.get(page_name) or {})
-        payload["status"] = "done"
-        payload["rows_parsed"] = int(page_diag.get("rows_parsed") or len(page_rows))
-        payload["updated_at"] = dt.datetime.utcnow().isoformat() + "Z"
-        page_status[page_name] = payload
+    _update_page_runtime_status(
+        repo=repo,
+        job_id=job_id,
+        page_name=page_name,
+        page_index=page_index,
+        page_count=page_count,
+        status="done",
+        step="done",
+        task_id=task_id,
+        page_type=page_type,
+        rows_parsed=int(page_diag.get("rows_parsed") or len(page_rows)),
+    )
+    payload = _load_page_status_map(repo, job_id).get(page_name) or {}
 
     merged = _refresh_job_progress(repo, job_id, parse_mode=parse_mode, active_task_id=task_id)
     if merged.get("pages_total", 0) > 0 and int(merged.get("pages_inflight") or 0) == 0:
@@ -1299,6 +1788,7 @@ def mark_page_retrying(
     """Persist retry metadata for a page task before Celery requeues it."""
     repo = JobsRepository(DATA_DIR)
     page_name = normalize_page_name(page_name)
+    _upsert_page_intake_record(job_id=job_id, page_name=page_name, processing_status="pending")
     with _edit_page_status_map(repo, job_id) as page_status:
         payload = dict(page_status.get(page_name) or {})
         payload["status"] = "retrying"
@@ -1326,6 +1816,7 @@ def mark_page_failed(
     """Persist a terminal page failure and finalize when no pages remain in flight."""
     repo = JobsRepository(DATA_DIR)
     page_name = normalize_page_name(page_name)
+    _upsert_page_intake_record(job_id=job_id, page_name=page_name, processing_status="failed")
     with _edit_page_status_map(repo, job_id) as page_status:
         payload = dict(page_status.get(page_name) or {})
         payload["status"] = "failed"
@@ -1434,16 +1925,20 @@ def finalize_job_processing(job_id: str, parse_mode: str, task_id: Optional[str]
     if success_pages == 0:
         status_value = "failed"
         step_value = "failed"
+        completion_outcome = "failed"
     elif failed_list:
-        status_value = "done_with_warnings"
-        step_value = "completed_with_warnings"
-    else:
-        status_value = "done"
+        status_value = "completed"
         step_value = "completed"
+        completion_outcome = "done_with_warnings"
+    else:
+        status_value = "completed"
+        step_value = "completed"
+        completion_outcome = "done"
 
     final_payload: Dict[str, Any] = {
         "status": status_value,
         "step": step_value,
+        "completion_outcome": completion_outcome,
         "progress": 100,
         "parse_mode": parse_mode,
         "pages": len(page_files),
@@ -1456,6 +1951,11 @@ def finalize_job_processing(job_id: str, parse_mode: str, task_id: Optional[str]
     if task_id:
         final_payload["task_id"] = task_id
     repo.write_status(job_id, final_payload)
+    auto_started = _maybe_start_next_volume_file(job_id, terminal_status=status_value)
+    if auto_started:
+        final_payload["volume_next_job_id"] = auto_started["job_id"]
+        final_payload["volume_next_file_name"] = auto_started["file_name"]
+        repo.write_status(job_id, final_payload)
     return final_payload
 
 
@@ -1557,16 +2057,6 @@ def _rebuild_ocr_outputs_from_saved_artifacts(
             last_balance_hint = page_last_balance
 
     return rebuilt_rows, rebuilt_bounds, rebuilt_diags
-
-
-def _read_job_text_layer_xml(repo: JobsRepository, job_id: str) -> str | None:
-    input_pdf = repo.path(job_id, "input", "document.pdf")
-    if not input_pdf.exists():
-        return None
-    try:
-        return extract_pdf_layout_xml(str(input_pdf))
-    except Exception:
-        return None
 
 
 def _collect_ocr_raw_payload(repo: JobsRepository, job_id: str, page_files: list[str]) -> dict[str, Any]:
@@ -1787,12 +2277,74 @@ def get_pages_status(job_id: str) -> Dict[str, Dict[str, Any]]:
         return status_map
     out: Dict[str, Dict[str, Any]] = {}
     for idx, page_file in enumerate(pages, start=1):
-        page_name = str(page_file).replace(".png", "")
+        page_name = normalize_page_name(page_file)
         payload = dict(status_map.get(page_name) or {})
         payload.setdefault("page_index", idx)
         payload.setdefault("page_count", len(pages))
+        payload["status"] = _public_page_status(payload.get("status") or "pending")
         out[page_name] = payload
     return out
+
+
+def _upsert_page_intake_record(
+    *,
+    job_id: str,
+    page_name: str,
+    page_type: str | None = None,
+    raw_text: str | None = None,
+    processing_status: str | None = None,
+    raw_result: Dict[str, Any] | List[Any] | None = None,
+) -> Dict[str, Any]:
+    page_number = _page_number_from_page_file(page_name)
+    if page_number is None:
+        raise KeyError(page_name)
+    repo = JobTransactionsRepository(DATA_DIR)
+    if page_type is None and raw_text is None and raw_result is None:
+        try:
+            return repo.update_page_intake_fields(
+                job_id=job_id,
+                page_number=page_number,
+                processing_status=processing_status,
+            )
+        except KeyError:
+            return {}
+    return repo.upsert_page_metadata(
+        job_id=job_id,
+        page_number=page_number,
+        page_type=page_type,
+        raw_text=raw_text,
+        processing_status=processing_status,
+        raw_result=raw_result,
+    )
+
+
+def _update_page_runtime_status(
+    *,
+    repo: JobsRepository,
+    job_id: str,
+    page_name: str,
+    page_index: int,
+    page_count: int,
+    status: str,
+    step: str,
+    task_id: Optional[str] = None,
+    page_type: str | None = None,
+    rows_parsed: int | None = None,
+) -> None:
+    with _edit_page_status_map(repo, job_id) as page_status:
+        payload = dict(page_status.get(page_name) or {})
+        payload["status"] = status
+        payload["step"] = step
+        payload["page_index"] = int(page_index)
+        payload["page_count"] = int(page_count)
+        payload["updated_at"] = dt.datetime.utcnow().isoformat() + "Z"
+        if page_type:
+            payload["page_type"] = page_type
+        if rows_parsed is not None:
+            payload["rows_parsed"] = int(rows_parsed)
+        if task_id:
+            payload["task_id"] = task_id
+        page_status[page_name] = payload
 
 
 def _write_pages_manifest(repo: JobsRepository, job_id: str, page_files: List[str]) -> None:
@@ -1908,6 +2460,11 @@ def _refresh_job_progress(
     total = len(manifest.get("pages") or [])
     done, failed = _count_page_states(page_status)
     inflight = max(0, total - done - failed)
+    parsing_started = any(
+        str((item or {}).get("step") or "").strip().lower() == "parsing"
+        or str((item or {}).get("status") or "").strip().lower() == "done"
+        for item in page_status.values()
+    )
     active_task_ids: List[str] = []
     for item in page_status.values():
         state = str(item.get("status") or "").strip().lower()
@@ -1916,11 +2473,12 @@ def _refresh_job_progress(
         task_ref = str(item.get("task_id") or "").strip()
         if task_ref:
             active_task_ids.append(task_ref)
+    runtime_status = "parsing" if parsing_started else "processing"
     payload: Dict[str, Any] = dict(status or {})
     payload.update(
         {
-            "status": "processing",
-            "step": "ocr_parsing",
+            "status": runtime_status,
+            "step": runtime_status,
             "parse_mode": parse_mode,
             "progress": _compute_page_progress(total=total, done=done, failed=failed),
             "pages_total": total,
@@ -1958,7 +2516,7 @@ def _get_celery_task_state(task_id: str) -> str:
 
 def _has_active_task(status_payload: Dict[str, Any]) -> bool:
     status = str((status_payload or {}).get("status") or "").strip().lower()
-    if status not in {"queued", "processing"}:
+    if status not in {"queued", "splitting", "processing", "parsing"}:
         return False
     multi = (status_payload or {}).get("active_task_ids")
     if isinstance(multi, list):
@@ -2009,6 +2567,17 @@ def _persist_parsed_rows(
     page_metadata_by_page = _build_page_metadata_by_page(repo, job_id, rows_by_page)
     for page_name, metadata in page_metadata_by_page.items():
         existing = existing_page_metadata.get(page_name) or {}
+        if metadata.get("page_type") is None and existing.get("page_type") is not None:
+            metadata["page_type"] = existing.get("page_type")
+        if metadata.get("raw_text") is None and existing.get("raw_text") is not None:
+            metadata["raw_text"] = existing.get("raw_text")
+        existing_processing_status = str(existing.get("processing_status") or "").strip().lower()
+        if existing_processing_status == "failed":
+            metadata["processing_status"] = "failed"
+        elif metadata.get("processing_status") is None and existing.get("processing_status") is not None:
+            metadata["processing_status"] = existing.get("processing_status")
+        if metadata.get("raw_result") is None and existing.get("raw_result") is not None:
+            metadata["raw_result"] = existing.get("raw_result")
         if metadata.get("notes") is None and existing.get("notes") is not None:
             metadata["notes"] = existing.get("notes")
     parsed_repo.replace_job_rows(
@@ -2047,8 +2616,14 @@ def _build_page_metadata_by_page(
             source_type = str(raw_result.get("source_type") or "").strip().lower()
             if source_type == "text":
                 is_digital = True
+        raw_text = _extract_page_raw_text(raw_result)
+        processing_status = "done" if (rows_by_page.get(page_name) or raw_result or raw_text) else None
+        page_type = "digital" if is_digital else "scanned"
         metadata[page_name] = {
             "page_number": page_number,
+            "page_type": page_type,
+            "raw_text": raw_text,
+            "processing_status": processing_status,
             "is_digital": is_digital,
             "raw_result": raw_result,
             "notes": None,
@@ -2181,177 +2756,6 @@ def _normalize_row_amount_output(value) -> float | None:
         return None
 
 
-def _normalize_flow_amount_output(value) -> float | None:
-    amount = _normalize_row_amount_output(value)
-    if amount is None:
-        return None
-    if abs(amount) <= 0.005:
-        return None
-    return amount
-
-
-def _output_amounts_match(left: float | None, right: float | None, tolerance: float = 0.01) -> bool:
-    if left is None or right is None:
-        return False
-    return abs(left - right) <= tolerance
-
-
-def _output_flow_description_bias(description: str | None) -> str | None:
-    lowered = str(description or "").strip().lower()
-    if not lowered:
-        return None
-
-    debit_markers = (
-        "withdrawal",
-        "withdraw",
-        "service fee",
-        "fee",
-        "bills payment",
-        "bill payment",
-        "instapay-send",
-        "instapay send",
-        "payment",
-        "send",
-    )
-    credit_markers = (
-        "reversal",
-        "refund",
-        "deposit",
-        "interest",
-        "incoming",
-        "received",
-        "transfer in",
-        "cash in",
-    )
-
-    has_debit = any(marker in lowered for marker in debit_markers)
-    has_credit = any(marker in lowered for marker in credit_markers)
-    if has_debit and not has_credit:
-        return "debit"
-    if has_credit and not has_debit:
-        return "credit"
-    return None
-
-
-def _expected_output_balance_for_flow(
-    prev_balance: float,
-    debit: float | None,
-    credit: float | None,
-    flow_direction: str,
-) -> float:
-    debit_value = debit or 0.0
-    credit_value = credit or 0.0
-    if flow_direction == "descending":
-        return prev_balance + debit_value - credit_value
-    return prev_balance - debit_value + credit_value
-
-
-def _infer_output_balance_flow_direction(page_rows: List[Dict]) -> str | None:
-    prev_balance: float | None = None
-    ascending_hits = 0
-    descending_hits = 0
-
-    for row in page_rows:
-        curr_balance = row.get("balance") if isinstance(row.get("balance"), (int, float)) else None
-        debit = _normalize_flow_amount_output(row.get("debit"))
-        credit = _normalize_flow_amount_output(row.get("credit"))
-
-        if prev_balance is not None and curr_balance is not None:
-            if debit is not None and credit is None:
-                if _output_amounts_match(prev_balance - debit, curr_balance):
-                    ascending_hits += 1
-                if _output_amounts_match(prev_balance + debit, curr_balance):
-                    descending_hits += 1
-            elif credit is not None and debit is None:
-                if _output_amounts_match(prev_balance + credit, curr_balance):
-                    ascending_hits += 1
-                if _output_amounts_match(prev_balance - credit, curr_balance):
-                    descending_hits += 1
-
-        if curr_balance is not None:
-            prev_balance = curr_balance
-
-    if ascending_hits > descending_hits:
-        return "ascending"
-    if descending_hits > ascending_hits:
-        return "descending"
-    return None
-
-
-def _sanitize_output_row_amounts(
-    row_copy: Dict,
-    *,
-    prev_balance: float | None,
-    curr_balance: float | None,
-    flow_direction: str | None,
-) -> None:
-    debit = _normalize_flow_amount_output(row_copy.get("debit"))
-    credit = _normalize_flow_amount_output(row_copy.get("credit"))
-    row_copy["debit"] = debit
-    row_copy["credit"] = credit
-    if debit is None or credit is None:
-        return
-
-    if prev_balance is not None and curr_balance is not None and flow_direction:
-        debit_matches = _output_amounts_match(
-            _expected_output_balance_for_flow(prev_balance, debit, None, flow_direction),
-            curr_balance,
-        )
-        credit_matches = _output_amounts_match(
-            _expected_output_balance_for_flow(prev_balance, None, credit, flow_direction),
-            curr_balance,
-        )
-        if debit_matches and not credit_matches:
-            row_copy["credit"] = None
-            return
-        if credit_matches and not debit_matches:
-            row_copy["debit"] = None
-            return
-
-    if prev_balance is not None and curr_balance is not None:
-        delta = abs(curr_balance - prev_balance)
-        debit_matches_delta = _output_amounts_match(delta, abs(debit))
-        credit_matches_delta = _output_amounts_match(delta, abs(credit))
-        if debit_matches_delta and not credit_matches_delta:
-            row_copy["credit"] = None
-            return
-        if credit_matches_delta and not debit_matches_delta:
-            row_copy["debit"] = None
-            return
-
-    description_bias = _output_flow_description_bias(row_copy.get("description"))
-    if description_bias == "debit":
-        row_copy["credit"] = None
-        return
-    if description_bias == "credit":
-        row_copy["debit"] = None
-        return
-
-    row_copy["debit"] = None
-    row_copy["credit"] = None
-
-
-def _sanitize_rows_single_sided_for_output(page_rows: List[Dict]) -> List[Dict]:
-    sanitized: List[Dict] = []
-    prev_balance: float | None = None
-    flow_direction = _infer_output_balance_flow_direction(page_rows)
-
-    for row in page_rows:
-        row_copy = dict(row)
-        curr_balance = row_copy.get("balance") if isinstance(row_copy.get("balance"), (int, float)) else None
-        _sanitize_output_row_amounts(
-            row_copy,
-            prev_balance=prev_balance,
-            curr_balance=curr_balance,
-            flow_direction=flow_direction,
-        )
-        sanitized.append(row_copy)
-        if curr_balance is not None:
-            prev_balance = curr_balance
-
-    return sanitized
-
-
 def _normalize_rows_by_page_for_output(rows_by_page: Dict[str, List[Dict]]) -> Dict[str, List[Dict]]:
     out: Dict[str, List[Dict]] = {}
     for page_name, rows in (rows_by_page or {}).items():
@@ -2383,34 +2787,6 @@ def _normalize_rows_by_page_for_output(rows_by_page: Dict[str, List[Dict]]) -> D
             )
         out[str(page_name)] = page_rows
     return out
-
-
-def _legacy_transactions_to_rows_by_page(transactions: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    grouped: Dict[str, List[Dict[str, Any]]] = {}
-    per_page_index: Dict[str, int] = {}
-    for tx in transactions or []:
-        if not isinstance(tx, dict):
-            continue
-        page_raw = tx.get("page") if tx.get("page") is not None else tx.get("page_number")
-        page_num = _normalize_row_number_output(page_raw)
-        page_name = f"page_{int(page_num or 1):03}"
-        per_page_index[page_name] = per_page_index.get(page_name, 0) + 1
-        row_number = tx.get("row_number")
-        row_number_text = str(row_number).strip() if row_number is not None else ""
-        grouped.setdefault(page_name, []).append(
-            {
-                "row_id": f"{per_page_index[page_name]:03}",
-                "rownumber": int(row_number) if isinstance(row_number, int) else None,
-                "row_number": row_number_text,
-                "date": _normalize_row_date_for_output(tx.get("date")),
-                "description": _normalize_row_cell(tx.get("description")),
-                "debit": _normalize_row_amount_output(tx.get("debit")),
-                "credit": _normalize_row_amount_output(tx.get("credit")),
-                "balance": _normalize_row_amount_output(tx.get("balance")),
-                "row_type": "transaction",
-            }
-        )
-    return grouped
 
 
 def _backfill_ocr_row_numbers_from_openai_raw(
@@ -2844,7 +3220,6 @@ def _build_minimal_xlsx(rows: List[List[str]]) -> bytes:
 __all__ = [
     "compute_summary",
     "create_job",
-    "export_csv",
     "export_excel",
     "export_pdf",
     "get_all_bounds",
